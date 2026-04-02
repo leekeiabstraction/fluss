@@ -167,6 +167,32 @@ public class RocksDBKv implements AutoCloseable {
         }
     }
 
+    /**
+     * Scans all key-value entries in the database.
+     *
+     * @param consumer a consumer that processes each key-value pair
+     */
+    public void scan(KeyValueConsumer consumer) throws IOException {
+        ReadOptions readOptions = new ReadOptions();
+        RocksIterator iterator = db.newIterator(defaultColumnFamilyHandle, readOptions);
+        try {
+            iterator.seekToFirst();
+            while (iterator.isValid()) {
+                consumer.accept(iterator.key(), iterator.value());
+                iterator.next();
+            }
+        } finally {
+            readOptions.close();
+            iterator.close();
+        }
+    }
+
+    /** A consumer for key-value pairs from a RocksDB scan. */
+    @FunctionalInterface
+    public interface KeyValueConsumer {
+        void accept(byte[] key, byte[] value) throws IOException;
+    }
+
     public void checkIfRocksDBClosed() {
         if (this.closed) {
             throw new FlussRuntimeException(

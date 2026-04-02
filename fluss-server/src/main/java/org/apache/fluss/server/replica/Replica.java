@@ -31,6 +31,7 @@ import org.apache.fluss.exception.NonPrimaryKeyTableException;
 import org.apache.fluss.exception.NotEnoughReplicasException;
 import org.apache.fluss.exception.NotLeaderOrFollowerException;
 import org.apache.fluss.fs.FsPath;
+import org.apache.fluss.index.IndexDescriptor;
 import org.apache.fluss.metadata.ChangelogImage;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.PhysicalTablePath;
@@ -41,6 +42,7 @@ import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.metrics.Counter;
 import org.apache.fluss.metrics.MetricNames;
 import org.apache.fluss.metrics.groups.MetricGroup;
+import org.apache.fluss.plugin.PluginManager;
 import org.apache.fluss.record.DefaultValueRecordBatch;
 import org.apache.fluss.record.KvRecordBatch;
 import org.apache.fluss.record.LogRecords;
@@ -54,6 +56,7 @@ import org.apache.fluss.server.kv.KvManager;
 import org.apache.fluss.server.kv.KvRecoverHelper;
 import org.apache.fluss.server.kv.KvTablet;
 import org.apache.fluss.server.kv.autoinc.AutoIncIDRange;
+import org.apache.fluss.server.kv.index.SecondaryIndexManager;
 import org.apache.fluss.server.kv.rocksdb.RocksDBKvBuilder;
 import org.apache.fluss.server.kv.snapshot.CompletedKvSnapshotCommitter;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshot;
@@ -195,6 +198,8 @@ public final class Replica {
     private volatile int bucketEpoch = LeaderAndIsr.INITIAL_BUCKET_EPOCH;
     private volatile int coordinatorEpoch = CoordinatorContext.INITIAL_COORDINATOR_EPOCH;
 
+    @Nullable private final PluginManager pluginManager;
+
     // null if table without pk or haven't become leader
     private volatile @Nullable KvTablet kvTablet;
     private volatile @Nullable CloseableRegistry closeableRegistryForKv;
@@ -223,6 +228,7 @@ public final class Replica {
             TabletServerMetadataCache metadataCache,
             FatalErrorHandler fatalErrorHandler,
             BucketMetricGroup bucketMetricGroup,
+            @Nullable PluginManager pluginManager,
             TableInfo tableInfo,
             Clock clock)
             throws Exception {
@@ -230,6 +236,7 @@ public final class Replica {
         this.tableBucket = tableBucket;
         this.logManager = logManager;
         this.kvManager = kvManager;
+        this.pluginManager = pluginManager;
         this.metadataCache = metadataCache;
         this.replicaMaxLagTime = replicaMaxLagTime;
         this.minInSyncReplicasSupplier = minInSyncReplicasSupplier;
@@ -715,7 +722,9 @@ public final class Replica {
                 downloadKvSnapshots(completedSnapshot, tabletDir.toPath());
 
                 // as we have downloaded kv files into the tablet dir, now, we can load it
-                kvTablet = kvManager.loadKv(tabletDir, schemaGetter);
+                kvTablet =
+                        kvManager.loadKv(
+                                tabletDir, schemaGetter, createSecondaryIndexManager(tabletDir));
 
                 checkNotNull(kvTablet, "kv tablet should not be null.");
                 restoreStartOffset = completedSnapshot.getLogOffset();
@@ -738,7 +747,8 @@ public final class Replica {
                                 tableConfig.getKvFormat(),
                                 schemaGetter,
                                 tableConfig,
-                                arrowCompressionInfo);
+                                arrowCompressionInfo,
+                                createSecondaryIndexManager(null));
 
                 // we don't support rowCount
                 rowCount = tableConfig.getChangelogImage() == ChangelogImage.WAL ? null : 0L;
@@ -841,6 +851,8 @@ public final class Replica {
                             tableConfig.getLogFormat(),
                             schemaGetter);
             kvRecoverHelper.recover();
+            // Rebuild secondary indexes from the recovered RocksDB state
+            kvTablet.rebuildSecondaryIndexes();
         } catch (Exception e) {
             throw new KvStorageException(
                     String.format(
@@ -855,6 +867,38 @@ public final class Replica {
                 physicalPath,
                 startRecoverLogOffset,
                 end - start);
+    }
+
+    /**
+     * Creates a SecondaryIndexManager if the table has index declarations in its properties.
+     * Returns null if no indexes are declared.
+     *
+     * @param kvTabletDir the KV tablet directory, or null to use a temporary directory
+     */
+    @Nullable
+    private SecondaryIndexManager createSecondaryIndexManager(@Nullable File kvTabletDir)
+            throws IOException {
+        java.util.List<IndexDescriptor> descriptors =
+                IndexDescriptor.fromProperties(tableInfo.getProperties().toMap());
+        if (descriptors.isEmpty()) {
+            return null;
+        }
+        File indexBaseDir;
+        if (kvTabletDir != null) {
+            indexBaseDir = new File(kvTabletDir, "indexes");
+        } else {
+            // kvTabletDir not yet known; KvManager will create it.
+            // Use a temporary directory; the indexes will be rebuilt from RocksDB after recovery.
+            indexBaseDir =
+                    new File(System.getProperty("java.io.tmpdir"), "fluss-idx-" + tableBucket);
+        }
+        return new SecondaryIndexManager(
+                descriptors,
+                tableInfo.getRowType(),
+                tableConfig.getKvFormat(),
+                schemaGetter,
+                indexBaseDir,
+                pluginManager);
     }
 
     private void startPeriodicKvSnapshot(@Nullable CompletedSnapshot completedSnapshot) {

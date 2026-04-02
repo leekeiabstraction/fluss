@@ -270,7 +270,8 @@ public class TabletServer extends ServerBase {
                             tabletServerMetricGroup,
                             userMetrics,
                             clock,
-                            ioExecutor);
+                            ioExecutor,
+                            pluginManager);
             replicaManager.startup();
 
             // Register DefaultSnapshotContext for dynamic kv.snapshot.interval

@@ -324,7 +324,8 @@ public class ReplicaTestBase {
                 TestingMetricGroups.USER_METRICS,
                 remoteLogManager,
                 manualClock,
-                ioExecutor);
+                ioExecutor,
+                null);
     }
 
     @AfterEach
@@ -498,6 +499,7 @@ public class ReplicaTestBase {
                 serverMetadataCache,
                 NOPErrorHandler.INSTANCE,
                 metricGroup,
+                null,
                 DATA1_TABLE_INFO,
                 manualClock);
     }

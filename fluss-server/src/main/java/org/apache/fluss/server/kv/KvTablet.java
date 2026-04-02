@@ -50,6 +50,8 @@ import org.apache.fluss.rpc.protocol.MergeMode;
 import org.apache.fluss.server.kv.autoinc.AutoIncIDRange;
 import org.apache.fluss.server.kv.autoinc.AutoIncrementManager;
 import org.apache.fluss.server.kv.autoinc.AutoIncrementUpdater;
+import org.apache.fluss.server.kv.index.IndexAwareKvBatchWriter;
+import org.apache.fluss.server.kv.index.SecondaryIndexManager;
 import org.apache.fluss.server.kv.prewrite.KvPreWriteBuffer;
 import org.apache.fluss.server.kv.prewrite.KvPreWriteBuffer.TruncateReason;
 import org.apache.fluss.server.kv.rocksdb.RocksDBKv;
@@ -134,6 +136,9 @@ public final class KvTablet {
     // RocksDB statistics accessor for this tablet
     @Nullable private final RocksDBStatistics rocksDBStatistics;
 
+    // Secondary index manager for this tablet (null when no indexes are declared)
+    @Nullable private final SecondaryIndexManager secondaryIndexManager;
+
     /**
      * The kv data in pre-write buffer whose log offset is less than the flushedLogOffset has been
      * flushed into kv.
@@ -162,7 +167,8 @@ public final class KvTablet {
             SchemaGetter schemaGetter,
             ChangelogImage changelogImage,
             @Nullable RocksDBStatistics rocksDBStatistics,
-            AutoIncrementManager autoIncrementManager) {
+            AutoIncrementManager autoIncrementManager,
+            @Nullable SecondaryIndexManager secondaryIndexManager) {
         this.physicalPath = physicalPath;
         this.tableBucket = tableBucket;
         this.logTablet = logTablet;
@@ -170,7 +176,12 @@ public final class KvTablet {
         this.rocksDBKv = rocksDBKv;
         this.writeBatchSize = writeBatchSize;
         this.serverMetricGroup = serverMetricGroup;
-        this.kvPreWriteBuffer = new KvPreWriteBuffer(createKvBatchWriter(), serverMetricGroup);
+        this.secondaryIndexManager = secondaryIndexManager;
+        KvBatchWriter writer = createKvBatchWriter();
+        if (secondaryIndexManager != null && secondaryIndexManager.hasIndexes()) {
+            writer = new IndexAwareKvBatchWriter(writer, secondaryIndexManager);
+        }
+        this.kvPreWriteBuffer = new KvPreWriteBuffer(writer, serverMetricGroup);
         this.logFormat = logFormat;
         this.arrowWriterProvider = new ArrowWriterPool(arrowBufferAllocator);
         this.memorySegmentPool = memorySegmentPool;
@@ -202,6 +213,7 @@ public final class KvTablet {
             ArrowCompressionInfo arrowCompressionInfo,
             SchemaGetter schemaGetter,
             ChangelogImage changelogImage,
+            @Nullable SecondaryIndexManager secondaryIndexManager,
             RateLimiter sharedRateLimiter,
             AutoIncrementManager autoIncrementManager)
             throws IOException {
@@ -236,7 +248,8 @@ public final class KvTablet {
                 schemaGetter,
                 changelogImage,
                 rocksDBStatistics,
-                autoIncrementManager);
+                autoIncrementManager,
+                secondaryIndexManager);
     }
 
     private static RocksDBKv buildRocksDBKv(
@@ -771,6 +784,14 @@ public final class KvTablet {
                     if (isClosed) {
                         return;
                     }
+                    // Close secondary indexes before RocksDB
+                    if (secondaryIndexManager != null) {
+                        try {
+                            secondaryIndexManager.close();
+                        } catch (Exception e) {
+                            LOG.warn("Failed to close secondary index manager", e);
+                        }
+                    }
                     // Note: RocksDB metrics lifecycle is managed by TableMetricGroup
                     // No need to close it here
                     if (rocksDBKv != null) {
@@ -778,6 +799,47 @@ public final class KvTablet {
                     }
                     isClosed = true;
                 });
+    }
+
+    /** Returns the secondary index manager, or null if no indexes are configured. */
+    @Nullable
+    public SecondaryIndexManager getSecondaryIndexManager() {
+        return secondaryIndexManager;
+    }
+
+    /**
+     * Search a secondary index by name.
+     *
+     * @param indexName the name of the index to search
+     * @param queryValue the query value bytes
+     * @param maxResults maximum number of results
+     * @return list of matching primary key bytes
+     */
+    public List<byte[]> searchIndex(String indexName, byte[] queryValue, int maxResults)
+            throws IOException {
+        if (secondaryIndexManager == null) {
+            throw new IllegalStateException("No secondary indexes configured for " + tableBucket);
+        }
+        return inReadLock(
+                kvLock, () -> secondaryIndexManager.search(indexName, queryValue, maxResults));
+    }
+
+    /**
+     * Rebuild all secondary indexes by scanning the full RocksDB state. Used after recovery to
+     * ensure index consistency.
+     */
+    public void rebuildSecondaryIndexes() throws IOException {
+        if (secondaryIndexManager == null || !secondaryIndexManager.hasIndexes()) {
+            return;
+        }
+        LOG.info("Rebuilding secondary indexes for {} ...", tableBucket);
+        secondaryIndexManager.clear();
+        rocksDBKv.scan(
+                (key, value) -> {
+                    secondaryIndexManager.onPut(key, value);
+                });
+        secondaryIndexManager.flush();
+        LOG.info("Secondary indexes rebuilt for {}.", tableBucket);
     }
 
     /** Completely delete the kv directory and all contents form the file system with no delay. */

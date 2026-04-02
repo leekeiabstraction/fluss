@@ -42,6 +42,7 @@ import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.metrics.MetricNames;
 import org.apache.fluss.metrics.groups.MetricGroup;
+import org.apache.fluss.plugin.PluginManager;
 import org.apache.fluss.record.KeyRecordBatch;
 import org.apache.fluss.record.KvRecordBatch;
 import org.apache.fluss.record.MemoryLogRecords;
@@ -209,6 +210,8 @@ public class ReplicaManager implements ServerReconfigurable {
 
     private final Clock clock;
 
+    @Nullable private final PluginManager pluginManager;
+
     public ReplicaManager(
             Configuration conf,
             Scheduler scheduler,
@@ -224,7 +227,8 @@ public class ReplicaManager implements ServerReconfigurable {
             TabletServerMetricGroup serverMetricGroup,
             UserMetrics userMetrics,
             Clock clock,
-            ExecutorService ioExecutor)
+            ExecutorService ioExecutor,
+            @Nullable PluginManager pluginManager)
             throws IOException {
         this(
                 conf,
@@ -242,7 +246,8 @@ public class ReplicaManager implements ServerReconfigurable {
                 userMetrics,
                 new RemoteLogManager(conf, zkClient, coordinatorGateway, clock, ioExecutor),
                 clock,
-                ioExecutor);
+                ioExecutor,
+                pluginManager);
     }
 
     @VisibleForTesting
@@ -262,7 +267,8 @@ public class ReplicaManager implements ServerReconfigurable {
             UserMetrics userMetrics,
             RemoteLogManager remoteLogManager,
             Clock clock,
-            ExecutorService ioExecutor)
+            ExecutorService ioExecutor,
+            @Nullable PluginManager pluginManager)
             throws IOException {
         this.conf = conf;
         this.zkClient = zkClient;
@@ -309,6 +315,7 @@ public class ReplicaManager implements ServerReconfigurable {
         this.userMetrics = userMetrics;
         this.clock = clock;
         this.ioExecutor = ioExecutor;
+        this.pluginManager = pluginManager;
         this.minInSyncReplicas = conf.get(ConfigOptions.LOG_REPLICA_MIN_IN_SYNC_REPLICAS_NUMBER);
         registerMetrics();
     }
@@ -1920,6 +1927,7 @@ public class ReplicaManager implements ServerReconfigurable {
                                 metadataCache,
                                 fatalErrorHandler,
                                 bucketMetricGroup,
+                                pluginManager,
                                 tableInfo,
                                 clock);
                 allReplicas.put(tb, new OnlineReplica(replica));

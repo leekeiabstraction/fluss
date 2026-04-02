@@ -38,6 +38,7 @@ import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.server.TabletManagerBase;
 import org.apache.fluss.server.kv.autoinc.AutoIncrementManager;
 import org.apache.fluss.server.kv.autoinc.ZkSequenceGeneratorFactory;
+import org.apache.fluss.server.kv.index.SecondaryIndexManager;
 import org.apache.fluss.server.kv.rowmerger.RowMerger;
 import org.apache.fluss.server.log.LogManager;
 import org.apache.fluss.server.log.LogTablet;
@@ -56,6 +57,7 @@ import org.rocksdb.RocksDB;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import javax.annotation.Nullable;
 import javax.annotation.concurrent.ThreadSafe;
 
 import java.io.File;
@@ -239,7 +241,8 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
             KvFormat kvFormat,
             SchemaGetter schemaGetter,
             TableConfig tableConfig,
-            ArrowCompressionInfo arrowCompressionInfo)
+            ArrowCompressionInfo arrowCompressionInfo,
+            @Nullable SecondaryIndexManager secondaryIndexManager)
             throws Exception {
         return inLock(
                 tabletCreationOrDeletionLock,
@@ -272,6 +275,7 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
                                     arrowCompressionInfo,
                                     schemaGetter,
                                     tableConfig.getChangelogImage(),
+                                    secondaryIndexManager,
                                     sharedRocksDBRateLimiter,
                                     autoIncrementManager);
                     currentKvs.put(tableBucket, tablet);
@@ -343,7 +347,11 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
         }
     }
 
-    public KvTablet loadKv(File tabletDir, SchemaGetter schemaGetter) throws Exception {
+    public KvTablet loadKv(
+            File tabletDir,
+            SchemaGetter schemaGetter,
+            @Nullable SecondaryIndexManager secondaryIndexManager)
+            throws Exception {
         Tuple2<PhysicalTablePath, TableBucket> pathAndBucket = FlussPaths.parseTabletDir(tabletDir);
         PhysicalTablePath physicalTablePath = pathAndBucket.f0;
         TableBucket tableBucket = pathAndBucket.f1;
@@ -389,6 +397,7 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
                         tableConfig.getArrowCompressionInfo(),
                         schemaGetter,
                         tableConfig.getChangelogImage(),
+                        secondaryIndexManager,
                         sharedRocksDBRateLimiter,
                         autoIncrementManager);
         if (this.currentKvs.containsKey(tableBucket)) {
