@@ -1,6 +1,6 @@
 ---
 slug: fluss_rust_client_release
-date: 2026-04-02
+date: 2026-04-06
 title: "Announcing Apache Fluss (Incubating) Rust, Python, and C++ Client 0.1.0 Release"
 authors: [yuxia, keithlee, anton]
 toc_max_heading_level: 5
@@ -29,7 +29,7 @@ All table types support idempotent writes and memory-bounded backpressure for re
 
 ### Zero-copy Arrow integration
 
-Leverage your existing Apache Arrow ecosystem. Whether you use Polars, Pandas, DuckDB, DataFusion, or Arrow directly, the clients speak Arrow natively. All records are represented as Arrow RecordBatches throughout the stack, so data arriving from Fluss can be handed directly to your tools without serialization or conversion.
+Leverage your existing Apache Arrow ecosystem. Whether you use Polars, Pandas, DuckDB, DataFusion, or Arrow directly, the clients speak Arrow natively. Log records are represented as Arrow RecordBatches throughout the stack, so data arriving from Fluss can be handed directly to your tools without serialization or conversion.
 
 A batch scanner mode makes this practical at scale: it returns complete RecordBatches to the caller, ready for immediate use. Python users can pass batches straight to Polars or Pandas, C++ applications can feed them into DuckDB, and Rust tools benefit from the same zero-copy path. The Java client does not offer this today because Flink and Spark convert data into their own internal row formats on ingestion. For the native ecosystem, skipping that conversion is where the performance wins are.
 
