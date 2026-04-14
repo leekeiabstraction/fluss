@@ -493,9 +493,6 @@ public final class LogTablet {
      * in-memory cache.
      */
     public void setSchema(Schema schema) {
-        if (this.schema != null) {
-            return; // Already set
-        }
         this.schema = schema;
 
         // Load persisted enrichment data from disk for each column group
@@ -540,6 +537,19 @@ public final class LogTablet {
                     "Target offset %s must be less than log end offset %s",
                     targetOffset,
                     localLog.getLocalLogEndOffset());
+
+            // Validate enrichment row field count matches the column group definition
+            if (schema != null) {
+                List<Integer> groupIndices = schema.getColumnGroups().get(columnGroup);
+                if (groupIndices != null) {
+                    checkArgument(
+                            enrichmentRow.getFieldCount() == groupIndices.size(),
+                            "Enrichment row has %s fields but column group '%s' expects %s",
+                            enrichmentRow.getFieldCount(),
+                            columnGroup,
+                            groupIndices.size());
+                }
+            }
 
             // Update in-memory cache
             TreeMap<Long, GenericRow> groupMap =
