@@ -102,6 +102,11 @@ public class WriterClient {
     private final WriterMetricGroup writerMetricGroup;
     private final DynamicPartitionCreator dynamicPartitionCreator;
 
+    // Shared Arrow allocator and writer pool for enrichment column encoding,
+    // avoiding per-call allocation overhead.
+    private final BufferAllocator enrichmentAllocator;
+    private final ArrowWriterPool enrichmentWriterPool;
+
     public WriterClient(
             Configuration conf,
             MetadataUpdater metadataUpdater,
@@ -127,6 +132,9 @@ public class WriterClient {
             this.sender = newSender(acks, retries);
             this.ioThreadPool = createThreadPool();
             ioThreadPool.submit(sender);
+
+            this.enrichmentAllocator = new RootAllocator(Integer.MAX_VALUE);
+            this.enrichmentWriterPool = new ArrowWriterPool(enrichmentAllocator);
 
             this.dynamicPartitionCreator =
                     new DynamicPartitionCreator(
@@ -238,31 +246,28 @@ public class WriterClient {
      */
     private byte[] encodeEnrichmentRow(InternalRow row, RowType rowType, int schemaId)
             throws Exception {
-        try (BufferAllocator allocator = new RootAllocator(Integer.MAX_VALUE);
-                ArrowWriterPool writerPool = new ArrowWriterPool(allocator)) {
-            ArrowWriter writer =
-                    writerPool.getOrCreateWriter(
-                            1L,
-                            schemaId,
-                            Integer.MAX_VALUE,
-                            rowType,
-                            ArrowCompressionInfo.NO_COMPRESSION);
-            MemoryLogRecordsArrowBuilder builder =
-                    MemoryLogRecordsArrowBuilder.builder(
-                            0L,
-                            org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V0,
-                            schemaId,
-                            writer,
-                            new UnmanagedPagedOutputView(16 * 1024));
-            builder.append(ChangeType.APPEND_ONLY, row);
-            builder.close();
-            org.apache.fluss.record.bytesview.MultiBytesView bytesView = builder.build();
-            org.apache.fluss.shaded.netty4.io.netty.buffer.ByteBuf buf = bytesView.getByteBuf();
-            byte[] bytes = new byte[buf.readableBytes()];
-            buf.readBytes(bytes);
-            buf.release();
-            return bytes;
-        }
+        ArrowWriter writer =
+                enrichmentWriterPool.getOrCreateWriter(
+                        1L,
+                        schemaId,
+                        Integer.MAX_VALUE,
+                        rowType,
+                        ArrowCompressionInfo.NO_COMPRESSION);
+        MemoryLogRecordsArrowBuilder builder =
+                MemoryLogRecordsArrowBuilder.builder(
+                        0L,
+                        org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V0,
+                        schemaId,
+                        writer,
+                        new UnmanagedPagedOutputView(16 * 1024));
+        builder.append(ChangeType.APPEND_ONLY, row);
+        builder.close();
+        org.apache.fluss.record.bytesview.MultiBytesView bytesView = builder.build();
+        org.apache.fluss.shaded.netty4.io.netty.buffer.ByteBuf buf = bytesView.getByteBuf();
+        byte[] bytes = new byte[buf.readableBytes()];
+        buf.readBytes(bytes);
+        buf.release();
+        return bytes;
     }
 
     /**
@@ -463,6 +468,13 @@ public class WriterClient {
         if (sender != null) {
             sender.forceClose();
         }
+
+        try {
+            enrichmentWriterPool.close();
+        } catch (Exception e) {
+            LOG.warn("Error closing enrichment writer pool", e);
+        }
+        enrichmentAllocator.close();
 
         LOG.info("Writer closed.");
     }

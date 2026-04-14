@@ -458,18 +458,11 @@ public final class LogTablet {
             maxOffsetMetadata = fetchHighWatermarkMetadata();
         }
 
-        // When column group enrichment data exists, skip projection so we can merge
-        // the full row including enrichment columns on the server side.
+        // Check if enrichment data exists for the offset range being fetched.
+        // Only disable projection if there is actually enrichment data to merge.
         boolean hasEnrichment;
         synchronized (lock) {
-            hasEnrichment = !columnGroupEnrichment.isEmpty() && schema != null;
-            if (!columnGroupEnrichment.isEmpty() || schema != null) {
-                LOG.info(
-                        "Column group check: enrichmentEmpty={}, schema={}, hasEnrichment={}",
-                        columnGroupEnrichment.isEmpty(),
-                        schema != null,
-                        hasEnrichment);
-            }
+            hasEnrichment = hasEnrichmentInRange(readOffset);
         }
         FileLogProjection effectiveProjection = hasEnrichment ? null : projection;
 
@@ -549,9 +542,15 @@ public final class LogTablet {
                     localLog.getLocalLogEndOffset());
 
             // Update in-memory cache
-            columnGroupEnrichment
-                    .computeIfAbsent(columnGroup, k -> new TreeMap<>())
-                    .put(targetOffset, enrichmentRow);
+            TreeMap<Long, GenericRow> groupMap =
+                    columnGroupEnrichment.computeIfAbsent(columnGroup, k -> new TreeMap<>());
+            groupMap.put(targetOffset, enrichmentRow);
+
+            // Evict entries below the log start offset (no longer readable)
+            long evictBefore = localLog.getLocalLogStartOffset();
+            if (evictBefore > 0) {
+                groupMap.headMap(evictBefore).clear();
+            }
 
             // Persist to disk
             try {
@@ -565,6 +564,23 @@ public final class LogTablet {
                         e);
             }
         }
+    }
+
+    /**
+     * Check if any column group has enrichment data at or after the given offset. Called under
+     * lock.
+     */
+    @GuardedBy("lock")
+    private boolean hasEnrichmentInRange(long fromOffset) {
+        if (schema == null || columnGroupEnrichment.isEmpty()) {
+            return false;
+        }
+        for (TreeMap<Long, GenericRow> groupData : columnGroupEnrichment.values()) {
+            if (!groupData.isEmpty() && groupData.lastKey() >= fromOffset) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -627,9 +643,17 @@ public final class LogTablet {
             return baseInfo;
         }
 
+        // Determine the offset range of the fetched records for range filtering
+        long rangeStart = startOffset;
+        long rangeEnd = Long.MAX_VALUE;
+        for (LogRecordBatch batch : memRecords.batches()) {
+            rangeEnd = batch.lastLogOffset();
+        }
+
         // Merge each column group sequentially. The output of one merge becomes the
         // input to the next, so multiple groups enriching the same offsets are handled
-        // correctly without overwriting each other.
+        // correctly without overwriting each other. Only pass enrichment data within the
+        // fetched offset range to avoid unnecessary work.
         boolean anyMerged = false;
         for (Map.Entry<String, List<Integer>> entry : columnGroups.entrySet()) {
             String groupName = entry.getKey();
@@ -637,8 +661,14 @@ public final class LogTablet {
             if (groupData == null || groupData.isEmpty()) {
                 continue;
             }
+            // Filter to only the relevant offset range
+            TreeMap<Long, GenericRow> rangeData =
+                    new TreeMap<>(groupData.subMap(rangeStart, true, rangeEnd, true));
+            if (rangeData.isEmpty()) {
+                continue;
+            }
             int[] groupIndices = entry.getValue().stream().mapToInt(Integer::intValue).toArray();
-            memRecords = ColumnGroupMerger.merge(memRecords, groupData, schema, groupIndices, 0);
+            memRecords = ColumnGroupMerger.merge(memRecords, rangeData, schema, groupIndices, 0);
             anyMerged = true;
         }
 
