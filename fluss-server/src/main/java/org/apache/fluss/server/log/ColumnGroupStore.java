@@ -94,8 +94,13 @@ public class ColumnGroupStore implements Closeable {
         }
 
         try (DataInputStream input = new DataInputStream(new FileInputStream(storeFile))) {
-            while (input.available() > 0) {
-                byte version = input.readByte();
+            while (true) {
+                byte version;
+                try {
+                    version = input.readByte();
+                } catch (java.io.EOFException eof) {
+                    break; // End of file
+                }
                 if (version != VERSION) {
                     LOG.warn(
                             "Unknown version {} in column group store {}, skipping rest",

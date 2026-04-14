@@ -215,7 +215,7 @@ public class WriterClient {
         ProduceLogColumnsRequest request = new ProduceLogColumnsRequest();
         request.setTableId(tableInfo.getTableId());
         request.setColumnGroup(columnGroup);
-        request.setTimeoutMs(maxRequestSize);
+        request.setTimeoutMs((int) conf.get(ConfigOptions.CLIENT_REQUEST_TIMEOUT).toMillis());
         PbProduceLogColumnsReqForBucket bucketReq = request.addBucketsReq();
         bucketReq.setBucketId(bucketId);
         bucketReq.setTargetOffset(targetOffset);

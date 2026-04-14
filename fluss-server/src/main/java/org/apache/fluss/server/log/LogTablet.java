@@ -1259,6 +1259,16 @@ public final class LogTablet {
             } catch (IOException e) {
                 LOG.error("Error while taking writer snapshot for bucket {}.", getTableBucket(), e);
             }
+            // Close column group stores to release file handles
+            for (ColumnGroupStore store : columnGroupStores.values()) {
+                try {
+                    store.close();
+                } catch (IOException e) {
+                    LOG.error(
+                            "Error closing column group store for bucket {}.", getTableBucket(), e);
+                }
+            }
+            columnGroupStores.clear();
             localLog.close();
         }
     }
