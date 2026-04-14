@@ -257,4 +257,10 @@ public class TestingTabletGatewayService extends TestingGatewayService
             DescribeClusterConfigsRequest request) {
         return null;
     }
+
+    @Override
+    public CompletableFuture<org.apache.fluss.rpc.messages.ProduceLogColumnsResponse>
+            produceLogColumns(org.apache.fluss.rpc.messages.ProduceLogColumnsRequest request) {
+        return null;
+    }
 }

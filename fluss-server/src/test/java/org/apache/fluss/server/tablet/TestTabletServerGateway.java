@@ -431,4 +431,11 @@ public class TestTabletServerGateway implements TabletServerGateway {
         stopReplicaResponse.addAllStopReplicasResps(protoStopReplicaRespForBuckets);
         return stopReplicaResponse;
     }
+
+    @Override
+    public CompletableFuture<org.apache.fluss.rpc.messages.ProduceLogColumnsResponse>
+            produceLogColumns(org.apache.fluss.rpc.messages.ProduceLogColumnsRequest request) {
+        return CompletableFuture.completedFuture(
+                new org.apache.fluss.rpc.messages.ProduceLogColumnsResponse());
+    }
 }

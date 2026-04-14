@@ -164,6 +164,43 @@ public final class LogSegment {
                 (int) logConfig.get(ConfigOptions.LOG_INDEX_INTERVAL_SIZE).getBytes());
     }
 
+    /**
+     * Open a log segment for a specific column group. Uses column-group-specific file names for
+     * log, index, and time index files.
+     */
+    public static LogSegment openForColumnGroup(
+            File dir,
+            long baseOffset,
+            Configuration logConfig,
+            String groupName,
+            LogFormat logFormat)
+            throws IOException {
+
+        int initFileSize = 0;
+        if (logConfig.getBoolean(ConfigOptions.LOG_FILE_PREALLOCATE)) {
+            initFileSize = (int) logConfig.get(ConfigOptions.LOG_SEGMENT_FILE_SIZE).getBytes();
+        }
+        int maxIndexSize = (int) logConfig.get(ConfigOptions.LOG_INDEX_FILE_SIZE).getBytes();
+
+        return new LogSegment(
+                logFormat,
+                FileLogRecords.open(
+                        FlussPaths.columnGroupLogFile(dir, baseOffset, groupName),
+                        false,
+                        initFileSize,
+                        logConfig.getBoolean(ConfigOptions.LOG_FILE_PREALLOCATE)),
+                LazyIndex.forOffset(
+                        FlussPaths.columnGroupOffsetIndexFile(dir, baseOffset, groupName),
+                        baseOffset,
+                        maxIndexSize),
+                LazyIndex.forTime(
+                        FlussPaths.columnGroupTimeIndexFile(dir, baseOffset, groupName),
+                        baseOffset,
+                        maxIndexSize),
+                baseOffset,
+                (int) logConfig.get(ConfigOptions.LOG_INDEX_INTERVAL_SIZE).getBytes());
+    }
+
     public OffsetIndex offsetIndex() throws IOException {
         return lazyOffsetIndex.get();
     }

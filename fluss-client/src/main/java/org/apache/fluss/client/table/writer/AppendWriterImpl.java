@@ -21,6 +21,7 @@ import org.apache.fluss.client.write.WriteRecord;
 import org.apache.fluss.client.write.WriterClient;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.PhysicalTablePath;
+import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.row.InternalRow;
@@ -31,6 +32,7 @@ import org.apache.fluss.row.encode.IndexedRowEncoder;
 import org.apache.fluss.row.encode.KeyEncoder;
 import org.apache.fluss.row.indexed.IndexedRow;
 import org.apache.fluss.types.DataType;
+import org.apache.fluss.types.RowType;
 
 import javax.annotation.Nullable;
 
@@ -98,6 +100,37 @@ class AppendWriterImpl extends AbstractTableWriter implements AppendWriter {
             record = WriteRecord.forArrowAppend(tableInfo, physicalPath, row, bucketKey);
         }
         return send(record).thenApply(ignored -> APPEND_SUCCESS);
+    }
+
+    @Override
+    public CompletableFuture<AppendResult> appendColumns(
+            String columnGroup, int bucketId, long targetOffset, InternalRow row) {
+        // Get the enrichment column indices for this column group
+        Schema schema = tableInfo.getSchema();
+        List<Integer> columnIndices = schema.getColumnGroups().get(columnGroup);
+        if (columnIndices == null) {
+            CompletableFuture<AppendResult> failed = new CompletableFuture<>();
+            failed.completeExceptionally(
+                    new IllegalArgumentException(
+                            "Column group '" + columnGroup + "' not found in schema"));
+            return failed;
+        }
+
+        // Build the enrichment row type (only the columns in the group)
+        RowType enrichmentRowType =
+                schema.getRowType().project(columnIndices.stream().mapToInt(i -> i).toArray());
+
+        return writerClient
+                .sendEnrichmentColumns(
+                        tableInfo,
+                        tablePath,
+                        columnGroup,
+                        bucketId,
+                        targetOffset,
+                        row,
+                        enrichmentRowType,
+                        tableInfo.getSchemaId())
+                .thenApply(ignored -> APPEND_SUCCESS);
     }
 
     private CompactedRow encodeCompactedRow(InternalRow row) {

@@ -994,6 +994,34 @@ public final class Replica {
         return logTablet.appendAsFollower(memoryLogRecords);
     }
 
+    /**
+     * Append enrichment columns at an existing offset in a column group.
+     *
+     * @param columnGroup the column group name
+     * @param targetOffset the offset of the base record to enrich
+     * @param enrichmentRow the enrichment column values
+     * @param schema the table schema for merge operations
+     */
+    public void appendColumnsToLeader(
+            String columnGroup,
+            long targetOffset,
+            org.apache.fluss.row.GenericRow enrichmentRow,
+            Schema schema) {
+        inReadLock(
+                leaderIsrUpdateLock,
+                () -> {
+                    if (!isLeader()) {
+                        throw new NotLeaderOrFollowerException(
+                                String.format(
+                                        "Leader not local for bucket %s on tabletServer %d",
+                                        tableBucket, localTabletServerId));
+                    }
+                    logTablet.setSchema(schema);
+                    logTablet.appendColumnsAtOffset(columnGroup, targetOffset, enrichmentRow);
+                    return null;
+                });
+    }
+
     public LogAppendInfo putRecordsToLeader(
             KvRecordBatch kvRecords,
             @Nullable int[] targetColumns,

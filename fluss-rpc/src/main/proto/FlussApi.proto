@@ -1330,3 +1330,30 @@ message PbLiteralValue {
   optional int32 timestamp_nano_of_millis_value = 12; // Nano of millis
   optional bytes decimal_bytes = 13;   // Serialized decimal (non-compact mode)
 }
+
+// produce log columns request and response
+// Used to write enrichment columns at existing offsets in a column group.
+message ProduceLogColumnsRequest {
+  required int64 table_id = 1;
+  required string column_group = 2;
+  required int32 timeout_ms = 3;
+  repeated PbProduceLogColumnsReqForBucket buckets_req = 4;
+}
+
+message PbProduceLogColumnsReqForBucket {
+  optional int64 partition_id = 1;
+  required int32 bucket_id = 2;
+  required int64 target_offset = 3;
+  required bytes records = 4;
+}
+
+message ProduceLogColumnsResponse {
+  repeated PbProduceLogColumnsRespForBucket buckets_resp = 1;
+}
+
+message PbProduceLogColumnsRespForBucket {
+  optional int64 partition_id = 1;
+  required int32 bucket_id = 2;
+  optional int32 error_code = 3;
+  optional string error_message = 4;
+}

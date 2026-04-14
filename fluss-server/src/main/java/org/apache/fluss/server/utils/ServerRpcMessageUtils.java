@@ -2232,4 +2232,92 @@ public class ServerRpcMessageUtils {
         }
         return offsets;
     }
+
+    /**
+     * Extract enrichment row values from MemoryLogRecords for a column group. The records contain
+     * Arrow-encoded data with only the enrichment columns. This method reads the first row from the
+     * records and returns it as a GenericRow.
+     *
+     * @param records the MemoryLogRecords containing enrichment data
+     * @param schema the full table schema
+     * @param columnGroup the column group name
+     * @return a GenericRow containing the enrichment column values
+     */
+    public static org.apache.fluss.row.GenericRow extractEnrichmentRow(
+            org.apache.fluss.record.MemoryLogRecords records,
+            org.apache.fluss.metadata.Schema schema,
+            String columnGroup) {
+        // Get the enrichment column indices
+        java.util.List<Integer> columnIndices = schema.getColumnGroups().get(columnGroup);
+        if (columnIndices == null) {
+            throw new IllegalArgumentException(
+                    "Column group '" + columnGroup + "' not found in schema");
+        }
+
+        // For the MVP, the enrichment row is sent as a simple GenericRow with only the enrichment
+        // columns. We read it from the Arrow records.
+        org.apache.fluss.types.RowType enrichmentRowType =
+                schema.getRowType().project(columnIndices.stream().mapToInt(i -> i).toArray());
+
+        org.apache.fluss.row.GenericRow enrichmentRow =
+                new org.apache.fluss.row.GenericRow(columnIndices.size());
+
+        // Build a schema containing only enrichment columns for Arrow decoding
+        org.apache.fluss.metadata.Schema.Builder enrichmentSchemaBuilder =
+                org.apache.fluss.metadata.Schema.newBuilder();
+        for (int idx : columnIndices) {
+            org.apache.fluss.metadata.Schema.Column col = schema.getColumns().get(idx);
+            enrichmentSchemaBuilder.column(col.getName(), col.getDataType());
+        }
+        final org.apache.fluss.metadata.Schema enrichmentSchema = enrichmentSchemaBuilder.build();
+
+        org.apache.fluss.metadata.SchemaGetter schemaGetter =
+                new org.apache.fluss.metadata.SchemaGetter() {
+                    @Override
+                    public org.apache.fluss.metadata.Schema getSchema(int schemaId) {
+                        return enrichmentSchema;
+                    }
+
+                    @Override
+                    public java.util.concurrent.CompletableFuture<
+                                    org.apache.fluss.metadata.SchemaInfo>
+                            getSchemaInfoAsync(int schemaId) {
+                        return java.util.concurrent.CompletableFuture.completedFuture(
+                                new org.apache.fluss.metadata.SchemaInfo(
+                                        enrichmentSchema, schemaId));
+                    }
+
+                    @Override
+                    public org.apache.fluss.metadata.SchemaInfo getLatestSchemaInfo() {
+                        return new org.apache.fluss.metadata.SchemaInfo(enrichmentSchema, 0);
+                    }
+
+                    @Override
+                    public void release() {}
+                };
+
+        try (org.apache.fluss.record.LogRecordReadContext readContext =
+                org.apache.fluss.record.LogRecordReadContext.createArrowReadContext(
+                        enrichmentRowType, 0, schemaGetter)) {
+            for (org.apache.fluss.record.LogRecordBatch batch : records.batches()) {
+                try (org.apache.fluss.utils.CloseableIterator<org.apache.fluss.record.LogRecord>
+                        iter = batch.records(readContext)) {
+                    if (iter.hasNext()) {
+                        org.apache.fluss.record.LogRecord record = iter.next();
+                        org.apache.fluss.row.InternalRow row = record.getRow();
+                        org.apache.fluss.row.InternalRow.FieldGetter[] getters =
+                                org.apache.fluss.row.InternalRow.createFieldGetters(
+                                        enrichmentRowType);
+                        for (int i = 0; i < columnIndices.size(); i++) {
+                            if (!row.isNullAt(i)) {
+                                enrichmentRow.setField(i, getters[i].getFieldOrNull(row));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        return enrichmentRow;
+    }
 }

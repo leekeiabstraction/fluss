@@ -52,8 +52,12 @@ import org.apache.fluss.rpc.messages.NotifyLeaderAndIsrRequest;
 import org.apache.fluss.rpc.messages.NotifyLeaderAndIsrResponse;
 import org.apache.fluss.rpc.messages.NotifyRemoteLogOffsetsRequest;
 import org.apache.fluss.rpc.messages.NotifyRemoteLogOffsetsResponse;
+import org.apache.fluss.rpc.messages.PbProduceLogColumnsReqForBucket;
+import org.apache.fluss.rpc.messages.PbProduceLogColumnsRespForBucket;
 import org.apache.fluss.rpc.messages.PrefixLookupRequest;
 import org.apache.fluss.rpc.messages.PrefixLookupResponse;
+import org.apache.fluss.rpc.messages.ProduceLogColumnsRequest;
+import org.apache.fluss.rpc.messages.ProduceLogColumnsResponse;
 import org.apache.fluss.rpc.messages.ProduceLogRequest;
 import org.apache.fluss.rpc.messages.ProduceLogResponse;
 import org.apache.fluss.rpc.messages.PutKvRequest;
@@ -180,6 +184,57 @@ public final class TabletService extends RpcServiceBase implements TabletServerG
                 produceLogData,
                 new UserContext(currentSession().getPrincipal()),
                 bucketResponseMap -> response.complete(makeProduceLogResponse(bucketResponseMap)));
+        return response;
+    }
+
+    @Override
+    public CompletableFuture<ProduceLogColumnsResponse> produceLogColumns(
+            ProduceLogColumnsRequest request) {
+        authorizeTable(WRITE, request.getTableId());
+        CompletableFuture<ProduceLogColumnsResponse> response = new CompletableFuture<>();
+
+        long tableId = request.getTableId();
+        String columnGroup = request.getColumnGroup();
+
+        // Get schema for this table
+        org.apache.fluss.metadata.Schema schema =
+                replicaManager.getTableSchema(tableId, columnGroup);
+
+        ProduceLogColumnsResponse resp = new ProduceLogColumnsResponse();
+        for (PbProduceLogColumnsReqForBucket bucketReq : request.getBucketsReqsList()) {
+            int bucketId = bucketReq.getBucketId();
+            long targetOffset = bucketReq.getTargetOffset();
+            Long partitionId = bucketReq.hasPartitionId() ? bucketReq.getPartitionId() : null;
+            TableBucket tb = new TableBucket(tableId, partitionId, bucketId);
+
+            PbProduceLogColumnsRespForBucket bucketResp = resp.addBucketsResp();
+            bucketResp.setBucketId(bucketId);
+            if (partitionId != null) {
+                bucketResp.setPartitionId(partitionId);
+            }
+
+            try {
+                // Decode the enrichment row from the records bytes
+                java.nio.ByteBuffer recordBuffer =
+                        org.apache.fluss.rpc.util.CommonRpcMessageUtils.toByteBuffer(
+                                bucketReq.getRecordsSlice());
+                MemoryLogRecords enrichmentRecords =
+                        MemoryLogRecords.pointToByteBuffer(recordBuffer);
+
+                // Extract enrichment row values from the records
+                org.apache.fluss.row.GenericRow enrichmentRow =
+                        ServerRpcMessageUtils.extractEnrichmentRow(
+                                enrichmentRecords, schema, columnGroup);
+
+                replicaManager.appendColumnsToLog(
+                        tb, columnGroup, targetOffset, enrichmentRow, schema);
+            } catch (Exception e) {
+                bucketResp.setErrorCode(Errors.forException(e).code());
+                bucketResp.setErrorMessage(e.getMessage());
+            }
+        }
+
+        response.complete(resp);
         return response;
     }
 

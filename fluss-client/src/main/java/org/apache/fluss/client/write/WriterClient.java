@@ -24,14 +24,29 @@ import org.apache.fluss.client.metadata.MetadataUpdater;
 import org.apache.fluss.client.metrics.WriterMetricGroup;
 import org.apache.fluss.client.write.RecordAccumulator.RecordAppendResult;
 import org.apache.fluss.cluster.Cluster;
+import org.apache.fluss.compression.ArrowCompressionInfo;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.exception.FlussRuntimeException;
 import org.apache.fluss.exception.IllegalConfigurationException;
+import org.apache.fluss.memory.UnmanagedPagedOutputView;
 import org.apache.fluss.metadata.PhysicalTablePath;
+import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableInfo;
+import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.record.ChangeType;
+import org.apache.fluss.record.MemoryLogRecordsArrowBuilder;
+import org.apache.fluss.row.InternalRow;
+import org.apache.fluss.row.arrow.ArrowWriter;
+import org.apache.fluss.row.arrow.ArrowWriterPool;
 import org.apache.fluss.rpc.gateway.TabletServerGateway;
+import org.apache.fluss.rpc.messages.PbProduceLogColumnsReqForBucket;
+import org.apache.fluss.rpc.messages.PbProduceLogColumnsRespForBucket;
+import org.apache.fluss.rpc.messages.ProduceLogColumnsRequest;
 import org.apache.fluss.rpc.metrics.ClientMetricGroup;
+import org.apache.fluss.shaded.arrow.org.apache.arrow.memory.BufferAllocator;
+import org.apache.fluss.shaded.arrow.org.apache.arrow.memory.RootAllocator;
+import org.apache.fluss.types.RowType;
 import org.apache.fluss.utils.CopyOnWriteMap;
 import org.apache.fluss.utils.clock.SystemClock;
 import org.apache.fluss.utils.concurrent.ExecutorThreadFactory;
@@ -138,6 +153,116 @@ public class WriterClient {
      */
     public void send(WriteRecord record, WriteCallback callback) {
         doSend(record, callback);
+    }
+
+    /**
+     * Send enrichment columns directly to a tablet server, bypassing the batching pipeline. This is
+     * used for column group writes where the target offset is already known.
+     *
+     * @param tableInfo the table information
+     * @param tablePath the table path
+     * @param columnGroup the column group name
+     * @param bucketId the bucket ID
+     * @param targetOffset the offset of the base record to enrich
+     * @param enrichmentRow the enrichment column values
+     * @param enrichmentRowType the row type for the enrichment columns only
+     * @param schemaId the schema ID
+     * @return a CompletableFuture that completes when the enrichment is acknowledged
+     */
+    public java.util.concurrent.CompletableFuture<Void> sendEnrichmentColumns(
+            TableInfo tableInfo,
+            TablePath tablePath,
+            String columnGroup,
+            int bucketId,
+            long targetOffset,
+            InternalRow enrichmentRow,
+            RowType enrichmentRowType,
+            int schemaId) {
+        throwIfWriterClosed();
+
+        // Find the leader for this bucket
+        TableBucket tb = new TableBucket(tableInfo.getTableId(), null, bucketId);
+        int leaderId = metadataUpdater.leaderFor(tablePath, tb);
+        TabletServerGateway gateway = metadataUpdater.newTabletServerClientForNode(leaderId);
+        if (gateway == null) {
+            return java.util.concurrent.CompletableFuture.supplyAsync(
+                    () -> {
+                        throw new FlussRuntimeException(
+                                "No gateway available for server " + leaderId);
+                    });
+        }
+
+        // Encode the enrichment row as Arrow MemoryLogRecords
+        byte[] recordBytes;
+        try {
+            recordBytes = encodeEnrichmentRow(enrichmentRow, enrichmentRowType, schemaId);
+        } catch (Exception e) {
+            java.util.concurrent.CompletableFuture<Void> failed =
+                    new java.util.concurrent.CompletableFuture<>();
+            failed.completeExceptionally(e);
+            return failed;
+        }
+
+        // Build the ProduceLogColumnsRequest
+        ProduceLogColumnsRequest request = new ProduceLogColumnsRequest();
+        request.setTableId(tableInfo.getTableId());
+        request.setColumnGroup(columnGroup);
+        request.setTimeoutMs(maxRequestSize);
+        PbProduceLogColumnsReqForBucket bucketReq = request.addBucketsReq();
+        bucketReq.setBucketId(bucketId);
+        bucketReq.setTargetOffset(targetOffset);
+        bucketReq.setRecords(recordBytes);
+
+        // Send via gateway
+        return gateway.produceLogColumns(request)
+                .thenAccept(
+                        response -> {
+                            for (PbProduceLogColumnsRespForBucket bucketResp :
+                                    response.getBucketsRespsList()) {
+                                if (bucketResp.hasErrorCode()) {
+                                    throw new FlussRuntimeException(
+                                            "Enrichment write failed: "
+                                                    + bucketResp.getErrorMessage());
+                                }
+                            }
+                        });
+    }
+
+    /**
+     * Encode an enrichment row as Arrow-format MemoryLogRecords bytes.
+     *
+     * @param row the enrichment row
+     * @param rowType the row type for the enrichment columns
+     * @param schemaId the schema ID
+     * @return serialized bytes for the records
+     */
+    private byte[] encodeEnrichmentRow(InternalRow row, RowType rowType, int schemaId)
+            throws Exception {
+        try (BufferAllocator allocator = new RootAllocator(Integer.MAX_VALUE);
+                ArrowWriterPool writerPool = new ArrowWriterPool(allocator)) {
+            ArrowWriter writer =
+                    writerPool.getOrCreateWriter(
+                            1L,
+                            schemaId,
+                            Integer.MAX_VALUE,
+                            rowType,
+                            ArrowCompressionInfo.NO_COMPRESSION);
+            MemoryLogRecordsArrowBuilder builder =
+                    MemoryLogRecordsArrowBuilder.builder(
+                            0L,
+                            org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V0,
+                            schemaId,
+                            writer,
+                            new UnmanagedPagedOutputView(16 * 1024));
+            builder.append(ChangeType.APPEND_ONLY, row);
+            builder.close();
+            org.apache.fluss.record.bytesview.MultiBytesView bytesView = builder.build();
+            org.apache.fluss.shaded.netty4.io.netty.buffer.ByteBuf buf = bytesView.getByteBuf();
+            byte[] bytes = new byte[buf.readableBytes()];
+            buf.readBytes(bytes);
+            buf.release();
+            return bytes;
+        }
     }
 
     /**

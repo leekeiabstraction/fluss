@@ -37,4 +37,18 @@ public interface AppendWriter extends TableWriter {
      * @return A {@link CompletableFuture} that always returns append result when complete normally.
      */
     CompletableFuture<AppendResult> append(InternalRow record);
+
+    /**
+     * Append enrichment columns at an existing offset in a column group. The enrichment row should
+     * contain only the columns belonging to the specified column group, in the order they appear in
+     * the schema.
+     *
+     * @param columnGroup the column group name to write to
+     * @param bucketId the bucket ID where the base record exists
+     * @param targetOffset the offset of the base record to enrich
+     * @param row the enrichment column values (only columns in the column group)
+     * @return A {@link CompletableFuture} that completes when the enrichment is acknowledged.
+     */
+    CompletableFuture<AppendResult> appendColumns(
+            String columnGroup, int bucketId, long targetOffset, InternalRow row);
 }

@@ -28,6 +28,7 @@ import org.apache.fluss.exception.LogOffsetOutOfRangeException;
 import org.apache.fluss.exception.LogStorageException;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.PhysicalTablePath;
+import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.metrics.MetricNames;
@@ -38,6 +39,7 @@ import org.apache.fluss.record.FileLogRecords;
 import org.apache.fluss.record.LogRecordBatch;
 import org.apache.fluss.record.LogRecords;
 import org.apache.fluss.record.MemoryLogRecords;
+import org.apache.fluss.row.GenericRow;
 import org.apache.fluss.server.log.LocalLog.SegmentDeletionReason;
 import org.apache.fluss.server.metrics.group.BucketMetricGroup;
 import org.apache.fluss.server.metrics.group.TabletServerMetricGroup;
@@ -64,6 +66,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.TreeMap;
 import java.util.concurrent.ScheduledFuture;
 
 import static org.apache.fluss.utils.FileUtils.flushFileIfExists;
@@ -127,6 +130,19 @@ public final class LogTablet {
     // note: currently, for primary key table, the log start offset nerve be updated
     private volatile long lakeLogStartOffset = Long.MAX_VALUE;
     private volatile long lakeLogEndOffset = -1L;
+
+    // In-memory cache for column group enrichment data, backed by ColumnGroupStore on disk.
+    // Maps column group name -> (offset -> enrichment row values).
+    @GuardedBy("lock")
+    private final Map<String, TreeMap<Long, GenericRow>> columnGroupEnrichment;
+
+    // Persistent stores for column group enrichment data, one per column group.
+    @GuardedBy("lock")
+    private final Map<String, ColumnGroupStore> columnGroupStores;
+
+    // The table schema, needed for column group merge operations. May be null for tables without
+    // column groups.
+    @Nullable private volatile Schema schema;
     private volatile long lakeMaxTimestamp = -1;
 
     private LogTablet(
@@ -168,6 +184,9 @@ public final class LogTablet {
         // updating this value in time. Default value to Long.MAX_VALUE for normal log table,
         // as we don't need to retain logs for kv recovery.
         this.minRetainOffset = isChangelog ? 0L : Long.MAX_VALUE;
+        this.columnGroupEnrichment = new HashMap<>();
+        this.columnGroupStores = new HashMap<>();
+        this.schema = null;
     }
 
     public PhysicalTablePath getPhysicalTablePath() {
@@ -439,8 +458,199 @@ public final class LogTablet {
             maxOffsetMetadata = fetchHighWatermarkMetadata();
         }
 
-        return localLog.read(
-                readOffset, maxLength, minOneMessage, maxOffsetMetadata, projection, filterContext);
+        // When column group enrichment data exists, skip projection so we can merge
+        // the full row including enrichment columns on the server side.
+        boolean hasEnrichment;
+        synchronized (lock) {
+            hasEnrichment = !columnGroupEnrichment.isEmpty() && schema != null;
+            if (!columnGroupEnrichment.isEmpty() || schema != null) {
+                LOG.info(
+                        "Column group check: enrichmentEmpty={}, schema={}, hasEnrichment={}",
+                        columnGroupEnrichment.isEmpty(),
+                        schema != null,
+                        hasEnrichment);
+            }
+        }
+        FileLogProjection effectiveProjection = hasEnrichment ? null : projection;
+
+        FetchDataInfo fetchDataInfo =
+                localLog.read(
+                        readOffset,
+                        maxLength,
+                        minOneMessage,
+                        maxOffsetMetadata,
+                        effectiveProjection,
+                        filterContext);
+
+        // Merge enrichment column group data if available
+        if (hasEnrichment) {
+            try {
+                fetchDataInfo = mergeColumnGroupData(fetchDataInfo, readOffset);
+            } catch (Exception e) {
+                LOG.error("Failed to merge column group data, returning base data", e);
+            }
+        }
+
+        return fetchDataInfo;
+    }
+
+    /**
+     * Set the schema for this log tablet, enabling column group operations. If the schema has
+     * column groups and persistent enrichment data exists on disk, it will be loaded into the
+     * in-memory cache.
+     */
+    public void setSchema(Schema schema) {
+        if (this.schema != null) {
+            return; // Already set
+        }
+        this.schema = schema;
+
+        // Load persisted enrichment data from disk for each column group
+        synchronized (lock) {
+            for (Map.Entry<String, List<Integer>> entry : schema.getColumnGroups().entrySet()) {
+                String groupName = entry.getKey();
+                if (!columnGroupEnrichment.containsKey(groupName)
+                        && ColumnGroupStore.exists(localLog.getLogTabletDir(), groupName)) {
+                    int[] indices = entry.getValue().stream().mapToInt(i -> i).toArray();
+                    org.apache.fluss.types.RowType enrichmentRowType =
+                            schema.getRowType().project(indices);
+                    TreeMap<Long, GenericRow> loaded =
+                            ColumnGroupStore.load(
+                                    localLog.getLogTabletDir(), groupName, enrichmentRowType);
+                    if (!loaded.isEmpty()) {
+                        columnGroupEnrichment.put(groupName, loaded);
+                    }
+                }
+            }
+        }
+    }
+
+    /** Get the schema for this log tablet. */
+    @Nullable
+    public Schema getSchema() {
+        return schema;
+    }
+
+    /**
+     * Append enrichment columns at an existing offset in the specified column group. The enrichment
+     * row should contain only the columns belonging to the column group.
+     *
+     * @param columnGroup the column group name
+     * @param targetOffset the base offset to enrich
+     * @param enrichmentRow the enrichment column values
+     */
+    public void appendColumnsAtOffset(
+            String columnGroup, long targetOffset, GenericRow enrichmentRow) {
+        synchronized (lock) {
+            checkArgument(
+                    targetOffset < localLog.getLocalLogEndOffset(),
+                    "Target offset %s must be less than log end offset %s",
+                    targetOffset,
+                    localLog.getLocalLogEndOffset());
+
+            // Update in-memory cache
+            columnGroupEnrichment
+                    .computeIfAbsent(columnGroup, k -> new TreeMap<>())
+                    .put(targetOffset, enrichmentRow);
+
+            // Persist to disk
+            try {
+                ColumnGroupStore store = getOrCreateStore(columnGroup);
+                store.append(targetOffset, enrichmentRow);
+            } catch (java.io.IOException e) {
+                LOG.error(
+                        "Failed to persist enrichment for column group '{}' at offset {}",
+                        columnGroup,
+                        targetOffset,
+                        e);
+            }
+        }
+    }
+
+    /**
+     * Get or create the persistent store for a column group. The store file is created in the
+     * tablet directory.
+     */
+    @GuardedBy("lock")
+    private ColumnGroupStore getOrCreateStore(String columnGroup) throws java.io.IOException {
+        ColumnGroupStore store = columnGroupStores.get(columnGroup);
+        if (store == null) {
+            if (schema == null) {
+                throw new IllegalStateException(
+                        "Schema must be set before writing to column groups");
+            }
+            List<Integer> columnIndices = schema.getColumnGroups().get(columnGroup);
+            if (columnIndices == null) {
+                throw new IllegalArgumentException(
+                        "Column group '" + columnGroup + "' not found in schema");
+            }
+            org.apache.fluss.types.RowType enrichmentRowType =
+                    schema.getRowType().project(columnIndices.stream().mapToInt(i -> i).toArray());
+            store =
+                    new ColumnGroupStore(
+                            localLog.getLogTabletDir(), columnGroup, enrichmentRowType);
+            columnGroupStores.put(columnGroup, store);
+        }
+        return store;
+    }
+
+    /**
+     * Merge enrichment column group data into the fetched records. For each record in the fetch
+     * result, if enrichment data exists at that offset, the enrichment columns are overlaid onto
+     * the base record.
+     */
+    private FetchDataInfo mergeColumnGroupData(FetchDataInfo baseInfo, long startOffset)
+            throws Exception {
+        LogRecords records = baseInfo.getRecords();
+        if (records.sizeInBytes() == 0) {
+            return baseInfo;
+        }
+
+        // Collect all enrichment data across all column groups for the relevant offset range
+        Map<String, List<Integer>> columnGroups = schema.getColumnGroups();
+        if (columnGroups.isEmpty()) {
+            return baseInfo;
+        }
+
+        // Build combined enrichment map: offset -> merged enrichment row
+        TreeMap<Long, GenericRow> mergedEnrichment = new TreeMap<>();
+        for (Map.Entry<String, java.util.List<Integer>> entry : columnGroups.entrySet()) {
+            String groupName = entry.getKey();
+            TreeMap<Long, GenericRow> groupData = columnGroupEnrichment.get(groupName);
+            if (groupData != null && !groupData.isEmpty()) {
+                mergedEnrichment.putAll(groupData);
+            }
+        }
+
+        if (mergedEnrichment.isEmpty()) {
+            return baseInfo;
+        }
+
+        // Get enrichment column indices
+        int[] enrichmentIndices =
+                columnGroups.values().stream()
+                        .flatMapToInt(list -> list.stream().mapToInt(Integer::intValue))
+                        .toArray();
+
+        // We need MemoryLogRecords for merging. If the records are file-backed,
+        // read them into memory first.
+        MemoryLogRecords memRecords;
+        if (records instanceof MemoryLogRecords) {
+            memRecords = (MemoryLogRecords) records;
+        } else if (records instanceof FileLogRecords) {
+            FileLogRecords fileRecords = (FileLogRecords) records;
+            java.nio.ByteBuffer buffer = java.nio.ByteBuffer.allocate(fileRecords.sizeInBytes());
+            fileRecords.readInto(buffer, 0);
+            memRecords = MemoryLogRecords.pointToByteBuffer(buffer);
+        } else {
+            // BytesViewLogRecords or other - skip merge for now
+            return baseInfo;
+        }
+
+        MemoryLogRecords merged =
+                ColumnGroupMerger.merge(memRecords, mergedEnrichment, schema, enrichmentIndices, 0);
+
+        return new FetchDataInfo(baseInfo.getFetchOffsetMetadata(), merged);
     }
 
     /**

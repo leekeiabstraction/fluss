@@ -599,6 +599,45 @@ public class ReplicaManager implements ServerReconfigurable {
     }
 
     /**
+     * Append enrichment columns at an existing offset in a column group.
+     *
+     * @param tb the table bucket to write to
+     * @param columnGroup the column group name
+     * @param targetOffset the offset of the base record to enrich
+     * @param enrichmentRow the enrichment column values
+     * @param schema the table schema for merge operations
+     */
+    public void appendColumnsToLog(
+            TableBucket tb,
+            String columnGroup,
+            long targetOffset,
+            org.apache.fluss.row.GenericRow enrichmentRow,
+            org.apache.fluss.metadata.Schema schema) {
+        Replica replica = getReplicaOrException(tb);
+        replica.appendColumnsToLeader(columnGroup, targetOffset, enrichmentRow, schema);
+    }
+
+    /**
+     * Get the schema for a table by table ID. Used for column group operations where the schema is
+     * needed to determine column group membership.
+     *
+     * @param tableId the table ID
+     * @param columnGroup the column group name (for validation)
+     * @return the table schema
+     */
+    public org.apache.fluss.metadata.Schema getTableSchema(long tableId, String columnGroup) {
+        // Find any online replica for this table to get the schema
+        for (Map.Entry<TableBucket, HostedReplica> entry : allReplicas.entrySet()) {
+            if (entry.getKey().getTableId() == tableId
+                    && entry.getValue() instanceof OnlineReplica) {
+                return ((OnlineReplica) entry.getValue()).getReplica().getTableInfo().getSchema();
+            }
+        }
+        throw new org.apache.fluss.exception.TableNotExistException(
+                "Table with id " + tableId + " not found");
+    }
+
+    /**
      * Fetch records from a replica. Currently, we will return the fetched records immediately.
      *
      * <p>The callback function will be triggered when required fetch info is satisfied. Both client
