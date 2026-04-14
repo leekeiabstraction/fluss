@@ -64,6 +64,9 @@ public class FlussPaths {
     /** Suffix of a time index file. */
     public static final String TIME_INDEX_FILE_SUFFIX = ".timeindex";
 
+    /** Suffix of an enrichment companion log file. */
+    public static final String ENRICH_LOG_FILE_SUFFIX = ".enrich.log";
+
     /** Suffix of a writer snapshot file. */
     public static final String WRITER_SNAPSHOT_FILE_SUFFIX = ".writer_snapshot";
 
@@ -267,6 +270,16 @@ public class FlussPaths {
      */
     public static File logFile(File logTabletDir, long offset) {
         return new File(logTabletDir, filenamePrefixFromOffset(offset) + LOG_FILE_SUFFIX);
+    }
+
+    /**
+     * Construct an enrichment companion file name in the given dir using the given base offset.
+     *
+     * @param logTabletDir The log tablet directory in which the file will reside
+     * @param offset The base offset of the corresponding log segment
+     */
+    public static File enrichLogFile(File logTabletDir, long offset) {
+        return new File(logTabletDir, filenamePrefixFromOffset(offset) + ENRICH_LOG_FILE_SUFFIX);
     }
 
     /**

@@ -26,6 +26,7 @@ import org.apache.fluss.exception.InvalidRecordException;
 import org.apache.fluss.exception.LogOffsetOutOfRangeException;
 import org.apache.fluss.exception.LogSegmentOffsetOverflowException;
 import org.apache.fluss.metadata.LogFormat;
+import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.predicate.Predicate;
 import org.apache.fluss.record.BytesViewLogRecords;
 import org.apache.fluss.record.FileChannelChunk;
@@ -100,6 +101,14 @@ public final class LogSegment {
     // The maximum timestamp and start offset we see so far
     private volatile TimestampOffset maxTimestampAndStartOffsetSoFar = TimestampOffset.UNKNOWN;
 
+    // Enrichment companion file, loaded when companion is registered.
+    @Nullable private volatile FileLogRecords enrichmentRecords;
+
+    // Schema needed for merge operations when companion exists.
+    @Nullable private volatile Schema enrichmentSchema;
+    private volatile int enrichmentSchemaId;
+    private volatile int[] enrichmentColumnIndices;
+
     public LogSegment(
             LogFormat logFormat,
             FileLogRecords fileLogRecords,
@@ -125,6 +134,26 @@ public final class LogSegment {
 
     public long getBaseOffset() {
         return baseOffset;
+    }
+
+    /**
+     * Attach an enrichment companion file to this segment. Called after the companion file has been
+     * written for a sealed segment.
+     */
+    public void setEnrichmentCompanion(
+            FileLogRecords enrichRecords,
+            Schema schema,
+            int schemaId,
+            int[] enrichmentColumnIndices) {
+        this.enrichmentRecords = enrichRecords;
+        this.enrichmentSchema = schema;
+        this.enrichmentSchemaId = schemaId;
+        this.enrichmentColumnIndices = enrichmentColumnIndices;
+    }
+
+    /** Check if this segment has an enrichment companion file. */
+    public boolean hasEnrichmentCompanion() {
+        return enrichmentRecords != null;
     }
 
     public static LogSegment open(
@@ -565,8 +594,26 @@ public final class LogSegment {
         }
         if (projection == null) {
             int fetchSize = Math.min((int) (maxPosition - startPosition), adjustedMaxSize);
-            return new FetchDataInfo(
-                    offsetMetadata, fileLogRecords.slice(startPosition, fetchSize));
+            LogRecords baseRecords = fileLogRecords.slice(startPosition, fetchSize);
+            // If companion enrichment file exists, merge enrichment columns into base records
+            FileLogRecords companionRecords = this.enrichmentRecords;
+            Schema companionSchema = this.enrichmentSchema;
+            if (companionRecords != null && companionSchema != null) {
+                try {
+                    MemoryLogRecords mergedRecords =
+                            ColumnGroupMerger.mergeFromCompanionFile(
+                                    baseRecords,
+                                    companionRecords,
+                                    companionSchema,
+                                    enrichmentColumnIndices,
+                                    enrichmentSchemaId);
+                    return new FetchDataInfo(offsetMetadata, mergedRecords);
+                } catch (Exception e) {
+                    LOG.warn("Failed to merge enrichment companion, returning base records", e);
+                    return new FetchDataInfo(offsetMetadata, baseRecords);
+                }
+            }
+            return new FetchDataInfo(offsetMetadata, baseRecords);
         } else {
             if (logFormat != LogFormat.ARROW) {
                 throw new InvalidColumnProjectionException(
@@ -854,6 +901,9 @@ public final class LogSegment {
         closeQuietly(lazyOffsetIndex, "offset index file");
         closeQuietly(lazyTimeIndex, "time index file");
         closeQuietly(fileLogRecords, "log file");
+        if (enrichmentRecords != null) {
+            closeQuietly(enrichmentRecords, "enrichment log file");
+        }
     }
 
     public void closeHandlers() {

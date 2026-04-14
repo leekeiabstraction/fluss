@@ -1955,6 +1955,26 @@ public class ReplicaManager implements ServerReconfigurable {
         return replicaOpt;
     }
 
+    /**
+     * Write enrichment companion file for a sealed segment.
+     *
+     * @param tableBucket the table bucket
+     * @param baseOffset the base offset of the sealed segment
+     * @param enrichmentByOffset map of offset to enrichment row
+     * @param schema the full table schema
+     * @param schemaId the schema ID
+     */
+    public void writeSegmentEnrichment(
+            org.apache.fluss.metadata.TableBucket tableBucket,
+            long baseOffset,
+            java.util.TreeMap<Long, org.apache.fluss.row.GenericRow> enrichmentByOffset,
+            org.apache.fluss.metadata.Schema schema,
+            int schemaId)
+            throws Exception {
+        Replica replica = getReplicaOrException(tableBucket);
+        replica.writeSegmentEnrichment(baseOffset, enrichmentByOffset, schema, schemaId);
+    }
+
     public Replica getReplicaOrException(TableBucket tableBucket) {
         HostedReplica replica = getReplica(tableBucket);
         if (replica instanceof OnlineReplica) {

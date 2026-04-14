@@ -328,6 +328,23 @@ public final class Replica {
         return logTablet;
     }
 
+    /**
+     * Write enrichment companion file for a sealed segment in the log tablet.
+     *
+     * @param baseOffset the base offset of the sealed segment
+     * @param enrichmentByOffset map of offset to enrichment row data
+     * @param schema the full table schema
+     * @param schemaId the schema ID
+     */
+    public void writeSegmentEnrichment(
+            long baseOffset,
+            java.util.TreeMap<Long, org.apache.fluss.row.GenericRow> enrichmentByOffset,
+            org.apache.fluss.metadata.Schema schema,
+            int schemaId)
+            throws Exception {
+        logTablet.writeEnrichmentForSegment(baseOffset, enrichmentByOffset, schema, schemaId);
+    }
+
     public long getLocalLogEndOffset() {
         return logTablet.localLogEndOffset();
     }

@@ -1000,6 +1000,54 @@ public final class LogTablet {
         }
     }
 
+    /**
+     * Write enrichment companion file for a sealed segment. The segment must be inactive (sealed,
+     * not the active segment).
+     *
+     * @param baseOffset the base offset of the sealed segment
+     * @param enrichmentByOffset map of offset to enrichment row (full schema width)
+     * @param schema the full table schema
+     * @param schemaId the schema ID
+     */
+    public void writeEnrichmentForSegment(
+            long baseOffset,
+            java.util.TreeMap<Long, org.apache.fluss.row.GenericRow> enrichmentByOffset,
+            org.apache.fluss.metadata.Schema schema,
+            int schemaId)
+            throws Exception {
+        synchronized (lock) {
+            java.util.Optional<LogSegment> segmentOpt = localLog.getSegments().get(baseOffset);
+            if (!segmentOpt.isPresent()) {
+                throw new IllegalArgumentException(
+                        "Segment with base offset " + baseOffset + " not found");
+            }
+            LogSegment segment = segmentOpt.get();
+            LogSegment activeSegment = localLog.getSegments().activeSegment();
+            if (segment == activeSegment) {
+                throw new IllegalArgumentException(
+                        "Cannot write enrichment for active segment at offset " + baseOffset);
+            }
+
+            java.util.Map<String, java.util.List<Integer>> columnGroups = schema.getColumnGroups();
+            java.util.List<Integer> allEnrichmentIndices = new java.util.ArrayList<>();
+            for (java.util.List<Integer> indices : columnGroups.values()) {
+                allEnrichmentIndices.addAll(indices);
+            }
+            int[] enrichmentIndices =
+                    allEnrichmentIndices.stream().mapToInt(Integer::intValue).toArray();
+
+            FileLogRecords companionRecords =
+                    SegmentEnrichmentWriter.writeCompanionFile(
+                            localLog.getLogTabletDir(),
+                            baseOffset,
+                            enrichmentByOffset,
+                            schema,
+                            schemaId);
+
+            segment.setEnrichmentCompanion(companionRecords, schema, schemaId, enrichmentIndices);
+        }
+    }
+
     public List<LogSegment> logSegments(long from, long to) {
         synchronized (lock) {
             return localLog.getSegments().values(from, to);
