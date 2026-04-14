@@ -101,6 +101,49 @@ class ColumnGroupStoreTest {
         assertThat(loaded).isEmpty();
     }
 
+    /**
+     * Simulates single-node recovery: writes enrichment data, closes the store, then verifies
+     * ColumnGroupStore.load() recovers all entries. This is the recovery path used by
+     * LogTablet.setSchema() on restart.
+     */
+    @Test
+    void testRecoveryAfterRestart() throws Exception {
+        RowType enrichmentRowType =
+                new RowType(
+                        Arrays.asList(
+                                new DataField("location", DataTypes.STRING()),
+                                new DataField("score", DataTypes.DOUBLE()),
+                                new DataField("flag", DataTypes.BOOLEAN())));
+
+        // Simulate a running tablet writing enrichment data
+        try (ColumnGroupStore store =
+                new ColumnGroupStore(tempDir, "recovery_test", enrichmentRowType)) {
+            for (int i = 0; i < 10; i++) {
+                GenericRow row = new GenericRow(3);
+                row.setField(0, BinaryString.fromString("region-" + i));
+                row.setField(1, i * 1.1);
+                row.setField(2, i % 2 == 0);
+                store.append((long) i, row);
+            }
+        }
+
+        // Simulate restart: verify store file exists and can be loaded
+        assertThat(ColumnGroupStore.exists(tempDir, "recovery_test")).isTrue();
+
+        TreeMap<Long, GenericRow> recovered =
+                ColumnGroupStore.load(tempDir, "recovery_test", enrichmentRowType);
+        assertThat(recovered).hasSize(10);
+
+        // Verify all entries recovered correctly
+        for (int i = 0; i < 10; i++) {
+            GenericRow row = recovered.get((long) i);
+            assertThat(row).isNotNull();
+            assertThat(row.getString(0).toString()).isEqualTo("region-" + i);
+            assertThat(row.getDouble(1)).isEqualTo(i * 1.1);
+            assertThat(row.getBoolean(2)).isEqualTo(i % 2 == 0);
+        }
+    }
+
     @Test
     void testAppendAfterReopen() throws Exception {
         RowType rowType = new RowType(Arrays.asList(new DataField("value", DataTypes.INT())));

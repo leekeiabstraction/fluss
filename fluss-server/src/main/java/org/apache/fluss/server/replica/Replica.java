@@ -997,6 +997,12 @@ public final class Replica {
     /**
      * Append enrichment columns at an existing offset in a column group.
      *
+     * <p>TODO: Enrichment data is not replicated to followers. On leader failover, enrichment is
+     * recovered from the leader's local ColumnGroupStore files, but followers do not receive
+     * enrichment data through the replication protocol. A production implementation should either:
+     * (1) piggyback enrichment markers on the main log so followers replay them, or (2) add a
+     * dedicated enrichment replication channel.
+     *
      * @param columnGroup the column group name
      * @param targetOffset the offset of the base record to enrich
      * @param enrichmentRow the enrichment column values
