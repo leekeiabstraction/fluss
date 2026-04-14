@@ -67,6 +67,9 @@ public class FlussPaths {
     /** Suffix of a writer snapshot file. */
     public static final String WRITER_SNAPSHOT_FILE_SUFFIX = ".writer_snapshot";
 
+    /** Infix for column group segment files. */
+    public static final String COLUMN_GROUP_INFIX = ".col.";
+
     /** The directory name for storing remote log index files. */
     public static final String REMOTE_LOG_INDEX_LOCAL_CACHE = "remote-log-index-cache";
 
@@ -309,6 +312,39 @@ public class FlussPaths {
      */
     public static File timeIndexFile(File dir, long offset) {
         return new File(dir, filenamePrefixFromOffset(offset) + TIME_INDEX_FILE_SUFFIX);
+    }
+
+    /**
+     * Construct a column group log file name in the given dir with the given base offset and group
+     * name.
+     *
+     * @param logTabletDir The log tablet directory
+     * @param offset The base offset of the log file
+     * @param groupName The column group name
+     */
+    public static File columnGroupLogFile(File logTabletDir, long offset, String groupName) {
+        return new File(
+                logTabletDir,
+                filenamePrefixFromOffset(offset)
+                        + COLUMN_GROUP_INFIX
+                        + groupName
+                        + LOG_FILE_SUFFIX);
+    }
+
+    /**
+     * Construct a column group offset index file name in the given dir.
+     *
+     * @param dir The directory
+     * @param offset The base offset
+     * @param groupName The column group name
+     */
+    public static File columnGroupOffsetIndexFile(File dir, long offset, String groupName) {
+        return new File(
+                dir,
+                filenamePrefixFromOffset(offset)
+                        + COLUMN_GROUP_INFIX
+                        + groupName
+                        + INDEX_FILE_SUFFIX);
     }
 
     /**

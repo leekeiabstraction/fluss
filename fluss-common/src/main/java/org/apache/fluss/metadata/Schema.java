@@ -37,8 +37,10 @@ import java.io.Serializable;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
@@ -224,6 +226,33 @@ public final class Schema implements Serializable {
         return highestFieldId;
     }
 
+    /**
+     * Returns a map of column group names to their column indices. Only includes columns that have
+     * a column group assigned.
+     */
+    public Map<String, List<Integer>> getColumnGroups() {
+        Map<String, List<Integer>> groups = new HashMap<>();
+        for (int i = 0; i < columns.size(); i++) {
+            Optional<String> group = columns.get(i).getColumnGroup();
+            if (group.isPresent()) {
+                groups.computeIfAbsent(group.get(), k -> new ArrayList<>()).add(i);
+            }
+        }
+        return groups;
+    }
+
+    /** Returns the set of column group names defined in this schema. */
+    public Set<String> getColumnGroupNames() {
+        return getColumnGroups().keySet();
+    }
+
+    /** Returns indices of columns that are NOT in any column group (the default group). */
+    public int[] getDefaultGroupColumnIndices() {
+        return IntStream.range(0, columns.size())
+                .filter(i -> !columns.get(i).getColumnGroup().isPresent())
+                .toArray();
+    }
+
     @Override
     public String toString() {
         return "Schema{"
@@ -365,7 +394,8 @@ public final class Schema implements Serializable {
                                     column.dataType,
                                     column.comment,
                                     newColumnId,
-                                    column.aggFunction));
+                                    column.aggFunction,
+                                    column.columnGroup));
                 }
             }
 
@@ -488,6 +518,21 @@ public final class Schema implements Serializable {
             return this;
         }
 
+        /** Assign the previous column to a column group. */
+        public Builder columnGroup(String groupName) {
+            checkNotNull(groupName, "Column group name must not be null.");
+            if (!columns.isEmpty()) {
+                columns.set(
+                        columns.size() - 1,
+                        columns.get(columns.size() - 1).withColumnGroup(groupName));
+            } else {
+                throw new IllegalArgumentException(
+                        "Method 'columnGroup(...)' must be called after a column definition, "
+                                + "but there is no preceding column defined.");
+            }
+            return this;
+        }
+
         /**
          * Declares a primary key constraint for a set of given columns. Primary key uniquely
          * identify a row in a table. Neither of columns in a primary can be nullable. Adding a
@@ -589,18 +634,19 @@ public final class Schema implements Serializable {
         private final DataType dataType;
         private final @Nullable String comment;
         private final @Nullable AggFunction aggFunction;
+        private final @Nullable String columnGroup;
 
         public Column(String columnName, DataType dataType) {
-            this(columnName, dataType, null, UNKNOWN_COLUMN_ID, null);
+            this(columnName, dataType, null, UNKNOWN_COLUMN_ID, null, null);
         }
 
         public Column(String columnName, DataType dataType, @Nullable String comment) {
-            this(columnName, dataType, comment, UNKNOWN_COLUMN_ID, null);
+            this(columnName, dataType, comment, UNKNOWN_COLUMN_ID, null, null);
         }
 
         public Column(
                 String columnName, DataType dataType, @Nullable String comment, int columnId) {
-            this(columnName, dataType, comment, columnId, null);
+            this(columnName, dataType, comment, columnId, null, null);
         }
 
         public Column(
@@ -609,11 +655,22 @@ public final class Schema implements Serializable {
                 @Nullable String comment,
                 int columnId,
                 @Nullable AggFunction aggFunction) {
+            this(columnName, dataType, comment, columnId, aggFunction, null);
+        }
+
+        public Column(
+                String columnName,
+                DataType dataType,
+                @Nullable String comment,
+                int columnId,
+                @Nullable AggFunction aggFunction,
+                @Nullable String columnGroup) {
             this.columnName = columnName;
             this.dataType = dataType;
             this.comment = comment;
             this.columnId = columnId;
             this.aggFunction = aggFunction;
+            this.columnGroup = columnGroup;
         }
 
         public String getName() {
@@ -641,12 +698,21 @@ public final class Schema implements Serializable {
             return Optional.ofNullable(aggFunction);
         }
 
+        /** Returns the column group name, if any. */
+        public Optional<String> getColumnGroup() {
+            return Optional.ofNullable(columnGroup);
+        }
+
         public Column withComment(String comment) {
-            return new Column(columnName, dataType, comment, columnId, aggFunction);
+            return new Column(columnName, dataType, comment, columnId, aggFunction, columnGroup);
         }
 
         public Column withAggFunction(@Nullable AggFunction aggFunction) {
-            return new Column(columnName, dataType, comment, columnId, aggFunction);
+            return new Column(columnName, dataType, comment, columnId, aggFunction, columnGroup);
+        }
+
+        public Column withColumnGroup(@Nullable String columnGroup) {
+            return new Column(columnName, dataType, comment, columnId, aggFunction, columnGroup);
         }
 
         @Override
@@ -660,6 +726,7 @@ public final class Schema implements Serializable {
                                 sb.append(EncodingUtils.escapeSingleQuotes(c));
                                 sb.append("'");
                             });
+            getColumnGroup().ifPresent(g -> sb.append(" COLUMN GROUP '").append(g).append("'"));
             return sb.toString();
         }
 
@@ -676,12 +743,13 @@ public final class Schema implements Serializable {
                     && Objects.equals(dataType, that.dataType)
                     && Objects.equals(comment, that.comment)
                     && Objects.equals(columnId, that.columnId)
-                    && Objects.equals(aggFunction, that.aggFunction);
+                    && Objects.equals(aggFunction, that.aggFunction)
+                    && Objects.equals(columnGroup, that.columnGroup);
         }
 
         @Override
         public int hashCode() {
-            return Objects.hash(columnName, dataType, comment, columnId, aggFunction);
+            return Objects.hash(columnName, dataType, comment, columnId, aggFunction, columnGroup);
         }
     }
 

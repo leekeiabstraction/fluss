@@ -129,6 +129,10 @@ public final class LogTablet {
     private volatile long lakeLogEndOffset = -1L;
     private volatile long lakeMaxTimestamp = -1;
 
+    // Column group enrichment stores (group name -> store)
+    private final java.util.concurrent.ConcurrentHashMap<String, ColumnGroupStore>
+            columnGroupStores = org.apache.fluss.utils.MapUtils.newConcurrentHashMap();
+
     private LogTablet(
             PhysicalTablePath physicalPath,
             LocalLog localLog,
@@ -263,6 +267,78 @@ public final class LogTablet {
 
     public long getLakeMaxTimestamp() {
         return lakeMaxTimestamp;
+    }
+
+    // --------------------------------------------------------------------------------------------
+    // Column Group Enrichment Methods
+    // --------------------------------------------------------------------------------------------
+
+    /**
+     * Register a column group store for enrichment data. If the group is already registered, this
+     * is a no-op.
+     */
+    public void registerColumnGroupIfAbsent(String groupName) {
+        columnGroupStores.computeIfAbsent(groupName, ColumnGroupStore::new);
+    }
+
+    /**
+     * Store enrichment data for a specific offset in the given column group.
+     *
+     * @param groupName the column group name
+     * @param offset the base log offset to enrich
+     * @param enrichmentRow the enrichment columns as a GenericRow
+     * @throws IllegalArgumentException if the offset is beyond the log end offset
+     */
+    public void putEnrichment(
+            String groupName, long offset, org.apache.fluss.row.GenericRow enrichmentRow) {
+        long logEndOffset = localLogEndOffset();
+        if (offset >= logEndOffset) {
+            throw new IllegalArgumentException(
+                    String.format(
+                            "Cannot enrich offset %d which is at or beyond log end offset %d "
+                                    + "for bucket %s",
+                            offset, logEndOffset, getTableBucket()));
+        }
+        ColumnGroupStore store =
+                columnGroupStores.computeIfAbsent(groupName, ColumnGroupStore::new);
+        store.put(offset, enrichmentRow);
+    }
+
+    /**
+     * Advance the enrichment watermark for a column group. The EWM represents that all offsets up
+     * to (but not including) newEwm have enrichment data available.
+     */
+    public void advanceEnrichmentWatermark(String groupName, long newEwm) {
+        ColumnGroupStore store = columnGroupStores.get(groupName);
+        if (store != null) {
+            store.advanceEnrichmentWatermark(newEwm);
+        }
+    }
+
+    /** Get the enrichment watermark for a specific column group, or -1 if not registered. */
+    public long getEnrichmentWatermark(String groupName) {
+        ColumnGroupStore store = columnGroupStores.get(groupName);
+        return store != null ? store.getEnrichmentWatermark() : -1L;
+    }
+
+    /** Get all enrichment watermarks across all column groups. */
+    public Map<String, Long> getAllEnrichmentWatermarks() {
+        Map<String, Long> watermarks = new HashMap<>();
+        for (Map.Entry<String, ColumnGroupStore> entry : columnGroupStores.entrySet()) {
+            watermarks.put(entry.getKey(), entry.getValue().getEnrichmentWatermark());
+        }
+        return watermarks;
+    }
+
+    /**
+     * Get the column group store for a specific group. Visible for testing.
+     *
+     * @return the store, or null if not registered
+     */
+    @Nullable
+    @VisibleForTesting
+    public ColumnGroupStore getColumnGroupStore(String groupName) {
+        return columnGroupStores.get(groupName);
     }
 
     public int getWriterIdCount() {
