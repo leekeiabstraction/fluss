@@ -64,8 +64,6 @@ public class FlussPaths {
     /** Suffix of a time index file. */
     public static final String TIME_INDEX_FILE_SUFFIX = ".timeindex";
 
-    public static final String COLUMN_GROUP_INFIX = ".col.";
-
     /** Suffix of a writer snapshot file. */
     public static final String WRITER_SNAPSHOT_FILE_SUFFIX = ".writer_snapshot";
 
@@ -311,54 +309,6 @@ public class FlussPaths {
      */
     public static File timeIndexFile(File dir, long offset) {
         return new File(dir, filenamePrefixFromOffset(offset) + TIME_INDEX_FILE_SUFFIX);
-    }
-
-    /**
-     * Construct a column group log file name in the given dir.
-     *
-     * @param dir The directory in which the file will reside
-     * @param offset The base offset of the log file
-     * @param groupName The column group name
-     */
-    public static File columnGroupLogFile(File dir, long offset, String groupName) {
-        return new File(
-                dir,
-                filenamePrefixFromOffset(offset)
-                        + COLUMN_GROUP_INFIX
-                        + groupName
-                        + LOG_FILE_SUFFIX);
-    }
-
-    /**
-     * Construct a column group offset index file name in the given dir.
-     *
-     * @param dir The directory in which the file will reside
-     * @param offset The base offset of the log file
-     * @param groupName The column group name
-     */
-    public static File columnGroupOffsetIndexFile(File dir, long offset, String groupName) {
-        return new File(
-                dir,
-                filenamePrefixFromOffset(offset)
-                        + COLUMN_GROUP_INFIX
-                        + groupName
-                        + INDEX_FILE_SUFFIX);
-    }
-
-    /**
-     * Construct a column group time index file name in the given dir.
-     *
-     * @param dir The directory in which the file will reside
-     * @param offset The base offset of the log file
-     * @param groupName The column group name
-     */
-    public static File columnGroupTimeIndexFile(File dir, long offset, String groupName) {
-        return new File(
-                dir,
-                filenamePrefixFromOffset(offset)
-                        + COLUMN_GROUP_INFIX
-                        + groupName
-                        + TIME_INDEX_FILE_SUFFIX);
     }
 
     /**

@@ -27,6 +27,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.File;
+import java.io.FileOutputStream;
 import java.util.Arrays;
 import java.util.TreeMap;
 
@@ -167,5 +168,72 @@ class ColumnGroupStoreTest {
         assertThat(loaded).hasSize(2);
         assertThat(loaded.get(0L).getInt(0)).isEqualTo(42);
         assertThat(loaded.get(1L).getInt(0)).isEqualTo(99);
+    }
+
+    /** Tests all supported data types round-trip through the store. */
+    @Test
+    void testAllSupportedDataTypes() throws Exception {
+        RowType rowType =
+                new RowType(
+                        Arrays.asList(
+                                new DataField("bool_col", DataTypes.BOOLEAN()),
+                                new DataField("int_col", DataTypes.INT()),
+                                new DataField("bigint_col", DataTypes.BIGINT()),
+                                new DataField("float_col", DataTypes.FLOAT()),
+                                new DataField("double_col", DataTypes.DOUBLE()),
+                                new DataField("string_col", DataTypes.STRING()),
+                                new DataField("bytes_col", DataTypes.BYTES())));
+
+        try (ColumnGroupStore store = new ColumnGroupStore(tempDir, "all_types", rowType)) {
+            GenericRow row = new GenericRow(7);
+            row.setField(0, true);
+            row.setField(1, 42);
+            row.setField(2, 123456789L);
+            row.setField(3, 3.14f);
+            row.setField(4, 2.718281828);
+            row.setField(5, BinaryString.fromString("hello"));
+            row.setField(6, new byte[] {0x01, 0x02, 0x03});
+            store.append(0L, row);
+        }
+
+        TreeMap<Long, GenericRow> loaded = ColumnGroupStore.load(tempDir, "all_types", rowType);
+        assertThat(loaded).hasSize(1);
+        GenericRow row = loaded.get(0L);
+        assertThat(row.getBoolean(0)).isTrue();
+        assertThat(row.getInt(1)).isEqualTo(42);
+        assertThat(row.getLong(2)).isEqualTo(123456789L);
+        assertThat(row.getFloat(3)).isEqualTo(3.14f);
+        assertThat(row.getDouble(4)).isEqualTo(2.718281828);
+        assertThat(row.getString(5).toString()).isEqualTo("hello");
+        assertThat((byte[]) row.getField(6)).containsExactly(0x01, 0x02, 0x03);
+    }
+
+    /** Tests that a truncated (corrupt) store file loads the valid entries and skips the rest. */
+    @Test
+    void testLoadFromCorruptFile() throws Exception {
+        RowType rowType = new RowType(Arrays.asList(new DataField("value", DataTypes.INT())));
+
+        // Write two valid entries
+        try (ColumnGroupStore store = new ColumnGroupStore(tempDir, "corrupt", rowType)) {
+            GenericRow row0 = new GenericRow(1);
+            row0.setField(0, 100);
+            store.append(0L, row0);
+
+            GenericRow row1 = new GenericRow(1);
+            row1.setField(0, 200);
+            store.append(1L, row1);
+        }
+
+        // Append garbage bytes to simulate corruption
+        File storeFile = new File(tempDir, "enrichment.corrupt.dat");
+        try (FileOutputStream fos = new FileOutputStream(storeFile, true)) {
+            fos.write(new byte[] {0x01, 0x00}); // version byte + partial data
+        }
+
+        // Should load the two valid entries and gracefully handle the corrupt tail
+        TreeMap<Long, GenericRow> loaded = ColumnGroupStore.load(tempDir, "corrupt", rowType);
+        assertThat(loaded).hasSize(2);
+        assertThat(loaded.get(0L).getInt(0)).isEqualTo(100);
+        assertThat(loaded.get(1L).getInt(0)).isEqualTo(200);
     }
 }
