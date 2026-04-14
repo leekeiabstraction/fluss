@@ -612,26 +612,6 @@ public final class LogTablet {
             return baseInfo;
         }
 
-        // Build combined enrichment map: offset -> merged enrichment row
-        TreeMap<Long, GenericRow> mergedEnrichment = new TreeMap<>();
-        for (Map.Entry<String, java.util.List<Integer>> entry : columnGroups.entrySet()) {
-            String groupName = entry.getKey();
-            TreeMap<Long, GenericRow> groupData = columnGroupEnrichment.get(groupName);
-            if (groupData != null && !groupData.isEmpty()) {
-                mergedEnrichment.putAll(groupData);
-            }
-        }
-
-        if (mergedEnrichment.isEmpty()) {
-            return baseInfo;
-        }
-
-        // Get enrichment column indices
-        int[] enrichmentIndices =
-                columnGroups.values().stream()
-                        .flatMapToInt(list -> list.stream().mapToInt(Integer::intValue))
-                        .toArray();
-
         // We need MemoryLogRecords for merging. If the records are file-backed,
         // read them into memory first.
         MemoryLogRecords memRecords;
@@ -647,10 +627,26 @@ public final class LogTablet {
             return baseInfo;
         }
 
-        MemoryLogRecords merged =
-                ColumnGroupMerger.merge(memRecords, mergedEnrichment, schema, enrichmentIndices, 0);
+        // Merge each column group sequentially. The output of one merge becomes the
+        // input to the next, so multiple groups enriching the same offsets are handled
+        // correctly without overwriting each other.
+        boolean anyMerged = false;
+        for (Map.Entry<String, List<Integer>> entry : columnGroups.entrySet()) {
+            String groupName = entry.getKey();
+            TreeMap<Long, GenericRow> groupData = columnGroupEnrichment.get(groupName);
+            if (groupData == null || groupData.isEmpty()) {
+                continue;
+            }
+            int[] groupIndices = entry.getValue().stream().mapToInt(Integer::intValue).toArray();
+            memRecords = ColumnGroupMerger.merge(memRecords, groupData, schema, groupIndices, 0);
+            anyMerged = true;
+        }
 
-        return new FetchDataInfo(baseInfo.getFetchOffsetMetadata(), merged);
+        if (!anyMerged) {
+            return baseInfo;
+        }
+
+        return new FetchDataInfo(baseInfo.getFetchOffsetMetadata(), memRecords);
     }
 
     /**

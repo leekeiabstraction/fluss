@@ -88,6 +88,12 @@ public class ColumnGroupMerger {
 
         SchemaGetter schemaGetter = new SimpleSchemaGetter(schema, actualSchemaId);
 
+        // Build getters for the enrichment row type
+        RowType enrichmentRowType = fullRowType.project(enrichmentColumnIndices);
+        InternalRow.FieldGetter[] enrichmentGetters =
+                InternalRow.createFieldGetters(enrichmentRowType);
+        InternalRow.FieldGetter[] baseGetters = InternalRow.createFieldGetters(fullRowType);
+
         try (BufferAllocator allocator = new RootAllocator(Integer.MAX_VALUE)) {
             LogRecordReadContext readContext =
                     LogRecordReadContext.createArrowReadContext(
@@ -96,20 +102,13 @@ public class ColumnGroupMerger {
             try {
                 for (LogRecordBatch batch : baseRecords.batches()) {
                     firstBaseOffset = batch.baseLogOffset();
-                    long currentOffset = firstBaseOffset;
 
                     try (CloseableIterator<LogRecord> iter = batch.records(readContext)) {
-                        // Build getters for the enrichment row type
-                        RowType enrichmentRowType = fullRowType.project(enrichmentColumnIndices);
-                        InternalRow.FieldGetter[] enrichmentGetters =
-                                InternalRow.createFieldGetters(enrichmentRowType);
-                        InternalRow.FieldGetter[] baseGetters =
-                                InternalRow.createFieldGetters(fullRowType);
-
                         while (iter.hasNext()) {
                             LogRecord record = iter.next();
+                            long recordOffset = record.logOffset();
                             InternalRow baseRow = record.getRow();
-                            GenericRow enrichmentRow = enrichmentByOffset.get(currentOffset);
+                            GenericRow enrichmentRow = enrichmentByOffset.get(recordOffset);
 
                             GenericRow merged = new GenericRow(totalColumns);
 
@@ -134,7 +133,6 @@ public class ColumnGroupMerger {
 
                             mergedRows.add(merged);
                             mergedChangeTypes.add(ChangeType.APPEND_ONLY);
-                            currentOffset++;
                         }
                     }
                 }
@@ -192,7 +190,7 @@ public class ColumnGroupMerger {
     }
 
     /** Simple SchemaGetter that returns a fixed schema for a single schema ID. */
-    private static class SimpleSchemaGetter implements SchemaGetter {
+    static class SimpleSchemaGetter implements SchemaGetter {
         private final Schema schema;
         private final int schemaId;
 
