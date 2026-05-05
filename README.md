@@ -890,185 +890,67 @@ Plus EWM tracking:
 
 ### Read Flow
 
-Same as Option 1 (merge column groups by offset), but the consumer can choose how the EWM affects visibility.
+Same as Option 1 (merge column groups by offset), but the consumer's visible offset is always gated at `min(HWM, EWM_g for groups in the projection)`. See [Consumer Visibility](#consumer-visibility) below.
 
-## Consumer Contracts
+## Consumer Visibility
 
-Three consumption modes that determine how clients interact with incomplete enrichment:
-
-### Contract A: Best-Effort (Fire-and-Forget)
-
-**Each offset is seen exactly once. NULLs in enrichment columns are permanent from the consumer's perspective.**
+A consumer's visible offset ceiling is determined entirely by its projection:
 
 ```
-scan.enrichment.mode = best-effort
-
-Consumer reads offset 1000 -> (device_id="abc", geo=NULL)   # enrichment not yet filled
-Consumer reads offset 1001 -> ...
-# offset 1000 enrichment arrives later -- consumer never sees it
+visible_offset = min(HWM, EWM_g for each column group g touched by the projection)
 ```
 
-- Consumer sees records up to HWM, regardless of EWM
-- Enrichment columns are NULL where `offset > EWM`
-- No redelivery, no buffering
-- Client must handle NULLs in business logic
+This is the only mode. There is no opt-out, no client-side buffering, no redelivery, no NULL handling for unfilled enrichment. **Every record a consumer sees is fully populated for the columns it asked for.**
 
-**Client code:**
-```java
-for (ScanRecord record : scanner.poll(timeout)) {
-    String geo = record.getRow().isNullAt(geoIdx) ? "UNKNOWN" : record.getRow().getString(geoIdx);
-    // proceed with possibly-null enrichment
-}
-```
+### Worked Examples
 
-**Good for**: Metrics pipelines, monitoring, alerting -- where approximate data is acceptable and low latency matters.
-
-**Edge cases**:
-- Consumer has no way to know if NULL means "enrichment pending" vs "genuinely no data" -- may need a metadata flag or sentinel value
-- If enrichment job is permanently down, all enrichment columns are permanently NULL
-
-### Contract B: Redelivery (Changelog Semantics)
-
-**When enrichment backfill arrives, the system emits an UPDATE for previously-consumed offsets.**
-
-```
-scan.enrichment.mode = redelivery
-
-t=1  Consumer reads: offset 1000, INSERT  (device_id="abc", geo=NULL)
-t=2  Enrichment fills offset 1000
-t=3  Consumer reads: offset 1000, UPDATE_AFTER (device_id="abc", geo="US-WEST")
-```
-
-This reuses the existing `ChangeType` enum in `ScanRecord` (`INSERT`, `UPDATE_BEFORE`, `UPDATE_AFTER`, `DELETE`).
-
-**How redelivery is triggered**: The consumer tracks `lastCompleteEWM`. When EWM advances past it, the consumer re-reads the newly enriched offset range:
-
-```
-Consumer state:
-  currentOffset = 1500          (latest offset consumed)
-  lastCompleteEWM = 800         (EWM when we last checked)
-
-EWM advances from 800 -> 1200:
-  -> re-read offsets [801, 1200] with all columns
-  -> emit as UPDATE_AFTER records
-  -> update lastCompleteEWM = 1200
-  -> continue from currentOffset = 1500
-```
-
-**Client code:**
-```java
-for (ScanRecord record : scanner.poll(timeout)) {
-    switch (record.getChangeType()) {
-        case INSERT:
-            downstream.insert(record.getRow());    // first time, enrichment may be NULL
-            break;
-        case UPDATE_AFTER:
-            downstream.upsert(record.getLogOffset(), record.getRow());  // enrichment backfill
-            break;
-    }
-}
-```
-
-**Good for**: Databases, KV stores, search indexes -- any downstream that supports upserts.
-
-**Edge cases**:
-- **Downstream must support upserts**. Append-only sinks (files, Kafka topics, email notifications) cannot handle UPDATE_AFTER.
-- **Offset ordering is violated** during redelivery -- the consumer sees offset 801 (redelivery) after offset 1500 (current). Downstream must not assume offset ordering.
-- **Checkpoint complexity**: Must persist both `currentOffset` and `lastCompleteEWM` to recover correctly after failure.
-- **Duplicate processing**: If the consumer crashes between processing a redelivered record and checkpointing, it may reprocess the same UPDATE_AFTER on restart. Downstream must be idempotent.
-
-### Contract C: Connector-Managed Buffer (Flink-Native)
-
-**The Flink connector buffers records internally, emitting only when enrichment is available (or timeout expires).**
-
-```
-scan.enrichment.mode = buffered    (default for Flink connector)
-scan.enrichment.timeout = 30s
-scan.enrichment.buffer-size = 100mb
-```
-
-The complexity is contained within `FlinkSourceSplitReader`:
-
-```
-FlinkSourceSplitReader enhanced behavior:
-
-  Internal state per split:
-    baseOffset = 1500           (latest base offset fetched)
-    enrichedOffset = 800        (latest offset where enrichment confirmed)
-    buffer: TreeMap<offset, Row>
-
-  fetch():
-    1. Fetch new base records [baseOffset..HWM], store in buffer with enrichment NULL
-    2. Check EWM. For buffered records where offset <= EWM:
-         fetch enrichment columns, merge into row, emit as complete record
-    3. Buffer too large or oldest record age > timeout?
-         emit oldest records with NULL enrichment (graceful degradation)
-    4. Return emitted records
-```
-
-```
-Visualization:
-
-                     EWM          HWM
-                      |            |
-  ────────────────────┼────────────┼──────
-  enriched records    | buffered   | not yet
-  (emitted, complete) | (held)     | fetched
-```
-
-**Flink SQL usage:**
+**Pure base projection** -- no enrichment columns selected:
 ```sql
-SELECT device_id, ip, geo_region, risk_score
-FROM device_logs
-/*+ OPTIONS('scan.enrichment.mode'='buffered',
-            'scan.enrichment.timeout'='30s',
-            'scan.enrichment.buffer-size'='100mb') */
+SELECT device_id, ip, payload, ts FROM device_logs
 ```
+Visibility = HWM. The EWM is never consulted; this query behaves exactly as today's log table reads.
 
-**Good for**: Most Flink jobs -- provides the cleanest semantics without leaking complexity to user code.
+**Single enrichment group**:
+```sql
+SELECT device_id, geo_region FROM device_logs
+```
+Visibility = `min(HWM, EWM_enriched)`. Enrichment lag manifests as consumer lag for this query.
 
-**Edge cases**:
-- **Memory pressure**: Buffer size is bounded, but under sustained enrichment lag, the buffer fills and records degrade to NULLs. The `scan.enrichment.buffer-size` must be tuned relative to expected lag.
-- **Checkpoint size**: Buffered records must be included in Flink checkpoints. Large buffers increase checkpoint size and duration.
-- **Latency**: Records are held until enrichment arrives or timeout expires. For latency-sensitive jobs, the timeout must be short.
-- **Non-Flink clients**: This mode is Flink-specific. Raw `LogScanner` clients must use Contract A or B.
+**Multiple enrichment groups** -- projection spans `enriched_geo` and `enriched_fraud`:
+```sql
+SELECT device_id, geo_region, risk_score FROM device_logs
+```
+Visibility = `min(HWM, EWM_enriched_geo, EWM_enriched_fraud)`. The slowest enrichment job dictates visibility for this query. A separate consumer projecting only `geo_region` is unaffected by `EWM_enriched_fraud` lag.
 
-### Consumer Contract Comparison
+### Why No Override
 
-| Dimension | A: Best-Effort | B: Redelivery | C: Buffered |
-|-----------|---------------|---------------|-------------|
-| Client complexity | Low (handle NULLs) | Medium (handle UPDATE) | None (connector hides it) |
-| Downstream requirements | Must tolerate NULLs | Must support upsert | No special requirement |
-| Data completeness | Best-effort | Eventually complete | Complete up to buffer limit |
-| Offset ordering | Preserved | Violated (re-reads old offsets) | Preserved |
-| State overhead | None | EWM tracking | Buffer memory |
-| Works for non-Flink clients | Yes | Yes | No |
-| Latency | Lowest | Low + redelivery spike | Bounded by timeout |
+Allowing reads past EWM (with NULL enrichment columns) would re-introduce the complexity this design avoids: clients distinguishing "pending" from "genuinely null," redelivery semantics for backfill, buffer-or-degrade tradeoffs in the connector. Excluding the override preserves a clean contract: **if a column is in the projection, the value you see is the value that was written.** No partial rows ever cross the read boundary.
 
-### Recommended Defaults
+The cost is latency. Enrichment lag becomes visible consumer lag for any reader that touches enrichment columns. This is intentional -- a stalled enrichment job becomes loud (consumer lag metrics rise) instead of silent (NULL columns drift past unnoticed downstream).
 
-| Client type | Default mode | Rationale |
-|-------------|-------------|-----------|
-| Fluss Java client (`LogScanner`) | `BEST_EFFORT` | Raw clients are expected to handle edge cases |
-| Flink connector | `BUFFERED` | Cleanest semantics, connector already manages internal buffering |
-| Flink SQL (ad-hoc) | `BEST_EFFORT` | Interactive queries shouldn't block on enrichment |
+### Implementation
+
+**Server-side**: `LogTablet.read()` / `FetchParams` inspects the projection (already carried in `FetchLogRequest.projected_fields`), looks up the column groups it touches, and bounds the returned offset range at `min(HWM, EWM_g for those groups)`. Same code path as today's HWM gate, just a tighter ceiling.
+
+**Client-side**: no changes. No mode config, no buffer state, no special record handling. The fetch returns records up to the gated offset; the client processes them as it does today.
+
+**Wire protocol**: `FetchLogResponse` carries per-group EWM values for observability and metrics. `FetchLogRequest` requires no new mode field -- the projection it already carries is sufficient.
 
 ## Codebase Changes Required
 
 | Component | File | Change |
 |-----------|------|--------|
-| `LogTablet` | `fluss-server/.../log/LogTablet.java` | Track per-column-group EWM. New `enrichmentWatermark` alongside existing `highWatermark`. Column-group-aware append |
+| `LogTablet` | `fluss-server/.../log/LogTablet.java` | Track per-column-group EWM (`enrichmentWatermark` alongside existing `highWatermark`). Column-group-aware append. Read path gates fetches at `min(HWM, EWM_g for groups in projection)` |
+| `ReplicaManager` / `FetchParams` | `fluss-server/.../replica/ReplicaManager.java` | Resolve projected fields → touched column groups → effective watermark, pass into `LogTablet.read()` |
 | `Replica` | `fluss-server/.../replica/Replica.java` | EWM replication (followers track it alongside HWM) |
 | `LocalLog` | `fluss-server/.../log/LocalLog.java` | Manage parallel segment chains per column group |
 | `LogSegment` | `fluss-server/.../log/LogSegment.java` | Multiple `FileLogRecords` per column group. Merge-on-read |
 | `AppendWriter` | `fluss-client/.../table/writer/AppendWriter.java` | New: `appendColumns(columnGroup, sourceOffset, row)` |
-| `LogScanner` | `fluss-client/.../scanner/log/LogScanner.java` | Enrichment mode config. EWM-aware fetch logic |
-| `LogFetcher` | `fluss-client/.../scanner/log/LogFetcher.java` | Pass enrichment mode in `FetchLogRequest` |
-| `FlinkSourceSplitReader` | `fluss-flink/.../source/reader/FlinkSourceSplitReader.java` | Buffer mode: hold records until EWM catches up or timeout |
 | `ProduceLogRequest` | `FlussApi.proto` | New field: `column_group` (string), `source_offset` (int64) |
-| `FetchLogRequest` | `FlussApi.proto` | New field: `enrichment_watermark_mode` enum |
-| `FetchLogResponse` | `FlussApi.proto` | New field: `enrichment_watermark` (int64) per column group |
+| `FetchLogResponse` | `FlussApi.proto` | New field: `enrichment_watermark` (int64) per column group, for observability |
 | Checkpoint file | Storage layer | Persist EWM per bucket per column group |
+
+`LogScanner`, `LogFetcher`, `FlinkSourceSplitReader`, and `FetchLogRequest` need **no changes** beyond what already exists -- the gate is purely server-side and driven by the projection that `FetchLogRequest` already carries.
 
 ## Tiered Storage Integration
 
@@ -1176,12 +1058,7 @@ Segments tier with base columns only after `enrichment-wait-timeout`. Local disk
 
 #### 2. Consumer Degradation
 
-| Consumer mode | Behavior under lag |
-|---------------|-------------------|
-| `STRICT` | Blocks. Consumer stops advancing. Backpressure propagates upstream. |
-| `BEST_EFFORT` | Continues. Enrichment columns are NULL. No impact on throughput. |
-| `REDELIVERY` | Continues with NULLs, then redelivers when backfill arrives. |
-| `BUFFERED` | Holds records up to buffer limit / timeout, then degrades to NULLs. |
+Consumers projecting an enrichment column block at the gated offset until EWM advances. Backpressure propagates upstream. Consumers projecting only base columns are unaffected and continue to advance up to HWM as today.
 
 #### 3. Operational Metrics
 
@@ -1253,8 +1130,7 @@ Segment sealed (rolled)
 
 | Decision point | Gate condition | Effect |
 |----------------|---------------|--------|
-| Consumer read (STRICT mode) | `offset <= min(HWM, EWM_*)` | Consumer sees only fully-enriched rows |
-| Consumer read (BUFFERED mode) | Buffer + timeout | Records held until enriched or timeout |
+| Consumer read | `offset <= min(HWM, EWM_g for groups in projection)` | Enrichment-projecting consumers see only fully-enriched rows; pure-base consumers bounded by HWM (today's behavior) |
 | Remote tiering | `segment.lastOffset <= min(EWM_*)` | Remote segments are always complete (with timeout escape) |
 | Lake materialization | `offsetRange.last <= min(EWM_*)` | Lake tables have all columns (with timeout escape) |
 | Local segment deletion | Segment tiered (which requires EWM gate) | Can't lose un-enriched data (unless retention forces it) |
@@ -1266,24 +1142,24 @@ Segment sealed (rolled)
 - **Enrichment watermark is a powerful primitive** -- one concept gates consumers, tiering, and lake materialization
 - **Composable** -- multiple enrichment jobs fill different column groups independently, each with its own EWM: `readable_offset = min(HWM, EWM_geo, EWM_fraud, EWM_identity)`
 - **Arrow-native** -- columnar batches naturally support column-subset storage and merging
-- **Consumer choice** -- clients declare their consistency/latency tradeoff explicitly
+- **No partial rows** -- consumers projecting enrichment columns are gated at the EWM, so every row they see is fully populated; pure-base consumers are unaffected
 - **Graceful degradation** -- timeout escape valves prevent cascading failures
 - **Single lake table** -- no "raw" vs "enriched" table split in the catalog
 
 ## Cons
 
-- **Highest implementation complexity** -- new watermark concept, checkpoint persistence, replication, consumer modes, tiering logic
+- **High implementation complexity** -- new watermark concept, checkpoint persistence, replication, tiering logic
 - **Breaks append-only invariant** -- like Option 1, writing at existing offsets is a fundamental change
 - **EWM replication overhead** -- followers must track EWM per column group, adding to replication protocol
 - **Backfill complexity** -- late enrichment of already-tiered segments requires companion file uploads and manifest updates
-- **Consumer mode proliferation** -- four modes (STRICT, BEST_EFFORT, REDELIVERY, BUFFERED) is a large API surface to test and document
+- **Enrichment lag = consumer lag** -- consumers projecting enrichment columns cannot advance past the EWM, so a stalled enrichment job stalls all enrichment-projecting reads (this is intentional, but operators must monitor it)
 - **Retention vs enrichment tension** -- requires careful policy when enrichment lag approaches retention, with no perfect answer
 
 ## When to Choose This Option
 
-- Enrichment completeness matters to consumers and must be tracked at the infrastructure level
+- Enrichment completeness matters to consumers and must be enforced at read time -- consumers should never see partial rows
 - Multiple independent enrichment jobs enrich the same base stream
-- You need consumers to have explicit control over the completeness/latency tradeoff
+- Enrichment lag manifesting as consumer lag is acceptable (or preferred over silent NULLs)
 - The team is willing to invest in a new system primitive (EWM) that will be maintained long-term
 - Lake/tiered storage is in use and must contain enriched data
 
@@ -1303,9 +1179,9 @@ This branch is an MVP that implements the foundational pieces of Option 2:
 | `ColumnGroupEWMITCase` integration test (5 tests, all passing) | ✅ Implemented |
 | `PRODUCE_LOG_COLUMNS` RPC + `appendColumns` client API | ⏳ Future work |
 | Server-side merge-on-read (rebuild Arrow batches) | ⏳ Future work |
+| Server-side read gate (`min(HWM, EWM_g for groups in projection)`) | ⏳ Future work |
 | EWM replication to followers | ⏳ Future work |
 | Tiering / lake EWM gate | ⏳ Future work |
-| `REDELIVERY` and `BUFFERED` consumer modes | ⏳ Future work |
 
 ## Running the Integration Test
 
