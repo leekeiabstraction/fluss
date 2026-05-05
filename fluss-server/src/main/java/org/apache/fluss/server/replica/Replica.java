@@ -49,6 +49,10 @@ import org.apache.fluss.record.KvRecordBatch;
 import org.apache.fluss.record.LogRecordReadContext;
 import org.apache.fluss.record.LogRecords;
 import org.apache.fluss.record.MemoryLogRecords;
+import org.apache.fluss.row.GenericRow;
+import org.apache.fluss.row.InternalRow;
+import org.apache.fluss.row.indexed.IndexedRow;
+import org.apache.fluss.rpc.messages.PbEnrichmentEntry;
 import org.apache.fluss.rpc.protocol.Errors;
 import org.apache.fluss.rpc.protocol.MergeMode;
 import org.apache.fluss.rpc.util.PredicateMessageUtils;
@@ -69,6 +73,7 @@ import org.apache.fluss.server.kv.snapshot.KvTabletSnapshotTarget;
 import org.apache.fluss.server.kv.snapshot.PeriodicSnapshotManager;
 import org.apache.fluss.server.kv.snapshot.RocksIncrementalSnapshot;
 import org.apache.fluss.server.kv.snapshot.SnapshotContext;
+import org.apache.fluss.server.log.ColumnGroupStore;
 import org.apache.fluss.server.log.FetchDataInfo;
 import org.apache.fluss.server.log.FetchIsolation;
 import org.apache.fluss.server.log.FetchParams;
@@ -97,6 +102,7 @@ import org.apache.fluss.server.zk.ZkSequenceIDCounter;
 import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
 import org.apache.fluss.server.zk.data.ZkData;
+import org.apache.fluss.types.DataType;
 import org.apache.fluss.types.RowType;
 import org.apache.fluss.utils.CloseableRegistry;
 import org.apache.fluss.utils.FlussPaths;
@@ -1002,6 +1008,88 @@ public final class Replica {
     public LogAppendInfo appendRecordsToFollower(MemoryLogRecords memoryLogRecords)
             throws Exception {
         return logTablet.appendAsFollower(memoryLogRecords);
+    }
+
+    /**
+     * Append enrichment columns for the given column group at the source offsets carried by each
+     * entry. Each entry's {@code enrichment_row} is an IndexedRow encoding of the column group's
+     * columns, in the order they appear in the table schema.
+     *
+     * <p>After all puts succeed, the per-group enrichment watermark (EWM) advances to the highest
+     * contiguous offset that has been filled (starting from offset 0). Returns the resulting EWM.
+     */
+    public long appendColumnsAsLeader(String columnGroup, List<PbEnrichmentEntry> entries) {
+        return inReadLock(
+                leaderIsrUpdateLock,
+                () -> {
+                    if (!isLeader()) {
+                        throw new NotLeaderOrFollowerException(
+                                String.format(
+                                        "Leader not local for bucket %s on tabletServer %d",
+                                        tableBucket, localTabletServerId));
+                    }
+
+                    Schema schema = tableInfo.getSchema();
+                    Map<String, List<Integer>> groupIndices = schema.getColumnGroups();
+                    List<Integer> indicesInGroup = groupIndices.get(columnGroup);
+                    if (indicesInGroup == null) {
+                        throw new IllegalArgumentException(
+                                "Unknown column group '"
+                                        + columnGroup
+                                        + "' on table "
+                                        + getTablePath());
+                    }
+
+                    DataType[] groupTypes = new DataType[indicesInGroup.size()];
+                    List<Schema.Column> allColumns = schema.getColumns();
+                    for (int i = 0; i < indicesInGroup.size(); i++) {
+                        groupTypes[i] = allColumns.get(indicesInGroup.get(i)).getDataType();
+                    }
+                    InternalRow.FieldGetter[] fieldGetters =
+                            new InternalRow.FieldGetter[groupTypes.length];
+                    for (int i = 0; i < groupTypes.length; i++) {
+                        fieldGetters[i] = InternalRow.createFieldGetter(groupTypes[i], i);
+                    }
+
+                    logTablet.registerColumnGroupIfAbsent(columnGroup);
+
+                    long localLogEnd = logTablet.localLogEndOffset();
+                    for (PbEnrichmentEntry entry : entries) {
+                        long offset = entry.getSourceOffset();
+                        if (offset < 0 || offset >= localLogEnd) {
+                            throw new IllegalArgumentException(
+                                    String.format(
+                                            "Cannot enrich offset %d which is outside [0, %d) for bucket %s",
+                                            offset, localLogEnd, tableBucket));
+                        }
+                        IndexedRow indexedRow =
+                                IndexedRow.from(groupTypes, entry.getEnrichmentRow());
+                        GenericRow generic = new GenericRow(groupTypes.length);
+                        for (int i = 0; i < groupTypes.length; i++) {
+                            generic.setField(i, fieldGetters[i].getFieldOrNull(indexedRow));
+                        }
+                        logTablet.putEnrichment(columnGroup, offset, generic);
+                    }
+
+                    advanceContiguousEnrichmentWatermark(columnGroup);
+                    return logTablet.getEnrichmentWatermark(columnGroup);
+                });
+    }
+
+    private void advanceContiguousEnrichmentWatermark(String columnGroup) {
+        ColumnGroupStore store = logTablet.getColumnGroupStore(columnGroup);
+        if (store == null) {
+            return;
+        }
+        long current = store.getEnrichmentWatermark();
+        long startScan = Math.max(0L, current);
+        long candidate = startScan;
+        while (store.get(candidate) != null) {
+            candidate++;
+        }
+        if (candidate > startScan) {
+            store.advanceEnrichmentWatermark(candidate);
+        }
     }
 
     public LogAppendInfo putRecordsToLeader(

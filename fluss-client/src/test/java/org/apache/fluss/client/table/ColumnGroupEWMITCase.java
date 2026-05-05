@@ -21,6 +21,7 @@ import org.apache.fluss.client.admin.ClientToServerITCaseBase;
 import org.apache.fluss.client.table.scanner.ScanRecord;
 import org.apache.fluss.client.table.scanner.log.LogScanner;
 import org.apache.fluss.client.table.scanner.log.ScanRecords;
+import org.apache.fluss.client.table.writer.AppendColumnsResult;
 import org.apache.fluss.client.table.writer.AppendWriter;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableBucket;
@@ -280,6 +281,70 @@ public class ColumnGroupEWMITCase extends ClientToServerITCaseBase {
         assertThat(deserialized.getColumnGroups()).isEqualTo(SCHEMA.getColumnGroups());
         assertThat(deserialized.getColumn("geo_region").getColumnGroup()).hasValue("enriched");
         assertThat(deserialized.getColumn("device_id").getColumnGroup()).isEmpty();
+    }
+
+    @Test
+    void testAppendColumnsOverRpcAdvancesEwm() throws Exception {
+        TablePath tablePath = TablePath.of(DB_NAME, "device_logs_rpc_columns");
+        long tableId = createTable(tablePath, TABLE_DESCRIPTOR, false);
+        FLUSS_CLUSTER_EXTENSION.waitUntilTableReady(tableId);
+
+        int recordCount = 4;
+        TableBucket bucket = new TableBucket(tableId, 0);
+
+        try (Table table = conn.getTable(tablePath)) {
+            // Phase 1: append base rows so source offsets exist.
+            AppendWriter writer = table.newAppend().createWriter();
+            for (int i = 0; i < recordCount; i++) {
+                GenericRow baseRow =
+                        row(
+                                "device-" + i,
+                                "10.0.0." + i,
+                                "payload-" + i,
+                                (long) (1000 + i),
+                                null,
+                                null);
+                writer.append(baseRow).get();
+            }
+            // Drain the log so we know offsets are durable.
+            try (LogScanner scanner = createLogScanner(table)) {
+                subscribeFromBeginning(scanner, table);
+                int read = 0;
+                while (read < recordCount) {
+                    read += scanner.poll(Duration.ofSeconds(1)).count();
+                }
+            }
+
+            // Phase 2: enrich offsets 0, 1, 2 (skip 3) over the wire.
+            for (int i = 0; i < 3; i++) {
+                GenericRow enrichmentRow =
+                        GenericRow.of(
+                                BinaryString.fromString("US-WEST-" + i), (double) (0.5 + i * 0.1));
+                AppendColumnsResult result =
+                        writer.appendColumns("enriched", bucket, i, enrichmentRow).get();
+                // After contiguous fill of [0..i], EWM should be i+1.
+                assertThat(result.getEnrichmentWatermark()).isEqualTo(i + 1L);
+            }
+
+            // Verify the leader's in-memory store reflects what the RPC delivered.
+            LogTablet leader = getLeaderLogTablet(bucket);
+            ColumnGroupStore store = leader.getColumnGroupStore("enriched");
+            assertThat(store).isNotNull();
+            assertThat(store.size()).isEqualTo(3);
+            assertThat(store.getEnrichmentWatermark()).isEqualTo(3L);
+            assertThat(store.get(0L).getString(0).toString()).isEqualTo("US-WEST-0");
+            assertThat(store.get(2L).getDouble(1))
+                    .isCloseTo(0.7, org.assertj.core.data.Offset.offset(0.001));
+
+            // Phase 3: enrich a non-contiguous offset (3 is missing, jump to... wait, 3 is next
+            // contiguous). Skip 3, enrich nothing else: send a duplicate to confirm idempotence
+            // of EWM advancement. Then fill 3 to confirm EWM jumps past it.
+            GenericRow lateRow = GenericRow.of(BinaryString.fromString("US-EAST-3"), 1.05);
+            AppendColumnsResult fillThree =
+                    writer.appendColumns("enriched", bucket, 3L, lateRow).get();
+            assertThat(fillThree.getEnrichmentWatermark()).isEqualTo(4L);
+            assertThat(store.size()).isEqualTo(4);
+        }
     }
 
     /** Find the leader LogTablet for a given table bucket across all tablet servers. */

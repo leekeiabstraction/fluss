@@ -141,6 +141,14 @@ public class WriterClient {
     }
 
     /**
+     * Returns the metadata updater used by this writer. Exposed so writers (e.g. enrichment column
+     * appends that bypass the batching pipeline) can resolve bucket leaders directly.
+     */
+    public MetadataUpdater getMetadataUpdater() {
+        return metadataUpdater;
+    }
+
+    /**
      * Invoking this method makes all buffered records immediately available to send (even if <code>
      * linger.ms</code> is greater than 0) and blocks on the completion of the requests associated
      * with these records. The post-condition of <code>flush()</code> is that any previously sent

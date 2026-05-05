@@ -52,8 +52,12 @@ import org.apache.fluss.rpc.messages.NotifyLeaderAndIsrRequest;
 import org.apache.fluss.rpc.messages.NotifyLeaderAndIsrResponse;
 import org.apache.fluss.rpc.messages.NotifyRemoteLogOffsetsRequest;
 import org.apache.fluss.rpc.messages.NotifyRemoteLogOffsetsResponse;
+import org.apache.fluss.rpc.messages.PbProduceLogColumnsReqForBucket;
+import org.apache.fluss.rpc.messages.PbProduceLogColumnsRespForBucket;
 import org.apache.fluss.rpc.messages.PrefixLookupRequest;
 import org.apache.fluss.rpc.messages.PrefixLookupResponse;
+import org.apache.fluss.rpc.messages.ProduceLogColumnsRequest;
+import org.apache.fluss.rpc.messages.ProduceLogColumnsResponse;
 import org.apache.fluss.rpc.messages.ProduceLogRequest;
 import org.apache.fluss.rpc.messages.ProduceLogResponse;
 import org.apache.fluss.rpc.messages.PutKvRequest;
@@ -181,6 +185,49 @@ public final class TabletService extends RpcServiceBase implements TabletServerG
                 new UserContext(currentSession().getPrincipal()),
                 bucketResponseMap -> response.complete(makeProduceLogResponse(bucketResponseMap)));
         return response;
+    }
+
+    @Override
+    public CompletableFuture<ProduceLogColumnsResponse> produceLogColumns(
+            ProduceLogColumnsRequest request) {
+        authorizeTable(WRITE, request.getTableId());
+        long tableId = request.getTableId();
+        String columnGroup = request.getColumnGroup();
+        ProduceLogColumnsResponse response = new ProduceLogColumnsResponse();
+
+        for (PbProduceLogColumnsReqForBucket bucketReq : request.getBucketsReqsList()) {
+            PbProduceLogColumnsRespForBucket bucketResp = response.addBucketsResp();
+            bucketResp.setBucketId(bucketReq.getBucketId());
+            if (bucketReq.hasPartitionId()) {
+                bucketResp.setPartitionId(bucketReq.getPartitionId());
+            }
+
+            TableBucket tb =
+                    bucketReq.hasPartitionId()
+                            ? new TableBucket(
+                                    tableId, bucketReq.getPartitionId(), bucketReq.getBucketId())
+                            : new TableBucket(tableId, bucketReq.getBucketId());
+
+            try {
+                ReplicaManager.HostedReplica hosted = replicaManager.getReplica(tb);
+                if (!(hosted instanceof ReplicaManager.OnlineReplica)) {
+                    throw new UnknownTableOrBucketException(
+                            "Replica for bucket " + tb + " is not online on this server");
+                }
+                long ewm =
+                        ((ReplicaManager.OnlineReplica) hosted)
+                                .getReplica()
+                                .appendColumnsAsLeader(columnGroup, bucketReq.getEntriesList());
+                bucketResp.setEnrichmentWatermark(ewm);
+            } catch (Exception e) {
+                ApiError apiError = ApiError.fromThrowable(e);
+                bucketResp.setErrorCode(apiError.error().code());
+                if (apiError.message() != null) {
+                    bucketResp.setErrorMessage(apiError.message());
+                }
+            }
+        }
+        return CompletableFuture.completedFuture(response);
     }
 
     @Override

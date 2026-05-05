@@ -222,6 +222,20 @@ message ProduceLogResponse {
   repeated PbProduceLogRespForBucket buckets_resp = 1;
 }
 
+// produce log columns (enrichment) request and response
+// Writes enrichment columns for an existing column group at specific source offsets.
+// The enrichment_row in each entry is an IndexedRow encoding of just the columns
+// that belong to the named column_group, in their schema order.
+message ProduceLogColumnsRequest {
+  required int64 table_id = 1;
+  required string column_group = 2;
+  repeated PbProduceLogColumnsReqForBucket buckets_req = 3;
+}
+
+message ProduceLogColumnsResponse {
+  repeated PbProduceLogColumnsRespForBucket buckets_resp = 1;
+}
+
 // fetch log request and response
 message FetchLogRequest {
   required int32 follower_server_id = 1;  // value -1 indicate the request from client.
@@ -809,6 +823,28 @@ message PbProduceLogRespForBucket {
   optional int32 error_code = 3;
   optional string error_message = 4;
   optional int64 base_offset = 5;
+}
+
+message PbProduceLogColumnsReqForBucket {
+  optional int64 partition_id = 1;
+  required int32 bucket_id = 2;
+  repeated PbEnrichmentEntry entries = 3;
+}
+
+message PbEnrichmentEntry {
+  required int64 source_offset = 1;
+  // IndexedRow-encoded bytes of the enrichment columns for this column group,
+  // in the column group's schema-defined order.
+  required bytes enrichment_row = 2;
+}
+
+message PbProduceLogColumnsRespForBucket {
+  optional int64 partition_id = 1;
+  required int32 bucket_id = 2;
+  optional int32 error_code = 3;
+  optional string error_message = 4;
+  // Enrichment watermark for the column group on this bucket after the put.
+  optional int64 enrichment_watermark = 5;
 }
 
 message PbFetchLogReqForTable {

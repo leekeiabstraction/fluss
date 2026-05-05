@@ -40,6 +40,8 @@ import org.apache.fluss.rpc.messages.NotifyRemoteLogOffsetsRequest;
 import org.apache.fluss.rpc.messages.NotifyRemoteLogOffsetsResponse;
 import org.apache.fluss.rpc.messages.PrefixLookupRequest;
 import org.apache.fluss.rpc.messages.PrefixLookupResponse;
+import org.apache.fluss.rpc.messages.ProduceLogColumnsRequest;
+import org.apache.fluss.rpc.messages.ProduceLogColumnsResponse;
 import org.apache.fluss.rpc.messages.ProduceLogRequest;
 import org.apache.fluss.rpc.messages.ProduceLogResponse;
 import org.apache.fluss.rpc.messages.PutKvRequest;
@@ -89,6 +91,18 @@ public interface TabletServerGateway extends RpcGateway, AdminReadOnlyGateway {
      */
     @RPC(api = ApiKeys.PRODUCE_LOG)
     CompletableFuture<ProduceLogResponse> produceLog(ProduceLogRequest request);
+
+    /**
+     * Write enrichment columns for an existing column group at specific source offsets in the
+     * specified table buckets. Each entry in the request targets one (bucket, source_offset) pair
+     * and carries an IndexedRow encoding of the column-group's columns.
+     *
+     * @return the produce log columns response, including the per-bucket enrichment watermark after
+     *     the put.
+     */
+    @RPC(api = ApiKeys.PRODUCE_LOG_COLUMNS)
+    CompletableFuture<ProduceLogColumnsResponse> produceLogColumns(
+            ProduceLogColumnsRequest request);
 
     /**
      * Fetch log data from the specified table bucket. The request can send by the client scanner or
