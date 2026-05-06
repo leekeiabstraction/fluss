@@ -63,6 +63,11 @@ public final class FetchParams {
     private long fetchOffset;
     // whether column projection is enabled
     private boolean projectionEnabled = false;
+    // the projected field indices for the current fetch, or null if no projection.
+    // Saved separately (alongside fileLogProjection) so callers that need the raw indices —
+    // e.g. to resolve which column groups a projection touches for the EWM gate —
+    // do not need to crack open FileLogProjection.
+    @Nullable private int[] currentProjectedFields;
     // filter info per table (predicate + schema ID), null if no filters
     @Nullable private final Map<Long, FilterInfo> tableFilterInfoMap;
     // the lazily initialized projection util to read and project file logs
@@ -108,6 +113,7 @@ public final class FetchParams {
             ProjectionPushdownCache projectionCache) {
         this.fetchOffset = fetchOffset;
         this.maxFetchBytes = maxFetchBytes;
+        this.currentProjectedFields = projectedFields;
         if (projectedFields != null) {
             projectionEnabled = true;
             if (fileLogProjection == null) {
@@ -119,6 +125,12 @@ public final class FetchParams {
         } else {
             projectionEnabled = false;
         }
+    }
+
+    /** Returns the projected field indices for the current fetch, or null if no projection. */
+    @Nullable
+    public int[] currentProjectedFields() {
+        return currentProjectedFields;
     }
 
     /**

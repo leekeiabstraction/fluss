@@ -508,11 +508,46 @@ public final class LogTablet {
             @Nullable FileLogProjection projection,
             @Nullable FilterContext filterContext)
             throws IOException {
+        return read(
+                readOffset,
+                maxLength,
+                fetchIsolation,
+                minOneMessage,
+                projection,
+                filterContext,
+                Long.MAX_VALUE);
+    }
+
+    /**
+     * Read messages from the local log, with an additional upper-offset cap that further bounds the
+     * fetch beyond what the {@link FetchIsolation} provides. Used by the consumer-visibility gate
+     * in Option 02 (late-materialized columns): when the projection touches enrichment column
+     * groups, callers pass {@code min(EWM_g for those groups)} as the cap so consumers see only
+     * fully-enriched offsets.
+     *
+     * <p>Pass {@link Long#MAX_VALUE} for {@code maxOffsetCap} to opt out (no extra cap).
+     */
+    public FetchDataInfo read(
+            long readOffset,
+            int maxLength,
+            FetchIsolation fetchIsolation,
+            boolean minOneMessage,
+            @Nullable FileLogProjection projection,
+            @Nullable FilterContext filterContext,
+            long maxOffsetCap)
+            throws IOException {
         LogOffsetMetadata maxOffsetMetadata = null;
         if (fetchIsolation == FetchIsolation.LOG_END) {
             maxOffsetMetadata = localLog.getLocalLogEndOffsetMetadata();
         } else if (fetchIsolation == FetchIsolation.HIGH_WATERMARK) {
             maxOffsetMetadata = fetchHighWatermarkMetadata();
+        }
+
+        if (maxOffsetCap < Long.MAX_VALUE) {
+            long cap = Math.max(0L, maxOffsetCap);
+            if (maxOffsetMetadata == null || cap < maxOffsetMetadata.getMessageOffset()) {
+                maxOffsetMetadata = new LogOffsetMetadata(cap);
+            }
         }
 
         return localLog.read(

@@ -1602,6 +1602,8 @@ public final class Replica {
 
         FilterContext filterContext = createFilterContext(fetchParams);
 
+        long enrichmentCap = computeEffectiveEnrichmentCap(fetchParams, logTablet);
+
         FetchDataInfo fetchDataInfo;
         try {
             fetchDataInfo =
@@ -1611,7 +1613,8 @@ public final class Replica {
                             fetchParams.isolation(),
                             fetchParams.minOneMessage(),
                             fetchParams.projection(),
-                            filterContext);
+                            filterContext,
+                            enrichmentCap);
         } finally {
             // Close readContext eagerly — it is only used for statistics extraction during
             // batch filtering and is NOT referenced by the returned FetchDataInfo records.
@@ -1620,6 +1623,47 @@ public final class Replica {
             }
         }
         return new LogReadInfo(fetchDataInfo, initialHighWatermark, initialLogEndOffset);
+    }
+
+    /**
+     * Compute the effective enrichment-watermark cap for a fetch (Option 02 EWM gate). When a
+     * client's projection includes a column belonging to an enrichment column group, the visible
+     * offset range is bounded at {@code min(EWM_g for those groups)}. Returns {@link
+     * Long#MAX_VALUE} when the gate does not apply: follower fetches, tables with no enrichment
+     * groups, no projection set (full-row reads keep the existing HWM-only path for backward
+     * compatibility), and explicit projections that touch only base columns.
+     */
+    private long computeEffectiveEnrichmentCap(FetchParams fetchParams, LogTablet logTablet) {
+        if (fetchParams.isFromFollower()) {
+            return Long.MAX_VALUE;
+        }
+        java.util.Map<String, java.util.List<Integer>> groups =
+                tableInfo.getSchema().getColumnGroups();
+        if (groups.isEmpty()) {
+            return Long.MAX_VALUE;
+        }
+        int[] projectedFields = fetchParams.currentProjectedFields();
+        if (projectedFields == null) {
+            return Long.MAX_VALUE;
+        }
+
+        java.util.Set<Integer> projectedSet = new java.util.HashSet<>();
+        for (int idx : projectedFields) {
+            projectedSet.add(idx);
+        }
+        long cap = Long.MAX_VALUE;
+        for (java.util.Map.Entry<String, java.util.List<Integer>> e : groups.entrySet()) {
+            for (int colIdx : e.getValue()) {
+                if (projectedSet.contains(colIdx)) {
+                    long ewm = logTablet.getEnrichmentWatermark(e.getKey());
+                    if (ewm < cap) {
+                        cap = ewm;
+                    }
+                    break;
+                }
+            }
+        }
+        return cap;
     }
 
     /**
