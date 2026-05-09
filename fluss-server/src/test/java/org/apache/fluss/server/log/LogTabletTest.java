@@ -506,35 +506,22 @@ final class LogTabletTest extends LogTestBase {
 
     @Test
     void testEnrichmentRecoversAcrossRestart() throws Exception {
-        String groupName = "enriched_test";
-        // A single-column group RowType — what the column group's Arrow batches will carry.
-        RowType groupRowType =
-                RowType.of(
-                        new org.apache.fluss.types.DataType[] {
-                            org.apache.fluss.types.DataTypes.STRING()
-                        },
-                        new String[] {"geo"});
+        // Append base records so localLogEndOffset >= 2; otherwise the recovery clamp
+        // (added in E.5b) will pull EWM back to 0 because the disk state would represent
+        // an enrichment-ahead-of-base condition that production never enters.
+        for (int i = 0; i < 2; i++) {
+            logTablet.appendAsLeader(
+                    genMemoryLogRecordsByObject(
+                            Collections.singletonList(new Object[] {i, "v" + i})));
+        }
 
-        // Phase 1: register group, append two enrichment "rows" via Arrow MemoryLogRecords.
+        String groupName = "enriched_test";
         logTablet.registerColumnGroupIfAbsent(groupName);
         assertThat(logTablet.getEnrichmentWatermark(groupName)).isEqualTo(0L);
 
         for (int i = 0; i < 2; i++) {
-            MemoryLogRecords records =
-                    org.apache.fluss.testutils.DataTestUtils.createBasicMemoryLogRecords(
-                            groupRowType,
-                            DEFAULT_SCHEMA_ID,
-                            0L,
-                            System.currentTimeMillis(),
-                            LogRecordBatch.CURRENT_LOG_MAGIC_VALUE,
-                            org.apache.fluss.record.LogRecordBatchFormat.NO_WRITER_ID,
-                            org.apache.fluss.record.LogRecordBatchFormat.NO_BATCH_SEQUENCE,
-                            Collections.singletonList(
-                                    org.apache.fluss.record.ChangeType.APPEND_ONLY),
-                            Collections.singletonList(new Object[] {"US-WEST-" + i}),
-                            LogFormat.ARROW,
-                            org.apache.fluss.compression.ArrowCompressionInfo.NO_COMPRESSION);
-            logTablet.appendColumnsAsLeader(groupName, records, new long[] {(long) i});
+            logTablet.appendColumnsAsLeader(
+                    groupName, buildSingleRowEnrichment("US-WEST-" + i), new long[] {(long) i});
         }
         assertThat(logTablet.getEnrichmentWatermark(groupName)).isEqualTo(2L);
 
@@ -568,6 +555,146 @@ final class LogTabletTest extends LogTestBase {
         } finally {
             scheduler2.shutdown();
         }
+    }
+
+    @Test
+    void testTruncateToClampsEnrichment() throws Exception {
+        // 5 base records → localLogEndOffset = 5.
+        for (int i = 0; i < 5; i++) {
+            logTablet.appendAsLeader(
+                    genMemoryLogRecordsByObject(
+                            Collections.singletonList(new Object[] {i, "v" + i})));
+        }
+
+        String groupName = "enriched_test";
+        logTablet.registerColumnGroupIfAbsent(groupName);
+        for (int i = 0; i < 5; i++) {
+            logTablet.appendColumnsAsLeader(
+                    groupName, buildSingleRowEnrichment("US-WEST-" + i), new long[] {(long) i});
+        }
+        assertThat(logTablet.getEnrichmentWatermark(groupName)).isEqualTo(5L);
+        EnrichmentSegment seg = logTablet.getEnrichmentSegment(groupName);
+        int sizeBefore = seg.records().sizeInBytes();
+        assertThat(sizeBefore).isPositive();
+
+        // Truncate base log to offset 3. Enrichment for offsets {3, 4} must be dropped.
+        logTablet.truncateTo(3L);
+
+        assertThat(logTablet.getEnrichmentWatermark(groupName)).isEqualTo(3L);
+        assertThat(seg.lastEnrichedOffset()).isEqualTo(2L);
+        assertThat(seg.lookup(2L)).isNotNull();
+        assertThat(seg.lookup(3L)).isNull();
+        assertThat(seg.lookup(4L)).isNull();
+        assertThat(seg.records().sizeInBytes()).isLessThan(sizeBefore);
+    }
+
+    @Test
+    void testTruncateFullyAndStartAtClearsEnrichment() throws Exception {
+        for (int i = 0; i < 3; i++) {
+            logTablet.appendAsLeader(
+                    genMemoryLogRecordsByObject(
+                            Collections.singletonList(new Object[] {i, "v" + i})));
+        }
+        String groupA = "geo";
+        String groupB = "device";
+        logTablet.registerColumnGroupIfAbsent(groupA);
+        logTablet.registerColumnGroupIfAbsent(groupB);
+        for (int i = 0; i < 3; i++) {
+            logTablet.appendColumnsAsLeader(
+                    groupA, buildSingleRowEnrichment("US-WEST-" + i), new long[] {(long) i});
+            logTablet.appendColumnsAsLeader(
+                    groupB, buildSingleRowEnrichment("dev-" + i), new long[] {(long) i});
+        }
+        assertThat(logTablet.getEnrichmentWatermark(groupA)).isEqualTo(3L);
+        assertThat(logTablet.getEnrichmentWatermark(groupB)).isEqualTo(3L);
+
+        // truncateFullyAndStartAt(5) clears the base log and starts at 5; every enrichment entry
+        // is now orphaned and must be dropped from every registered group.
+        logTablet.truncateFullyAndStartAt(5L);
+
+        assertThat(logTablet.getEnrichmentWatermark(groupA)).isEqualTo(0L);
+        assertThat(logTablet.getEnrichmentWatermark(groupB)).isEqualTo(0L);
+        assertThat(logTablet.getEnrichmentSegment(groupA).records().sizeInBytes()).isZero();
+        assertThat(logTablet.getEnrichmentSegment(groupB).records().sizeInBytes()).isZero();
+        assertThat(logTablet.getEnrichmentSegment(groupA).lastEnrichedOffset()).isEqualTo(-1L);
+        assertThat(logTablet.getEnrichmentSegment(groupB).lastEnrichedOffset()).isEqualTo(-1L);
+    }
+
+    @Test
+    void testRecoveryClampsEnrichmentAheadOfBaseLog() throws Exception {
+        // 2 base records → localLogEndOffset = 2.
+        for (int i = 0; i < 2; i++) {
+            logTablet.appendAsLeader(
+                    genMemoryLogRecordsByObject(
+                            Collections.singletonList(new Object[] {i, "v" + i})));
+        }
+
+        // Register and append enrichment for source_offsets 0..3 — beyond localLogEndOffset.
+        // LogTablet.appendColumnsAsLeader accepts this; the in-range check lives in Replica.
+        // This simulates the crash window left by base-first / enrichment-second truncation
+        // (PHASE_E_REPLICATION §4.4).
+        String groupName = "enriched_test";
+        logTablet.registerColumnGroupIfAbsent(groupName);
+        for (int i = 0; i < 4; i++) {
+            logTablet.appendColumnsAsLeader(
+                    groupName, buildSingleRowEnrichment("US-WEST-" + i), new long[] {(long) i});
+        }
+        assertThat(logTablet.getEnrichmentWatermark(groupName)).isEqualTo(4L);
+
+        File tabletDir = logTablet.getLogDir();
+        logTablet.close();
+
+        // Recovery must clamp the enrichment tail to localLogEndOffset = 2.
+        Scheduler scheduler2 = new FlussScheduler(1);
+        scheduler2.startup();
+        try {
+            LogTablet recovered =
+                    LogTablet.create(
+                            PhysicalTablePath.of(DATA1_TABLE_PATH),
+                            tabletDir,
+                            conf,
+                            TestingMetricGroups.TABLET_SERVER_METRICS,
+                            0,
+                            scheduler2,
+                            LogFormat.ARROW,
+                            1,
+                            false,
+                            SystemClock.getInstance(),
+                            true);
+            try {
+                assertThat(recovered.localLogEndOffset()).isEqualTo(2L);
+                assertThat(recovered.getEnrichmentWatermark(groupName)).isEqualTo(2L);
+                EnrichmentSegment recoveredSeg = recovered.getEnrichmentSegment(groupName);
+                assertThat(recoveredSeg.lastEnrichedOffset()).isEqualTo(1L);
+                assertThat(recoveredSeg.lookup(2L)).isNull();
+                assertThat(recoveredSeg.lookup(3L)).isNull();
+            } finally {
+                recovered.close();
+            }
+        } finally {
+            scheduler2.shutdown();
+        }
+    }
+
+    private MemoryLogRecords buildSingleRowEnrichment(String value) throws Exception {
+        RowType groupRowType =
+                RowType.of(
+                        new org.apache.fluss.types.DataType[] {
+                            org.apache.fluss.types.DataTypes.STRING()
+                        },
+                        new String[] {"geo"});
+        return org.apache.fluss.testutils.DataTestUtils.createBasicMemoryLogRecords(
+                groupRowType,
+                DEFAULT_SCHEMA_ID,
+                0L,
+                System.currentTimeMillis(),
+                LogRecordBatch.CURRENT_LOG_MAGIC_VALUE,
+                org.apache.fluss.record.LogRecordBatchFormat.NO_WRITER_ID,
+                org.apache.fluss.record.LogRecordBatchFormat.NO_BATCH_SEQUENCE,
+                Collections.singletonList(org.apache.fluss.record.ChangeType.APPEND_ONLY),
+                Collections.singletonList(new Object[] {value}),
+                LogFormat.ARROW,
+                org.apache.fluss.compression.ArrowCompressionInfo.NO_COMPRESSION);
     }
 
     private void assertFetchSizeAndOffsets(

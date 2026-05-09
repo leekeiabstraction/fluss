@@ -131,6 +131,60 @@ final class EnrichmentSegment implements Closeable {
         return fileLogRecords;
     }
 
+    /**
+     * Drop all entries with {@code source_offset >= sourceOffsetExclusive}. The on-disk {@link
+     * FileLogRecords} is truncated to the file position of the first dropped entry, and the {@link
+     * OffsetIndex} drops the corresponding tail. After this call, {@link #lastEnrichedOffset()} is
+     * at most {@code sourceOffsetExclusive - 1}.
+     *
+     * <p>This is the mirror of base-log truncation: when the base log truncates to offset N,
+     * enrichment for offsets {@code >= N} is no longer reachable and must be dropped to preserve
+     * the contiguous-from-EWM write contract enforced by {@code Replica.appendColumnsAsLeader}.
+     *
+     * <p><b>Phase C invariant:</b> the index is dense — one entry per source offset, contiguous
+     * from 0. Under this invariant, every {@code sourceOffsetExclusive} in {@code [0,
+     * lastEnrichedOffset() + 1]} matches an indexed entry exactly. If a future writer relaxes
+     * density (e.g. multi-row batches with non-contiguous offsets), this method's "first entry to
+     * drop" derivation will need to walk the next-larger slot.
+     *
+     * @return {@code true} if any entries were dropped, {@code false} if the call was a no-op.
+     */
+    boolean truncateTo(long sourceOffsetExclusive) throws IOException {
+        if (sourceOffsetExclusive < 0L) {
+            sourceOffsetExclusive = 0L;
+        }
+        if (offsetIndex.entries() == 0 || sourceOffsetExclusive > lastEnrichedOffset()) {
+            return false;
+        }
+        if (sourceOffsetExclusive == 0L) {
+            // Drop everything.
+            fileLogRecords.truncateTo(0);
+            offsetIndex.truncate();
+            fileLogRecords.flush();
+            offsetIndex.flush();
+            return true;
+        }
+        OffsetPosition firstDropped = offsetIndex.lookup(sourceOffsetExclusive);
+        if (firstDropped.getOffset() != sourceOffsetExclusive) {
+            // Phase C dense-index invariant violated. Rather than guess at the right
+            // file position, fail loudly — this would indicate a writer that produced
+            // gaps or a corrupted index.
+            throw new IllegalStateException(
+                    "Sparse enrichment index encountered while truncating "
+                            + fileLogRecords.file().getAbsolutePath()
+                            + " to "
+                            + sourceOffsetExclusive
+                            + ": OffsetIndex.lookup returned offset "
+                            + firstDropped.getOffset()
+                            + " (expected exact match under the Phase C dense-index invariant).");
+        }
+        fileLogRecords.truncateTo(firstDropped.getPosition());
+        offsetIndex.truncateTo(sourceOffsetExclusive);
+        fileLogRecords.flush();
+        offsetIndex.flush();
+        return true;
+    }
+
     /** Flush in-memory writes to disk. */
     void flush() throws IOException {
         fileLogRecords.flush();

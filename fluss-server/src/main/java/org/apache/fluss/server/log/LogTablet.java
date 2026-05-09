@@ -367,6 +367,26 @@ public final class LogTablet {
     }
 
     /**
+     * Drop every enrichment entry with {@code source_offset >= sourceOffsetExclusive} across all
+     * registered groups, and clamp each group's EWM to {@code min(current, sourceOffsetExclusive)}.
+     * Called from {@link #truncateTo} and {@link #truncateFullyAndStartAt} as the mirror of
+     * base-log truncation; without this the contiguous-from-EWM contract enforced by {@code
+     * Replica.appendColumnsAsLeader} can be violated when the next enrichment write arrives for an
+     * offset whose base record was truncated away.
+     *
+     * <p>Caller must hold {@link #lock}.
+     */
+    private void truncateEnrichmentSegmentsTo(long sourceOffsetExclusive) throws IOException {
+        for (Map.Entry<String, EnrichmentSegment> e : enrichmentSegments.entrySet()) {
+            e.getValue().truncateTo(sourceOffsetExclusive);
+            enrichmentWatermarks.computeIfPresent(
+                    e.getKey(),
+                    (g, current) ->
+                            current > sourceOffsetExclusive ? sourceOffsetExclusive : current);
+        }
+    }
+
+    /**
      * Live view of the per-group enrichment segments. Returned map is the leader's mutable map —
      * callers must only read from it. Reads on individual segments are safe to interleave with
      * concurrent writer appends because {@link OffsetIndex} uses a read lock and {@link
@@ -468,12 +488,20 @@ public final class LogTablet {
      * Walk the bucket directory for {@code *.col.<group>.log} files and open each as an {@link
      * EnrichmentSegment}, deriving the EWM from the index's last entry. Called once at startup so
      * fetches issued before the first write of this run already see the correct EWM.
+     *
+     * <p>Also acts as the recovery clamp for the non-atomic truncate path: a crash between the
+     * base-log truncate and the enrichment truncate would leave enrichment ahead of the base log
+     * end. After loading each segment, if its derived EWM exceeds {@link #localLogEndOffset()}, the
+     * dangling tail is truncated and the EWM clamped to match. This is the safety net that
+     * justifies the "base first, enrichment second" ordering documented in PHASE_E_REPLICATION
+     * §4.4.
      */
     private void discoverEnrichmentSegments(File tabletDir) throws IOException {
         File[] files = tabletDir.listFiles();
         if (files == null) {
             return;
         }
+        long localEnd = localLogEndOffset();
         // Filename pattern: {20-digit offset}.col.{groupName}.log
         for (File f : files) {
             if (!f.isFile()) {
@@ -502,6 +530,15 @@ public final class LogTablet {
             EnrichmentSegment seg =
                     EnrichmentSegment.open(
                             tabletDir, groupName, baseOffset, enrichmentMaxIndexSize);
+            // Recovery clamp: drop any entries past the base log's current end.
+            if (seg.lastEnrichedOffset() >= localEnd) {
+                seg.truncateTo(localEnd);
+                LOG.info(
+                        "Recovery clamped enrichment group '{}' on bucket {} to base log end {}",
+                        groupName,
+                        getTableBucket(),
+                        localEnd);
+            }
             enrichmentSegments.put(groupName, seg);
             enrichmentWatermarks.put(groupName, seg.lastEnrichedOffset() + 1L);
         }
@@ -1151,6 +1188,8 @@ public final class LogTablet {
                         if (getHighWatermark() >= localLog.getLocalLogEndOffset()) {
                             updateHighWatermark(localLog.getLocalLogEndOffset());
                         }
+
+                        truncateEnrichmentSegmentsTo(targetOffset);
                     }
 
                     return true;
@@ -1174,6 +1213,9 @@ public final class LogTablet {
                 writerStateManager.truncateFullyAndStartAt(newOffset);
                 rebuildWriterState(newOffset, writerStateManager);
                 updateHighWatermark(localLog.getLocalLogEndOffset());
+                // Base log is empty starting at newOffset; every enrichment entry now points at a
+                // base offset that no longer exists. Drop everything from each registered group.
+                truncateEnrichmentSegmentsTo(0L);
             } catch (IOException e) {
                 throw new LogStorageException(
                         String.format(
