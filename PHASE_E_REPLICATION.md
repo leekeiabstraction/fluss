@@ -232,37 +232,78 @@ E.5a New-leader CEW init                ─┤
 E.5c Catch-up after follower gap         │
 E.5d Same-node recovery clamp            │
 E.6  ISR coupling — deferred (Option A)  │
-E.7  Metrics + observability            ─┘
+E.7  Metrics, observability, schema-evolve dispatch ─┘
 ```
 
 **Critical path:** E.5b → E.2 → E.3a → E.3{b,c,d} → E.4. E.5{a,c,d} can land
 parallel to E.4. E.6 deferred. E.7 anytime after E.3.
 
-## 6. Open questions
+## 6. Resolved design questions
+
+These were open during initial E.1 drafting; resolved before E.3a starts.
+Recorded here so the rationale is recoverable.
 
 ### 6.1 Backpressure / fairness across groups
 
-If group A has a 100MB enrichment backlog and group B is current, how does the
-leader split bandwidth in a single fetch response?
+**Scenario.** Bucket B0 has groups A, B, C registered. Group A has 100MB of
+unreplicated enrichment, B has 1MB, C is current. How does the leader split
+bandwidth in a single fetch response?
 
-**Proposal:** new config `replication.fetch.enrichment.max-bytes` (default
-8MB), applied per-group, round-robin across registered groups within a single
-bucket response. Pin down before E.3a — affects whether the proto needs a
-per-group budget hint.
+**Resolution.** Equal-slice per registered group with single-pass leftover
+redistribution. Single config `replication.fetch.enrichment.max-bytes`
+(default 8MB) bounds the total enrichment payload per bucket per fetch.
+Inside a group, strict source-offset FIFO. No per-group budget hint in the
+request — proto stays minimal; allocation is a leader-side decision.
+
+**Rejected alternatives:**
+- Greedy by registration order — starves trailing groups indefinitely.
+- Pure equal-slice without redistribution — wastes budget on groups with no
+  backlog.
+- Per-group hard cap with no bucket cap — unbounded response when many groups
+  are registered.
+
+**Production assumption.** Most tables register 1–3 groups; the pathological
+"10 groups with wildly skewed backlog" case is rare and equal-slice fairness
+still bounds it.
 
 ### 6.2 Schema evolution across replication
 
-If a column group's schema changes between when an enrichment batch is written
-on the leader and replicated to a follower, the follower's deserialization may
-fail. `LogRecordReadContext` already plumbs `SchemaGetter`, but Phase D has not
-exercised cross-schemaId paths. Defer test coverage to E.7; ensure error path
-is loud, not silent.
+**Background.** `EnrichmentMerger.GroupDecoder` (`EnrichmentMerger.java:336-342`)
+takes a single `batchSchemaId` at construction and assumes every batch in the
+segment carries it. The Phase B+ writer stamps `tableInfo.getSchemaId()` into
+each batch — fine until schema evolves, after which the segment contains a
+mix of schemaIds and the merger silently misreads older batches because
+`isSameRowType` short-circuits on
+`targetSchemaId == schemaId || isProjectionPushDowned()`. Replication
+amplifies this — a follower applying a stream of mixed-schema batches hits
+the same merge-on-read failure.
+
+**Resolution.** Lift the "one schemaId per segment" assumption — deferred to
+E.7. In E.3 we make it loud rather than silent:
+
+- Pass `SchemaGetter` (not `null`) to `GroupDecoder.readContext` so resolution
+  *can* succeed when needed.
+- Add explicit `IllegalStateException` in `GroupDecoder` when the observed
+  `batchSchemaId` differs from the constructor's.
+
+E.7 task: per-`(group, batchSchemaId)` decoder cache + schema-evolution
+ITCase covering both old and new batches read correctly.
+
+**Rejected alternatives:**
+- Forbid schema evolution on column-group tables — production-hostile.
+- Rewrite segment on evolve — defining "evolve" semantics for enrichment is
+  non-trivial and storage cost is high; not warranted given dispatch is
+  straightforward.
 
 ### 6.3 Per-group fetch session bookkeeping
 
-`FetchSession` caches per-bucket fetch metadata to skip redundant request
-fields. Adding per-group EWM cursor expands this cache by O(groups) per
-bucket. Confirm session size growth is acceptable before E.3a.
+**Resolution.** No proto change needed. Back-of-envelope: 1000 buckets ×
+3 groups × ~50 bytes/cursor ≈ 150 KB per fetcher session. Negligible.
+
+E.7 adds metric `replication.fetch_session.size_bytes` to confirm in
+production. If observed cache size grows past expectation, revisit with
+incremental-fetch-style cursor diffing (only send changed cursors). Not
+load-bearing for Phase E correctness.
 
 ## 7. Risks
 
@@ -270,8 +311,8 @@ bucket. Confirm session size growth is acceptable before E.3a.
 |---|---|---|
 | Unclean election regresses CEW | Clients observe "phantom" data go missing on retry | Accepted; documented; resolved alongside leader-epoch cache (out of scope here) |
 | E.3 lands before E.5b | Stale enrichment beyond truncation → data corruption on next write | Strict phase ordering; E.3 PR cannot merge without E.5b prereq |
-| Replication backlog on enrichment-heavy workload | CEW lags; projecting clients see stale-bounded reads | Backpressure config (see §6.1); operational metrics in E.7 |
-| Schema evolution mid-replication | Follower deserialize fails; replication stalls | E.7 integration test; verify error path is loud |
+| Replication backlog on enrichment-heavy workload | CEW lags; projecting clients see stale-bounded reads | `replication.fetch.enrichment.max-bytes` budget with equal-slice fairness (§6.1); operational metrics in E.7 |
+| Schema evolution mid-replication | Follower deserializes batches written under prior schemaId; silent corruption | E.3 fails loudly via `IllegalStateException` on schemaId mismatch (§6.2); E.7 implements per-`(group, schemaId)` dispatch and ITCase |
 | Wire/CPU regression for non-enrichment tables | The 99% case slows down for the 1% feature | Empty-list proto defaults; benchmark before/after on a non-enrichment table |
 
 ## 8. Test strategy
@@ -287,7 +328,7 @@ bucket. Confirm session size growth is acceptable before E.3a.
 | E.4 | `ColumnGroupEWMITCase` extended to 3-server: kill a follower, verify CEW does not advance until rejoin; restart, verify catch-up. |
 | E.5a | Failover ITCase: write with `acks=-1` until CEW=N, kill leader, verify projecting client fetches see exactly `[0, N)`. |
 | E.5c+d | Crash mid-write, restart, verify recovery clamps EWM to base LEO. |
-| E.7 | Metrics presence & monotonicity (`enrichment.committed_ewm` ≤ `enrichment.local_ewm`). |
+| E.7 | (a) Metrics presence & monotonicity: `enrichment.committed_ewm` ≤ `enrichment.local_ewm`; new `replication.fetch_session.size_bytes` (§6.3). (b) Per-`(group, schemaId)` decoder dispatch + schema-evolution ITCase that produces enrichment, evolves the column-group schema, produces more, and verifies both old and new batches read correctly (§6.2). |
 
 ---
 
