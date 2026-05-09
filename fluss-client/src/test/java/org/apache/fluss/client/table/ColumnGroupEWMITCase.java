@@ -30,7 +30,6 @@ import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.row.BinaryString;
 import org.apache.fluss.row.GenericRow;
 import org.apache.fluss.row.InternalRow;
-import org.apache.fluss.server.log.ColumnGroupStore;
 import org.apache.fluss.server.log.LogTablet;
 import org.apache.fluss.server.replica.Replica;
 import org.apache.fluss.server.replica.ReplicaManager;
@@ -56,7 +55,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * <ul>
  *   <li>Schema with column groups can be created and used
  *   <li>Base rows can be written and read via standard AppendWriter/LogScanner
- *   <li>Enrichment data can be stored on the server via ColumnGroupStore
+ *   <li>Enrichment data can be persisted to disk via per-group EnrichmentSegment files
  *   <li>Enrichment Watermark (EWM) tracks progress correctly
  *   <li>Column group metadata is correctly reflected in the Schema
  * </ul>
@@ -155,104 +154,6 @@ public class ColumnGroupEWMITCase extends ClientToServerITCaseBase {
     }
 
     @Test
-    void testEnrichmentStorageAndEWM() throws Exception {
-        long tableId =
-                createTable(TablePath.of(DB_NAME, "device_logs_ewm"), TABLE_DESCRIPTOR, false);
-        FLUSS_CLUSTER_EXTENSION.waitUntilTableReady(tableId);
-        TablePath tablePath = TablePath.of(DB_NAME, "device_logs_ewm");
-
-        int recordCount = 5;
-
-        try (Table table = conn.getTable(tablePath)) {
-            // Write base rows
-            AppendWriter writer = table.newAppend().createWriter();
-            for (int i = 0; i < recordCount; i++) {
-                GenericRow baseRow =
-                        row(
-                                "device-" + i,
-                                "10.0.0." + i,
-                                "payload-" + i,
-                                (long) (1000 + i),
-                                null,
-                                null);
-                writer.append(baseRow).get();
-            }
-
-            // Read rows to ensure they are committed
-            LogScanner scanner = createLogScanner(table);
-            subscribeFromBeginning(scanner, table);
-            int readCount = 0;
-            while (readCount < recordCount) {
-                readCount += scanner.poll(Duration.ofSeconds(1)).count();
-            }
-
-            // Get the LogTablet for bucket 0 via direct server access
-            TableBucket tableBucket = new TableBucket(tableId, 0);
-            LogTablet logTablet = getLeaderLogTablet(tableBucket);
-
-            // Register the enrichment column group
-            logTablet.registerColumnGroupIfAbsent("enriched");
-
-            // Verify EWM starts at -1
-            assertThat(logTablet.getEnrichmentWatermark("enriched")).isEqualTo(-1L);
-
-            // Store enrichment for offsets 0, 1, 2
-            for (int i = 0; i < 3; i++) {
-                GenericRow enrichment =
-                        GenericRow.of(
-                                BinaryString.fromString("US-WEST-" + i), (double) (0.5 + i * 0.1));
-                logTablet.putEnrichment("enriched", i, enrichment);
-            }
-
-            // Advance EWM to 3 (offsets 0, 1, 2 are enriched)
-            logTablet.advanceEnrichmentWatermark("enriched", 3);
-            assertThat(logTablet.getEnrichmentWatermark("enriched")).isEqualTo(3L);
-
-            // Verify enrichment data can be retrieved
-            ColumnGroupStore store = logTablet.getColumnGroupStore("enriched");
-            assertThat(store).isNotNull();
-            assertThat(store.size()).isEqualTo(3);
-
-            GenericRow enrichRow0 = store.get(0L);
-            assertThat(enrichRow0).isNotNull();
-            assertThat(enrichRow0.getString(0).toString()).isEqualTo("US-WEST-0");
-            assertThat(enrichRow0.getDouble(1))
-                    .isCloseTo(0.5, org.assertj.core.data.Offset.offset(0.001));
-
-            GenericRow enrichRow2 = store.get(2L);
-            assertThat(enrichRow2).isNotNull();
-            assertThat(enrichRow2.getString(0).toString()).isEqualTo("US-WEST-2");
-            assertThat(enrichRow2.getDouble(1))
-                    .isCloseTo(0.7, org.assertj.core.data.Offset.offset(0.001));
-
-            // Offsets 3 and 4 should have no enrichment
-            assertThat(store.get(3L)).isNull();
-            assertThat(store.get(4L)).isNull();
-
-            // Enrich remaining offsets
-            for (int i = 3; i < recordCount; i++) {
-                GenericRow enrichment =
-                        GenericRow.of(
-                                BinaryString.fromString("US-EAST-" + i), (double) (0.9 + i * 0.05));
-                logTablet.putEnrichment("enriched", i, enrichment);
-            }
-            logTablet.advanceEnrichmentWatermark("enriched", recordCount);
-
-            // Verify EWM advanced
-            assertThat(logTablet.getEnrichmentWatermark("enriched")).isEqualTo((long) recordCount);
-            assertThat(store.size()).isEqualTo(recordCount);
-
-            // Verify all enrichment watermarks
-            Map<String, Long> allEwm = logTablet.getAllEnrichmentWatermarks();
-            assertThat(allEwm).containsEntry("enriched", (long) recordCount);
-
-            // Verify range query
-            assertThat(store.getRange(0, 3)).hasSize(3);
-            assertThat(store.getRange(2, 5)).hasSize(3);
-        }
-    }
-
-    @Test
     void testMultipleColumnGroups() throws Exception {
         // Schema with two separate enrichment groups
         Schema multiGroupSchema =
@@ -327,24 +228,19 @@ public class ColumnGroupEWMITCase extends ClientToServerITCaseBase {
                 assertThat(result.getEnrichmentWatermark()).isEqualTo(i + 1L);
             }
 
-            // Verify the leader's in-memory store reflects what the RPC delivered.
+            // Verify the leader's tracked EWM reflects what the RPC delivered. Direct content
+            // verification arrives in Phase D via merge-on-read; here we confirm the watermark
+            // and that the on-disk segment is registered.
             LogTablet leader = getLeaderLogTablet(bucket);
-            ColumnGroupStore store = leader.getColumnGroupStore("enriched");
-            assertThat(store).isNotNull();
-            assertThat(store.size()).isEqualTo(3);
-            assertThat(store.getEnrichmentWatermark()).isEqualTo(3L);
-            assertThat(store.get(0L).getString(0).toString()).isEqualTo("US-WEST-0");
-            assertThat(store.get(2L).getDouble(1))
-                    .isCloseTo(0.7, org.assertj.core.data.Offset.offset(0.001));
+            assertThat(leader.getEnrichmentWatermark("enriched")).isEqualTo(3L);
+            assertThat(leader.getAllEnrichmentWatermarks()).containsEntry("enriched", 3L);
 
-            // Phase 3: enrich a non-contiguous offset (3 is missing, jump to... wait, 3 is next
-            // contiguous). Skip 3, enrich nothing else: send a duplicate to confirm idempotence
-            // of EWM advancement. Then fill 3 to confirm EWM jumps past it.
+            // Phase 3: fill the next contiguous offset 3 to confirm EWM advances past it.
             GenericRow lateRow = GenericRow.of(BinaryString.fromString("US-EAST-3"), 1.05);
             AppendColumnsResult fillThree =
                     writer.appendColumns("enriched", bucket, 3L, lateRow).get();
             assertThat(fillThree.getEnrichmentWatermark()).isEqualTo(4L);
-            assertThat(store.size()).isEqualTo(4);
+            assertThat(leader.getEnrichmentWatermark("enriched")).isEqualTo(4L);
         }
     }
 

@@ -46,13 +46,9 @@ import org.apache.fluss.metrics.groups.MetricGroup;
 import org.apache.fluss.predicate.Predicate;
 import org.apache.fluss.record.DefaultValueRecordBatch;
 import org.apache.fluss.record.KvRecordBatch;
-import org.apache.fluss.record.LogRecord;
-import org.apache.fluss.record.LogRecordBatch;
 import org.apache.fluss.record.LogRecordReadContext;
 import org.apache.fluss.record.LogRecords;
 import org.apache.fluss.record.MemoryLogRecords;
-import org.apache.fluss.row.GenericRow;
-import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.rpc.protocol.Errors;
 import org.apache.fluss.rpc.protocol.MergeMode;
 import org.apache.fluss.rpc.util.PredicateMessageUtils;
@@ -101,9 +97,7 @@ import org.apache.fluss.server.zk.ZkSequenceIDCounter;
 import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
 import org.apache.fluss.server.zk.data.ZkData;
-import org.apache.fluss.types.DataType;
 import org.apache.fluss.types.RowType;
-import org.apache.fluss.utils.CloseableIterator;
 import org.apache.fluss.utils.CloseableRegistry;
 import org.apache.fluss.utils.FlussPaths;
 import org.apache.fluss.utils.IOUtils;
@@ -1052,6 +1046,8 @@ public final class Replica {
                     }
 
                     long localLogEnd = logTablet.localLogEndOffset();
+                    long localLogStart = logTablet.localLogStartOffset();
+                    logTablet.registerColumnGroupIfAbsent(columnGroup);
                     long currentEwm = logTablet.getEnrichmentWatermark(columnGroup);
                     long expected = Math.max(0L, currentEwm);
                     for (int i = 0; i < sourceOffsets.length; i++) {
@@ -1068,6 +1064,13 @@ public final class Replica {
                                             actual,
                                             i));
                         }
+                        if (actual < localLogStart) {
+                            throw new IllegalArgumentException(
+                                    String.format(
+                                            "Cannot enrich offset %d below local log start %d "
+                                                    + "(base segment may have been retention-deleted) for bucket %s",
+                                            actual, localLogStart, tableBucket));
+                        }
                         if (actual >= localLogEnd) {
                             throw new IllegalArgumentException(
                                     String.format(
@@ -1077,63 +1080,16 @@ public final class Replica {
                         expected++;
                     }
 
-                    String[] groupColumnNames = new String[indicesInGroup.size()];
-                    DataType[] groupTypes = new DataType[indicesInGroup.size()];
-                    List<Schema.Column> allColumns = schema.getColumns();
-                    for (int i = 0; i < indicesInGroup.size(); i++) {
-                        Schema.Column col = allColumns.get(indicesInGroup.get(i));
-                        groupColumnNames[i] = col.getName();
-                        groupTypes[i] = col.getDataType();
+                    try {
+                        logTablet.appendColumnsAsLeader(columnGroup, records, sourceOffsets);
+                    } catch (IOException e) {
+                        throw new RuntimeException(
+                                "Failed to persist enrichment for group '"
+                                        + columnGroup
+                                        + "' on bucket "
+                                        + tableBucket,
+                                e);
                     }
-                    RowType groupRowType = RowType.of(groupTypes, groupColumnNames);
-                    InternalRow.FieldGetter[] fieldGetters =
-                            new InternalRow.FieldGetter[groupTypes.length];
-                    for (int i = 0; i < groupTypes.length; i++) {
-                        fieldGetters[i] = InternalRow.createFieldGetter(groupTypes[i], i);
-                    }
-
-                    logTablet.registerColumnGroupIfAbsent(columnGroup);
-
-                    int rowIdx = 0;
-                    int expectedRowCount = sourceOffsets.length;
-                    try (LogRecordReadContext readCtx =
-                            LogRecordReadContext.createArrowReadContext(
-                                    groupRowType, tableInfo.getSchemaId(), schemaGetter)) {
-                        for (LogRecordBatch batch : records.batches()) {
-                            try (CloseableIterator<LogRecord> it = batch.records(readCtx)) {
-                                while (it.hasNext()) {
-                                    if (rowIdx >= expectedRowCount) {
-                                        throw new IllegalArgumentException(
-                                                String.format(
-                                                        "Column-group records contain more rows than source_offsets (%d) for bucket %s group '%s'",
-                                                        expectedRowCount,
-                                                        tableBucket,
-                                                        columnGroup));
-                                    }
-                                    InternalRow row = it.next().getRow();
-                                    GenericRow generic = new GenericRow(groupTypes.length);
-                                    for (int i = 0; i < groupTypes.length; i++) {
-                                        generic.setField(i, fieldGetters[i].getFieldOrNull(row));
-                                    }
-                                    logTablet.putEnrichment(
-                                            columnGroup, sourceOffsets[rowIdx], generic);
-                                    rowIdx++;
-                                }
-                            }
-                        }
-                    }
-                    if (rowIdx != expectedRowCount) {
-                        throw new IllegalArgumentException(
-                                String.format(
-                                        "Column-group records contain %d rows but source_offsets list has %d for bucket %s group '%s'",
-                                        rowIdx, expectedRowCount, tableBucket, columnGroup));
-                    }
-
-                    long newEwm =
-                            sourceOffsets.length == 0
-                                    ? Math.max(0L, currentEwm)
-                                    : sourceOffsets[sourceOffsets.length - 1] + 1L;
-                    logTablet.advanceEnrichmentWatermark(columnGroup, newEwm);
                     return logTablet.getEnrichmentWatermark(columnGroup);
                 });
     }

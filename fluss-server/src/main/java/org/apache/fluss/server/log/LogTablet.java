@@ -129,9 +129,15 @@ public final class LogTablet {
     private volatile long lakeLogEndOffset = -1L;
     private volatile long lakeMaxTimestamp = -1;
 
-    // Column group enrichment stores (group name -> store)
-    private final java.util.concurrent.ConcurrentHashMap<String, ColumnGroupStore>
-            columnGroupStores = org.apache.fluss.utils.MapUtils.newConcurrentHashMap();
+    // Per-column-group on-disk enrichment storage. Phase C uses a single segment per group
+    // with baseOffset=0; multi-segment lifecycle aligned with base segments will land in
+    // Tier 3 for tiering. Both maps are populated either during create() (recovery from
+    // existing files) or lazily on first registerColumnGroupIfAbsent for a new group.
+    private final java.util.concurrent.ConcurrentHashMap<String, EnrichmentSegment>
+            enrichmentSegments = org.apache.fluss.utils.MapUtils.newConcurrentHashMap();
+    private final java.util.concurrent.ConcurrentHashMap<String, Long> enrichmentWatermarks =
+            org.apache.fluss.utils.MapUtils.newConcurrentHashMap();
+    private final int enrichmentMaxIndexSize;
 
     private LogTablet(
             PhysicalTablePath physicalPath,
@@ -146,6 +152,7 @@ public final class LogTablet {
         this.physicalPath = physicalPath;
         this.localLog = localLog;
         this.maxSegmentFileSize = (int) conf.get(ConfigOptions.LOG_SEGMENT_FILE_SIZE).getBytes();
+        this.enrichmentMaxIndexSize = (int) conf.get(ConfigOptions.LOG_INDEX_FILE_SIZE).getBytes();
         this.logFlushIntervalMessages = conf.get(ConfigOptions.LOG_FLUSH_INTERVAL_MESSAGES);
         int writerExpirationCheckIntervalMs =
                 (int) conf.get(ConfigOptions.WRITER_ID_EXPIRATION_CHECK_INTERVAL).toMillis();
@@ -274,71 +281,89 @@ public final class LogTablet {
     // --------------------------------------------------------------------------------------------
 
     /**
-     * Register a column group store for enrichment data. If the group is already registered, this
-     * is a no-op.
+     * Register an on-disk enrichment segment for the given column group. If the segment files
+     * already exist (recovery from a previous run), they are opened and the EWM is initialized from
+     * the index's last entry. If they do not exist, fresh files are created and the EWM starts at
+     * -1. Idempotent.
      */
     public void registerColumnGroupIfAbsent(String groupName) {
-        columnGroupStores.computeIfAbsent(groupName, ColumnGroupStore::new);
+        synchronized (lock) {
+            enrichmentSegments.computeIfAbsent(
+                    groupName,
+                    g -> {
+                        try {
+                            EnrichmentSegment seg =
+                                    EnrichmentSegment.open(
+                                            getLogDir(), g, 0L, enrichmentMaxIndexSize);
+                            long lastWritten = seg.lastEnrichedOffset();
+                            enrichmentWatermarks.put(g, lastWritten + 1L);
+                            return seg;
+                        } catch (IOException e) {
+                            throw new FlussRuntimeException(
+                                    "Failed to open enrichment segment for group '"
+                                            + g
+                                            + "' on bucket "
+                                            + getTableBucket(),
+                                    e);
+                        }
+                    });
+        }
     }
 
     /**
-     * Store enrichment data for a specific offset in the given column group.
+     * Append a batch of enrichment rows to the given column group's on-disk segment. The {@code
+     * sourceOffsets} are the base-log offsets being enriched, parallel to the rows in {@code
+     * records}; they must be strictly monotonic and contiguous from the current EWM (validated by
+     * the caller, typically {@link org.apache.fluss.server.replica.Replica#appendColumnsAsLeader}).
      *
-     * @param groupName the column group name
-     * @param offset the base log offset to enrich
-     * @param enrichmentRow the enrichment columns as a GenericRow
-     * @throws IllegalArgumentException if the offset is beyond the log end offset
+     * <p>After the records are persisted, the EWM advances to {@code lastSourceOffset + 1L}.
      */
-    public void putEnrichment(
-            String groupName, long offset, org.apache.fluss.row.GenericRow enrichmentRow) {
-        long logEndOffset = localLogEndOffset();
-        if (offset >= logEndOffset) {
-            throw new IllegalArgumentException(
-                    String.format(
-                            "Cannot enrich offset %d which is at or beyond log end offset %d "
-                                    + "for bucket %s",
-                            offset, logEndOffset, getTableBucket()));
+    public void appendColumnsAsLeader(
+            String groupName, MemoryLogRecords records, long[] sourceOffsets) throws IOException {
+        if (sourceOffsets.length == 0) {
+            return;
         }
-        ColumnGroupStore store =
-                columnGroupStores.computeIfAbsent(groupName, ColumnGroupStore::new);
-        store.put(offset, enrichmentRow);
+        synchronized (lock) {
+            EnrichmentSegment segment = enrichmentSegments.get(groupName);
+            if (segment == null) {
+                throw new IllegalStateException(
+                        "Column group '"
+                                + groupName
+                                + "' is not registered on bucket "
+                                + getTableBucket());
+            }
+            segment.append(records, sourceOffsets);
+            segment.flush();
+            long newEwm = sourceOffsets[sourceOffsets.length - 1] + 1L;
+            enrichmentWatermarks.merge(groupName, newEwm, Math::max);
+        }
     }
 
     /**
      * Advance the enrichment watermark for a column group. The EWM represents that all offsets up
-     * to (but not including) newEwm have enrichment data available.
+     * to (but not including) newEwm have enrichment data available. No-op if the group has not been
+     * registered, or if {@code newEwm <=} current EWM.
      */
     public void advanceEnrichmentWatermark(String groupName, long newEwm) {
-        ColumnGroupStore store = columnGroupStores.get(groupName);
-        if (store != null) {
-            store.advanceEnrichmentWatermark(newEwm);
-        }
+        enrichmentWatermarks.computeIfPresent(
+                groupName, (g, current) -> newEwm > current ? newEwm : current);
     }
 
     /** Get the enrichment watermark for a specific column group, or -1 if not registered. */
     public long getEnrichmentWatermark(String groupName) {
-        ColumnGroupStore store = columnGroupStores.get(groupName);
-        return store != null ? store.getEnrichmentWatermark() : -1L;
+        Long ewm = enrichmentWatermarks.get(groupName);
+        return ewm != null ? ewm : -1L;
     }
 
     /** Get all enrichment watermarks across all column groups. */
     public Map<String, Long> getAllEnrichmentWatermarks() {
-        Map<String, Long> watermarks = new HashMap<>();
-        for (Map.Entry<String, ColumnGroupStore> entry : columnGroupStores.entrySet()) {
-            watermarks.put(entry.getKey(), entry.getValue().getEnrichmentWatermark());
-        }
-        return watermarks;
+        return new HashMap<>(enrichmentWatermarks);
     }
 
-    /**
-     * Get the column group store for a specific group. Visible for testing.
-     *
-     * @return the store, or null if not registered
-     */
+    /** Returns the on-disk segment for a column group, or null if unregistered. Used by Phase D. */
     @Nullable
-    @VisibleForTesting
-    public ColumnGroupStore getColumnGroupStore(String groupName) {
-        return columnGroupStores.get(groupName);
+    EnrichmentSegment getEnrichmentSegment(String groupName) {
+        return enrichmentSegments.get(groupName);
     }
 
     public int getWriterIdCount() {
@@ -414,16 +439,62 @@ public final class LogTablet {
                         tableBucket,
                         logFormat);
 
-        return new LogTablet(
-                tablePath,
-                log,
-                conf,
-                scheduler,
-                writerStateManager,
-                logFormat,
-                tieredLogLocalSegments,
-                isChangelog,
-                clock);
+        LogTablet tablet =
+                new LogTablet(
+                        tablePath,
+                        log,
+                        conf,
+                        scheduler,
+                        writerStateManager,
+                        logFormat,
+                        tieredLogLocalSegments,
+                        isChangelog,
+                        clock);
+        tablet.discoverEnrichmentSegments(tabletDir);
+        return tablet;
+    }
+
+    /**
+     * Walk the bucket directory for {@code *.col.<group>.log} files and open each as an {@link
+     * EnrichmentSegment}, deriving the EWM from the index's last entry. Called once at startup so
+     * fetches issued before the first write of this run already see the correct EWM.
+     */
+    private void discoverEnrichmentSegments(File tabletDir) throws IOException {
+        File[] files = tabletDir.listFiles();
+        if (files == null) {
+            return;
+        }
+        // Filename pattern: {20-digit offset}.col.{groupName}.log
+        for (File f : files) {
+            if (!f.isFile()) {
+                continue;
+            }
+            String name = f.getName();
+            int colIdx = name.indexOf(FlussPaths.COLUMN_GROUP_INFIX);
+            if (colIdx < 0 || !name.endsWith(".log")) {
+                continue;
+            }
+            // baseOffset = filename prefix before .col.
+            String prefix = name.substring(0, colIdx);
+            long baseOffset;
+            try {
+                baseOffset = Long.parseLong(prefix);
+            } catch (NumberFormatException nfe) {
+                continue;
+            }
+            // group name = between .col. and .log
+            int groupStart = colIdx + FlussPaths.COLUMN_GROUP_INFIX.length();
+            int groupEnd = name.length() - ".log".length();
+            if (groupEnd <= groupStart) {
+                continue;
+            }
+            String groupName = name.substring(groupStart, groupEnd);
+            EnrichmentSegment seg =
+                    EnrichmentSegment.open(
+                            tabletDir, groupName, baseOffset, enrichmentMaxIndexSize);
+            enrichmentSegments.put(groupName, seg);
+            enrichmentWatermarks.put(groupName, seg.lastEnrichedOffset() + 1L);
+        }
     }
 
     /** Register metrics for this log tablet in the metric group. */
@@ -1143,6 +1214,18 @@ public final class LogTablet {
             } catch (IOException e) {
                 LOG.error("Error while taking writer snapshot for bucket {}.", getTableBucket(), e);
             }
+            for (Map.Entry<String, EnrichmentSegment> e : enrichmentSegments.entrySet()) {
+                try {
+                    e.getValue().close();
+                } catch (IOException ex) {
+                    LOG.error(
+                            "Error while closing enrichment segment for group {} on bucket {}.",
+                            e.getKey(),
+                            getTableBucket(),
+                            ex);
+                }
+            }
+            enrichmentSegments.clear();
             localLog.close();
         }
     }

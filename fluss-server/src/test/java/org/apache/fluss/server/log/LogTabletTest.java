@@ -504,6 +504,72 @@ final class LogTabletTest extends LogTestBase {
                 true);
     }
 
+    @Test
+    void testEnrichmentRecoversAcrossRestart() throws Exception {
+        String groupName = "enriched_test";
+        // A single-column group RowType — what the column group's Arrow batches will carry.
+        RowType groupRowType =
+                RowType.of(
+                        new org.apache.fluss.types.DataType[] {
+                            org.apache.fluss.types.DataTypes.STRING()
+                        },
+                        new String[] {"geo"});
+
+        // Phase 1: register group, append two enrichment "rows" via Arrow MemoryLogRecords.
+        logTablet.registerColumnGroupIfAbsent(groupName);
+        assertThat(logTablet.getEnrichmentWatermark(groupName)).isEqualTo(0L);
+
+        for (int i = 0; i < 2; i++) {
+            MemoryLogRecords records =
+                    org.apache.fluss.testutils.DataTestUtils.createBasicMemoryLogRecords(
+                            groupRowType,
+                            DEFAULT_SCHEMA_ID,
+                            0L,
+                            System.currentTimeMillis(),
+                            LogRecordBatch.CURRENT_LOG_MAGIC_VALUE,
+                            org.apache.fluss.record.LogRecordBatchFormat.NO_WRITER_ID,
+                            org.apache.fluss.record.LogRecordBatchFormat.NO_BATCH_SEQUENCE,
+                            Collections.singletonList(
+                                    org.apache.fluss.record.ChangeType.APPEND_ONLY),
+                            Collections.singletonList(new Object[] {"US-WEST-" + i}),
+                            LogFormat.ARROW,
+                            org.apache.fluss.compression.ArrowCompressionInfo.NO_COMPRESSION);
+            logTablet.appendColumnsAsLeader(groupName, records, new long[] {(long) i});
+        }
+        assertThat(logTablet.getEnrichmentWatermark(groupName)).isEqualTo(2L);
+
+        // Capture the dir before close so we can reopen on it.
+        File tabletDir = logTablet.getLogDir();
+        logTablet.close();
+
+        // Phase 2: a fresh LogTablet on the same dir must rediscover the segment + EWM.
+        Scheduler scheduler2 = new FlussScheduler(1);
+        scheduler2.startup();
+        try {
+            LogTablet recovered =
+                    LogTablet.create(
+                            PhysicalTablePath.of(DATA1_TABLE_PATH),
+                            tabletDir,
+                            conf,
+                            TestingMetricGroups.TABLET_SERVER_METRICS,
+                            0,
+                            scheduler2,
+                            LogFormat.ARROW,
+                            1,
+                            false,
+                            SystemClock.getInstance(),
+                            true);
+            try {
+                assertThat(recovered.getEnrichmentWatermark(groupName)).isEqualTo(2L);
+                assertThat(recovered.getAllEnrichmentWatermarks()).containsEntry(groupName, 2L);
+            } finally {
+                recovered.close();
+            }
+        } finally {
+            scheduler2.shutdown();
+        }
+    }
+
     private void assertFetchSizeAndOffsets(
             long fetchOffset, int expectedSize, List<Long> expectedOffsets, RowType rowType)
             throws Exception {
