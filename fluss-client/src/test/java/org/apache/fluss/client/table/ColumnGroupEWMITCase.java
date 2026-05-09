@@ -355,7 +355,8 @@ public class ColumnGroupEWMITCase extends ClientToServerITCaseBase {
             }
 
             // Projecting scanner that includes the "enriched" group's geo_region (idx 4)
-            // must see only offsets [0..2] (capped by EWM=3).
+            // must see only offsets [0..2] (capped by EWM=3), AND the projected geo_region
+            // values must be the ones written via appendColumns (Phase D merge-on-read).
             int[] projection = new int[] {0, 4};
             try (LogScanner gatedScanner = createLogScanner(table, projection)) {
                 subscribeFromBeginning(gatedScanner, table);
@@ -374,7 +375,13 @@ public class ColumnGroupEWMITCase extends ClientToServerITCaseBase {
                 }
                 assertThat(seen).hasSize(3);
                 for (int i = 0; i < 3; i++) {
-                    assertThat(seen.get(i).logOffset()).isEqualTo(i);
+                    ScanRecord r = seen.get(i);
+                    assertThat(r.logOffset()).isEqualTo(i);
+                    InternalRow row = r.getRow();
+                    // Position 0 in projected row = device_id (base column passthrough).
+                    assertThat(row.getString(0).toString()).isEqualTo("device-" + i);
+                    // Position 1 in projected row = geo_region (spliced in from EnrichmentSegment).
+                    assertThat(row.getString(1).toString()).isEqualTo("US-WEST-" + i);
                 }
             }
         }

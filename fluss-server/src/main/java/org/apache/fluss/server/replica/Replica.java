@@ -45,6 +45,7 @@ import org.apache.fluss.metrics.MetricNames;
 import org.apache.fluss.metrics.groups.MetricGroup;
 import org.apache.fluss.predicate.Predicate;
 import org.apache.fluss.record.DefaultValueRecordBatch;
+import org.apache.fluss.record.FileLogProjection;
 import org.apache.fluss.record.KvRecordBatch;
 import org.apache.fluss.record.LogRecordReadContext;
 import org.apache.fluss.record.LogRecords;
@@ -69,6 +70,7 @@ import org.apache.fluss.server.kv.snapshot.KvTabletSnapshotTarget;
 import org.apache.fluss.server.kv.snapshot.PeriodicSnapshotManager;
 import org.apache.fluss.server.kv.snapshot.RocksIncrementalSnapshot;
 import org.apache.fluss.server.kv.snapshot.SnapshotContext;
+import org.apache.fluss.server.log.EnrichmentMerger;
 import org.apache.fluss.server.log.FetchDataInfo;
 import org.apache.fluss.server.log.FetchIsolation;
 import org.apache.fluss.server.log.FetchParams;
@@ -1606,6 +1608,15 @@ public final class Replica {
 
         long enrichmentCap = computeEffectiveEnrichmentCap(fetchParams, logTablet);
 
+        // Phase D: when the projection touches enrichment columns, we skip FileLogProjection's
+        // byte-level path and let LogTablet read raw base batches. The merger below decodes
+        // the base rows, overlays per-row enrichment values, and re-encodes with the projected
+        // row type. Projections that touch only base columns still use the zero-copy path.
+        boolean enrichmentTouched =
+                EnrichmentMerger.projectionTouchesEnrichment(
+                        tableInfo.getSchema(), fetchParams.currentProjectedFields());
+        FileLogProjection projection = enrichmentTouched ? null : fetchParams.projection();
+
         FetchDataInfo fetchDataInfo;
         try {
             fetchDataInfo =
@@ -1614,7 +1625,7 @@ public final class Replica {
                             fetchParams.maxFetchBytes(),
                             fetchParams.isolation(),
                             fetchParams.minOneMessage(),
-                            fetchParams.projection(),
+                            projection,
                             filterContext,
                             enrichmentCap);
         } finally {
@@ -1622,6 +1633,28 @@ public final class Replica {
             // batch filtering and is NOT referenced by the returned FetchDataInfo records.
             if (filterContext != null) {
                 IOUtils.closeQuietly(filterContext.getReadContext());
+            }
+        }
+
+        if (enrichmentTouched && fetchDataInfo.getRecords().sizeInBytes() > 0) {
+            try (EnrichmentMerger merger =
+                    new EnrichmentMerger(
+                            tableInfo.getSchema(),
+                            tableInfo.getSchemaId(),
+                            tableInfo.getTableId(),
+                            fetchParams.currentProjectedFields(),
+                            tableInfo.getTableConfig().getArrowCompressionInfo(),
+                            schemaGetter)) {
+                LogRecords merged =
+                        merger.merge(
+                                fetchDataInfo.getRecords(), logTablet.getEnrichmentSegmentsView());
+                fetchDataInfo =
+                        new FetchDataInfo(
+                                fetchDataInfo.getFetchOffsetMetadata(),
+                                merged,
+                                fetchDataInfo.getFilteredEndOffset());
+            } catch (Exception e) {
+                throw new IOException("Failed to merge enrichment columns for fetch", e);
             }
         }
         return new LogReadInfo(fetchDataInfo, initialHighWatermark, initialLogEndOffset);

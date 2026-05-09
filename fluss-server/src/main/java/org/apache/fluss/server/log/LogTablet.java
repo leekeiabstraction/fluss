@@ -366,6 +366,16 @@ public final class LogTablet {
         return enrichmentSegments.get(groupName);
     }
 
+    /**
+     * Live view of the per-group enrichment segments. Returned map is the leader's mutable map —
+     * callers must only read from it. Reads on individual segments are safe to interleave with
+     * concurrent writer appends because {@link OffsetIndex} uses a read lock and {@link
+     * org.apache.fluss.record.FileLogRecords} only grows. Used by the Phase D merge-on-read path.
+     */
+    public Map<String, EnrichmentSegment> getEnrichmentSegmentsView() {
+        return enrichmentSegments;
+    }
+
     public int getWriterIdCount() {
         return writerStateManager.writerIdCount();
     }
