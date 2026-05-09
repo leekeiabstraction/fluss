@@ -46,13 +46,13 @@ import org.apache.fluss.metrics.groups.MetricGroup;
 import org.apache.fluss.predicate.Predicate;
 import org.apache.fluss.record.DefaultValueRecordBatch;
 import org.apache.fluss.record.KvRecordBatch;
+import org.apache.fluss.record.LogRecord;
+import org.apache.fluss.record.LogRecordBatch;
 import org.apache.fluss.record.LogRecordReadContext;
 import org.apache.fluss.record.LogRecords;
 import org.apache.fluss.record.MemoryLogRecords;
 import org.apache.fluss.row.GenericRow;
 import org.apache.fluss.row.InternalRow;
-import org.apache.fluss.row.indexed.IndexedRow;
-import org.apache.fluss.rpc.messages.PbEnrichmentEntry;
 import org.apache.fluss.rpc.protocol.Errors;
 import org.apache.fluss.rpc.protocol.MergeMode;
 import org.apache.fluss.rpc.util.PredicateMessageUtils;
@@ -73,7 +73,6 @@ import org.apache.fluss.server.kv.snapshot.KvTabletSnapshotTarget;
 import org.apache.fluss.server.kv.snapshot.PeriodicSnapshotManager;
 import org.apache.fluss.server.kv.snapshot.RocksIncrementalSnapshot;
 import org.apache.fluss.server.kv.snapshot.SnapshotContext;
-import org.apache.fluss.server.log.ColumnGroupStore;
 import org.apache.fluss.server.log.FetchDataInfo;
 import org.apache.fluss.server.log.FetchIsolation;
 import org.apache.fluss.server.log.FetchParams;
@@ -104,6 +103,7 @@ import org.apache.fluss.server.zk.data.LeaderAndIsr;
 import org.apache.fluss.server.zk.data.ZkData;
 import org.apache.fluss.types.DataType;
 import org.apache.fluss.types.RowType;
+import org.apache.fluss.utils.CloseableIterator;
 import org.apache.fluss.utils.CloseableRegistry;
 import org.apache.fluss.utils.FlussPaths;
 import org.apache.fluss.utils.IOUtils;
@@ -1011,14 +1011,19 @@ public final class Replica {
     }
 
     /**
-     * Append enrichment columns for the given column group at the source offsets carried by each
-     * entry. Each entry's {@code enrichment_row} is an IndexedRow encoding of the column group's
-     * columns, in the order they appear in the table schema.
+     * Append enrichment columns for the given column group. The records are an Arrow-encoded {@link
+     * MemoryLogRecords} containing one row per source offset, in the column group's schema-defined
+     * order; {@code sourceOffsets} is parallel to those rows and names the base-log offset each
+     * enrichment row enriches.
      *
-     * <p>After all puts succeed, the per-group enrichment watermark (EWM) advances to the highest
-     * contiguous offset that has been filled (starting from offset 0). Returns the resulting EWM.
+     * <p>The source offsets must be strictly monotonic and contiguous from the current EWM (i.e.
+     * {@code sourceOffsets[0] == EWM} and each subsequent offset is the previous + 1). After all
+     * rows are persisted, the EWM advances to {@code sourceOffsets.last + 1} and is returned.
+     * Tables whose log format is not ARROW reject column-group writes — this mirrors the read-path
+     * enforcement in {@link #fetchRecords}.
      */
-    public long appendColumnsAsLeader(String columnGroup, List<PbEnrichmentEntry> entries) {
+    public long appendColumnsAsLeader(
+            String columnGroup, MemoryLogRecords records, long[] sourceOffsets) {
         return inReadLock(
                 leaderIsrUpdateLock,
                 () -> {
@@ -1027,6 +1032,12 @@ public final class Replica {
                                 String.format(
                                         "Leader not local for bucket %s on tabletServer %d",
                                         tableBucket, localTabletServerId));
+                    }
+                    if (logFormat != LogFormat.ARROW) {
+                        throw new InvalidColumnProjectionException(
+                                String.format(
+                                        "Column groups require ARROW log format, but table '%s' is %s.",
+                                        physicalPath, logFormat));
                     }
 
                     Schema schema = tableInfo.getSchema();
@@ -1040,11 +1051,41 @@ public final class Replica {
                                         + getTablePath());
                     }
 
+                    long localLogEnd = logTablet.localLogEndOffset();
+                    long currentEwm = logTablet.getEnrichmentWatermark(columnGroup);
+                    long expected = Math.max(0L, currentEwm);
+                    for (int i = 0; i < sourceOffsets.length; i++) {
+                        long actual = sourceOffsets[i];
+                        if (actual != expected) {
+                            throw new IllegalArgumentException(
+                                    String.format(
+                                            "Out-of-order column-group write for bucket %s group '%s': "
+                                                    + "expected source_offset %d (next slot after EWM=%d) but got %d at index %d",
+                                            tableBucket,
+                                            columnGroup,
+                                            expected,
+                                            currentEwm,
+                                            actual,
+                                            i));
+                        }
+                        if (actual >= localLogEnd) {
+                            throw new IllegalArgumentException(
+                                    String.format(
+                                            "Cannot enrich offset %d which is outside [0, %d) for bucket %s",
+                                            actual, localLogEnd, tableBucket));
+                        }
+                        expected++;
+                    }
+
+                    String[] groupColumnNames = new String[indicesInGroup.size()];
                     DataType[] groupTypes = new DataType[indicesInGroup.size()];
                     List<Schema.Column> allColumns = schema.getColumns();
                     for (int i = 0; i < indicesInGroup.size(); i++) {
-                        groupTypes[i] = allColumns.get(indicesInGroup.get(i)).getDataType();
+                        Schema.Column col = allColumns.get(indicesInGroup.get(i));
+                        groupColumnNames[i] = col.getName();
+                        groupTypes[i] = col.getDataType();
                     }
+                    RowType groupRowType = RowType.of(groupTypes, groupColumnNames);
                     InternalRow.FieldGetter[] fieldGetters =
                             new InternalRow.FieldGetter[groupTypes.length];
                     for (int i = 0; i < groupTypes.length; i++) {
@@ -1053,43 +1094,48 @@ public final class Replica {
 
                     logTablet.registerColumnGroupIfAbsent(columnGroup);
 
-                    long localLogEnd = logTablet.localLogEndOffset();
-                    for (PbEnrichmentEntry entry : entries) {
-                        long offset = entry.getSourceOffset();
-                        if (offset < 0 || offset >= localLogEnd) {
-                            throw new IllegalArgumentException(
-                                    String.format(
-                                            "Cannot enrich offset %d which is outside [0, %d) for bucket %s",
-                                            offset, localLogEnd, tableBucket));
+                    int rowIdx = 0;
+                    int expectedRowCount = sourceOffsets.length;
+                    try (LogRecordReadContext readCtx =
+                            LogRecordReadContext.createArrowReadContext(
+                                    groupRowType, tableInfo.getSchemaId(), schemaGetter)) {
+                        for (LogRecordBatch batch : records.batches()) {
+                            try (CloseableIterator<LogRecord> it = batch.records(readCtx)) {
+                                while (it.hasNext()) {
+                                    if (rowIdx >= expectedRowCount) {
+                                        throw new IllegalArgumentException(
+                                                String.format(
+                                                        "Column-group records contain more rows than source_offsets (%d) for bucket %s group '%s'",
+                                                        expectedRowCount,
+                                                        tableBucket,
+                                                        columnGroup));
+                                    }
+                                    InternalRow row = it.next().getRow();
+                                    GenericRow generic = new GenericRow(groupTypes.length);
+                                    for (int i = 0; i < groupTypes.length; i++) {
+                                        generic.setField(i, fieldGetters[i].getFieldOrNull(row));
+                                    }
+                                    logTablet.putEnrichment(
+                                            columnGroup, sourceOffsets[rowIdx], generic);
+                                    rowIdx++;
+                                }
+                            }
                         }
-                        IndexedRow indexedRow =
-                                IndexedRow.from(groupTypes, entry.getEnrichmentRow());
-                        GenericRow generic = new GenericRow(groupTypes.length);
-                        for (int i = 0; i < groupTypes.length; i++) {
-                            generic.setField(i, fieldGetters[i].getFieldOrNull(indexedRow));
-                        }
-                        logTablet.putEnrichment(columnGroup, offset, generic);
+                    }
+                    if (rowIdx != expectedRowCount) {
+                        throw new IllegalArgumentException(
+                                String.format(
+                                        "Column-group records contain %d rows but source_offsets list has %d for bucket %s group '%s'",
+                                        rowIdx, expectedRowCount, tableBucket, columnGroup));
                     }
 
-                    advanceContiguousEnrichmentWatermark(columnGroup);
+                    long newEwm =
+                            sourceOffsets.length == 0
+                                    ? Math.max(0L, currentEwm)
+                                    : sourceOffsets[sourceOffsets.length - 1] + 1L;
+                    logTablet.advanceEnrichmentWatermark(columnGroup, newEwm);
                     return logTablet.getEnrichmentWatermark(columnGroup);
                 });
-    }
-
-    private void advanceContiguousEnrichmentWatermark(String columnGroup) {
-        ColumnGroupStore store = logTablet.getColumnGroupStore(columnGroup);
-        if (store == null) {
-            return;
-        }
-        long current = store.getEnrichmentWatermark();
-        long startScan = Math.max(0L, current);
-        long candidate = startScan;
-        while (store.get(candidate) != null) {
-            candidate++;
-        }
-        if (candidate > startScan) {
-            store.advanceEnrichmentWatermark(candidate);
-        }
     }
 
     public LogAppendInfo putRecordsToLeader(

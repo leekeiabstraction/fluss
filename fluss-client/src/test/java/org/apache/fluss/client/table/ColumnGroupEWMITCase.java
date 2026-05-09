@@ -46,6 +46,7 @@ import java.util.Map;
 
 import static org.apache.fluss.testutils.DataTestUtils.row;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * Integration test for Column Group Enrichment with Enrichment Watermark (EWM) tracking.
@@ -344,6 +345,60 @@ public class ColumnGroupEWMITCase extends ClientToServerITCaseBase {
                     writer.appendColumns("enriched", bucket, 3L, lateRow).get();
             assertThat(fillThree.getEnrichmentWatermark()).isEqualTo(4L);
             assertThat(store.size()).isEqualTo(4);
+        }
+    }
+
+    @Test
+    void testAppendColumnsRejectsOutOfOrder() throws Exception {
+        TablePath tablePath = TablePath.of(DB_NAME, "device_logs_strict_order");
+        long tableId = createTable(tablePath, TABLE_DESCRIPTOR, false);
+        FLUSS_CLUSTER_EXTENSION.waitUntilTableReady(tableId);
+
+        int recordCount = 4;
+        TableBucket bucket = new TableBucket(tableId, 0);
+
+        try (Table table = conn.getTable(tablePath)) {
+            AppendWriter writer = table.newAppend().createWriter();
+            for (int i = 0; i < recordCount; i++) {
+                writer.append(
+                                row(
+                                        "device-" + i,
+                                        "10.0.0." + i,
+                                        "payload-" + i,
+                                        (long) (1000 + i),
+                                        null,
+                                        null))
+                        .get();
+            }
+            try (LogScanner scanner = createLogScanner(table)) {
+                subscribeFromBeginning(scanner, table);
+                int read = 0;
+                while (read < recordCount) {
+                    read += scanner.poll(Duration.ofSeconds(1)).count();
+                }
+            }
+
+            // EWM starts at -1; first valid offset is 0. Skipping to 1 must fail.
+            GenericRow enrich = GenericRow.of(BinaryString.fromString("US-WEST-1"), 0.6);
+            assertThatThrownBy(() -> writer.appendColumns("enriched", bucket, 1L, enrich).get())
+                    .hasMessageContaining("Out-of-order column-group write")
+                    .hasMessageContaining("expected source_offset 0");
+
+            // Filling 0 first then 2 (skipping 1) must also fail on the second call.
+            writer.appendColumns(
+                            "enriched",
+                            bucket,
+                            0L,
+                            GenericRow.of(BinaryString.fromString("US-WEST-0"), 0.5))
+                    .get();
+            GenericRow skipOne = GenericRow.of(BinaryString.fromString("US-WEST-2"), 0.7);
+            assertThatThrownBy(() -> writer.appendColumns("enriched", bucket, 2L, skipOne).get())
+                    .hasMessageContaining("Out-of-order column-group write")
+                    .hasMessageContaining("expected source_offset 1");
+
+            // EWM advanced exactly once (only offset 0 was successfully enriched).
+            LogTablet leader = getLeaderLogTablet(bucket);
+            assertThat(leader.getEnrichmentWatermark("enriched")).isEqualTo(1L);
         }
     }
 

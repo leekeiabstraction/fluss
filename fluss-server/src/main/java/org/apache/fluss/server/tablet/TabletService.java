@@ -69,6 +69,7 @@ import org.apache.fluss.rpc.messages.UpdateMetadataResponse;
 import org.apache.fluss.rpc.protocol.ApiError;
 import org.apache.fluss.rpc.protocol.Errors;
 import org.apache.fluss.rpc.protocol.MergeMode;
+import org.apache.fluss.rpc.util.CommonRpcMessageUtils;
 import org.apache.fluss.security.acl.OperationType;
 import org.apache.fluss.security.acl.Resource;
 import org.apache.fluss.server.DynamicConfigManager;
@@ -214,10 +215,14 @@ public final class TabletService extends RpcServiceBase implements TabletServerG
                     throw new UnknownTableOrBucketException(
                             "Replica for bucket " + tb + " is not online on this server");
                 }
+                java.nio.ByteBuffer recordsBuf =
+                        CommonRpcMessageUtils.toByteBuffer(bucketReq.getRecordsSlice());
+                MemoryLogRecords records = MemoryLogRecords.pointToByteBuffer(recordsBuf);
                 long ewm =
                         ((ReplicaManager.OnlineReplica) hosted)
                                 .getReplica()
-                                .appendColumnsAsLeader(columnGroup, bucketReq.getEntriesList());
+                                .appendColumnsAsLeader(
+                                        columnGroup, records, bucketReq.getSourceOffsets());
                 bucketResp.setEnrichmentWatermark(ewm);
             } catch (Exception e) {
                 ApiError apiError = ApiError.fromThrowable(e);
