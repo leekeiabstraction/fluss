@@ -196,9 +196,10 @@ public final class EnrichmentMerger implements AutoCloseable {
                         normalizeMagic(batch.magic()),
                         tableSchemaId,
                         arrowWriter,
-                        outputView)) {
+                        outputView,
+                        true)) {
+            int rowCount = 0;
             try (CloseableIterator<LogRecord> rowIter = batch.records(baseReadContext)) {
-                int rowCount = 0;
                 while (rowIter.hasNext()) {
                     LogRecord baseRecord = rowIter.next();
                     long sourceOffset = baseRecord.logOffset();

@@ -142,6 +142,22 @@ public class MemoryLogRecordsArrowBuilder implements AutoCloseable {
                 baseLogOffset, schemaId, magic, arrowWriter, outputView, false, null);
     }
 
+    /**
+     * Builder that lets the caller pin the batch's {@code baseLogOffset} and {@code appendOnly}
+     * flag — needed by re-encoders (e.g. enrichment merge-on-read) that emit batches mirroring an
+     * input batch's framing while writing rows that are uniformly append-only.
+     */
+    public static MemoryLogRecordsArrowBuilder builder(
+            long baseLogOffset,
+            byte magic,
+            int schemaId,
+            ArrowWriter arrowWriter,
+            AbstractPagedOutputView outputView,
+            boolean appendOnly) {
+        return new MemoryLogRecordsArrowBuilder(
+                baseLogOffset, schemaId, magic, arrowWriter, outputView, appendOnly, null);
+    }
+
     /** Builder with limited write size and the memory segment used to serialize records. */
     public static MemoryLogRecordsArrowBuilder builder(
             int schemaId,
