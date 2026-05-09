@@ -167,22 +167,47 @@ Considered alternatives:
 - **Persist CEW to ZooKeeper alongside `LeaderAndIsr`.** Write rate too high;
   ZK is for low-frequency state.
 
-### 4.4 Truncation must drop enrichment beyond the truncation point
+### 4.4 Truncation: strict, base-first, with recovery clamp
 
 `LogTablet.truncateTo` and `truncateFullyAndStartAt` (`LogTablet.java:1120-1185`)
-currently leave enrichment segments untouched. After replication lands, this
-becomes a corruption hazard: a follower truncating base log to offset N must
-also truncate enrichment with `source_offset >= N`, otherwise on next
-replication the leader will append enrichment that contradicts the follower's
-stale data, violating the contiguous-from-EWM contract enforced in
+currently leave enrichment segments untouched. After replication lands this
+becomes a corruption hazard: a replica truncating base log to offset N must
+also drop enrichment with `source_offset >= N`, otherwise on next replication
+the leader will append enrichment that contradicts the replica's stale data,
+violating the contiguous-from-EWM contract enforced in
 `Replica.appendColumnsAsLeader`.
 
-**Order:** land Phase E.5b (truncation fix) **before** E.3 (replication wire-up).
-Without that ordering, the latent bug becomes a live data-corruption scenario
-the first time an unclean truncation hits a replica.
+Three decisions resolved together:
+
+1. **Trigger: mirror only.** Enrichment truncation fires *exclusively* as a
+   side effect of base-log truncation. No enrichment-only truncation path.
+   Enrichment exists to annotate base records; if a base record disappears,
+   the corresponding enrichment is meaningless and unsafe to keep.
+
+2. **Strict, not lazy.** On every base truncate to offset N, walk every
+   registered group, call `EnrichmentSegment.truncateTo(N)` (drop
+   `OffsetIndex` entries with `offset >= N`, truncate the `FileLogRecords`
+   to the file position of the first dropped entry), reset
+   `EWM_g := min(EWM_g, N)`. Lazy gating (keep stale entries, gate reads at
+   `min(EWM_g, localLogEndOffset)`) was rejected because the
+   contiguous-from-EWM write contract requires the file's tail to track EWM —
+   splitting them forces a rewrite of the append path, and disk savings are a
+   Tier-3 concern anyway.
+
+3. **Order: base first, then enrichment, with recovery clamp.** A multi-file
+   truncate cannot be made atomic. Truncating base before enrichment leaves a
+   crash window in which `EWM_g > localLogEndOffset`; the recovery clamp in
+   E.5d (`discoverEnrichmentSegments` post-process) closes that window by
+   re-truncating dangling enrichment at startup. The reverse order (enrichment
+   first) creates a window where base is ahead of enrichment, which has no safe
+   recovery — we would be inferring base-log truncation from enrichment state.
+
+**Phase ordering:** E.5b (truncation fix) lands **before** E.3 (replication
+wire-up). Without that ordering the latent bug becomes a live data-corruption
+scenario the first time an unclean truncation hits a replica.
 
 Adds `EnrichmentSegment.truncateTo(long sourceOffsetExclusive)` and wires it
-into both truncation paths.
+into both `LogTablet.truncateTo` and `LogTablet.truncateFullyAndStartAt`.
 
 ### 4.5 ISR coupling
 
