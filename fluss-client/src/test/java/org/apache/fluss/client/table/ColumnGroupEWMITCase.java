@@ -347,6 +347,88 @@ public class ColumnGroupEWMITCase extends ClientToServerITCaseBase {
         }
     }
 
+    @Test
+    void testProjectionGatedVisibility() throws Exception {
+        TablePath tablePath = TablePath.of(DB_NAME, "device_logs_gate");
+        long tableId = createTable(tablePath, TABLE_DESCRIPTOR, false);
+        FLUSS_CLUSTER_EXTENSION.waitUntilTableReady(tableId);
+
+        int recordCount = 6;
+        TableBucket bucket = new TableBucket(tableId, 0);
+
+        try (Table table = conn.getTable(tablePath)) {
+            // Append 6 base rows so offsets 0..5 exist.
+            AppendWriter writer = table.newAppend().createWriter();
+            for (int i = 0; i < recordCount; i++) {
+                GenericRow baseRow =
+                        row(
+                                "device-" + i,
+                                "10.0.0." + i,
+                                "payload-" + i,
+                                (long) (1000 + i),
+                                null,
+                                null);
+                writer.append(baseRow).get();
+            }
+            // Drain via a non-projecting scanner so we know all 6 rows are durable.
+            try (LogScanner scanner = createLogScanner(table)) {
+                subscribeFromBeginning(scanner, table);
+                int read = 0;
+                while (read < recordCount) {
+                    read += scanner.poll(Duration.ofSeconds(1)).count();
+                }
+            }
+
+            // Enrich offsets 0, 1, 2 only — advance EWM to 3.
+            for (int i = 0; i < 3; i++) {
+                GenericRow enrichmentRow =
+                        GenericRow.of(
+                                BinaryString.fromString("US-WEST-" + i), (double) (0.5 + i * 0.1));
+                AppendColumnsResult result =
+                        writer.appendColumns("enriched", bucket, i, enrichmentRow).get();
+                assertThat(result.getEnrichmentWatermark()).isEqualTo(i + 1L);
+            }
+
+            LogTablet leader = getLeaderLogTablet(bucket);
+            assertThat(leader.getEnrichmentWatermark("enriched")).isEqualTo(3L);
+
+            // Sanity: a non-projecting scanner still sees all 6 (option-(b) gate semantics).
+            try (LogScanner fullScanner = createLogScanner(table)) {
+                subscribeFromBeginning(fullScanner, table);
+                int seen = 0;
+                long deadline = System.currentTimeMillis() + 5_000L;
+                while (seen < recordCount && System.currentTimeMillis() < deadline) {
+                    seen += fullScanner.poll(Duration.ofSeconds(1)).count();
+                }
+                assertThat(seen).isEqualTo(recordCount);
+            }
+
+            // Projecting scanner that includes the "enriched" group's geo_region (idx 4)
+            // must see only offsets [0..2] (capped by EWM=3).
+            int[] projection = new int[] {0, 4};
+            try (LogScanner gatedScanner = createLogScanner(table, projection)) {
+                subscribeFromBeginning(gatedScanner, table);
+                List<ScanRecord> seen = new ArrayList<>();
+                long deadline = System.currentTimeMillis() + 5_000L;
+                while (seen.size() < 3 && System.currentTimeMillis() < deadline) {
+                    ScanRecords records = gatedScanner.poll(Duration.ofSeconds(1));
+                    for (ScanRecord r : records) {
+                        seen.add(r);
+                    }
+                }
+                // Try one more poll to make sure no extras dribble in.
+                ScanRecords extra = gatedScanner.poll(Duration.ofMillis(500));
+                for (ScanRecord r : extra) {
+                    seen.add(r);
+                }
+                assertThat(seen).hasSize(3);
+                for (int i = 0; i < 3; i++) {
+                    assertThat(seen.get(i).logOffset()).isEqualTo(i);
+                }
+            }
+        }
+    }
+
     /** Find the leader LogTablet for a given table bucket across all tablet servers. */
     private LogTablet getLeaderLogTablet(TableBucket tableBucket) {
         for (TabletServer ts : FLUSS_CLUSTER_EXTENSION.getTabletServers()) {

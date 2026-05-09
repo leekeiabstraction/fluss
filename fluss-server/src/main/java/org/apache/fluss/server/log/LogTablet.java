@@ -546,7 +546,16 @@ public final class LogTablet {
         if (maxOffsetCap < Long.MAX_VALUE) {
             long cap = Math.max(0L, maxOffsetCap);
             if (maxOffsetMetadata == null || cap < maxOffsetMetadata.getMessageOffset()) {
-                maxOffsetMetadata = new LogOffsetMetadata(cap);
+                // Resolve to a fully-populated LogOffsetMetadata (segmentBaseOffset +
+                // relativePositionInSegment) so LocalLog.read can use it to bound maxPosition
+                // at the segment level. A messageOffsetOnly metadata leaves maxPosition equal
+                // to segment.getSizeInBytes(), which would defeat the cap.
+                long endOffset = localLog.getLocalLogEndOffsetMetadata().getMessageOffset();
+                if (cap >= endOffset) {
+                    maxOffsetMetadata = localLog.getLocalLogEndOffsetMetadata();
+                } else {
+                    maxOffsetMetadata = localLog.convertToOffsetMetadataOrThrow(cap);
+                }
             }
         }
 
