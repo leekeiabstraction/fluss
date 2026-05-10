@@ -1,6 +1,8 @@
 # Phase H — Schema evolution for column groups
 
-**Status:** ADR — H.1 (this doc).
+**Status:** H.1, H.2, H.3 landed. H.4 ITCase checked in `@Disabled` —
+blocked by a pre-existing gap (`Replica.tableInfo` is `final`, no
+refresh-on-alter path). See §5.1.
 **Authors:** option02-lateMaterialized branch.
 **Depends on:** Phase B (column-group schema), Phase E (per-(group, batchSchemaId) decoder dispatch — commit `63e5a12f`).
 
@@ -155,18 +157,81 @@ Out of scope for H.
 ## 5. Phasing
 
 ```
-H.1  ADR (this doc)                      ✓ this commit
+H.1  ADR (this doc)                                  ✓ 83de602f
 H.2  TableChange.AddColumn.groupName +
-     SchemaUpdate group-aware            (next)
+     SchemaUpdate group-aware                        ✓ 87d24f85
 H.3  Wire format: PbAddColumn.column_group
-     + client/server util plumbing        (next)
-H.4  Schema-evolution ITCase              (drives v1 → v2 dispatch end-to-end)
-H.5  Negative tests                       (validator rejects ambiguous calls)
+     + client/server util plumbing                   ✓ 87d24f85
+H.4  Schema-evolution ITCase                         BLOCKED — see §5.1
+     (drives v1 → v2 dispatch end-to-end)
+H.5  Negative tests                                  not started
 ```
 
 H.2 and H.3 are coupled (the proto change has to land with the Java
 overload that fills it). H.4 is the deliverable that makes the
 deferred E.7 dispatch ITCase real. H.5 is polish.
+
+### 5.1 H.4 surfaced a pre-existing architectural gap
+
+When wiring up `testSchemaEvolutionDispatch` in `ColumnGroupEWMITCase`
+the test failed not because of H.2/H.3 but because of a separate gap:
+**`Replica.tableInfo` is `final`** (Replica.java:185), captured once at
+`ReplicaManager.maybeCreateReplica` from a ZK fetch. There is no
+notification path that refreshes the leader Replica's `tableInfo` when
+`alterTable` bumps the schema in ZK.
+
+The diagnostic instrumentation showed:
+
+```
+schemaId=1 projected=[0,1,2,3] enrichmentTouched=true preMergeBytes=5440 enrichmentCap=10
+merger threw: java.lang.IndexOutOfBoundsException: Index 3 out of bounds for length 3
+```
+
+Even after the test's `admin.alterTable(...)` succeeded (the v2 enrichment
+writes that follow it return `EWM = i+1`, so the *write* path observes v2),
+the leader's `Replica.tableInfo` is still v1. When the read path
+constructs `EnrichmentMerger` from that v1 `tableInfo` but the client's
+projection `[0,1,2,3]` references v2's 4-column row type, the merger
+throws on column index 3.
+
+Why this is not exposed by existing tests:
+
+- `PaimonTieringITCase#testTieringWithAddColumn` does an `addColumn`
+  alter and verifies the new column lands in Paimon. It works because
+  tiering reads **without** a column-group projection — no merger,
+  no schema-mismatch path. The stale `tableInfo` doesn't bite.
+- `ColumnGroupEWMITCase#testProjectionGatedVisibility` exercises the
+  projection-with-merger path but never alters the table — only one
+  schema is in play.
+- Phase F.4/F.5 ITCases use column-group projection but no alter.
+
+H.4 is the first test that combines `alterTable` *and*
+column-group-projection-with-merger, and that's the combination that
+needs `tableInfo` refresh.
+
+The H.4 test method is checked in but `@Disabled` with this
+explanation. It will become a green check once the Replica refresh is
+landed (a separate phase — see §6.5).
+
+### 5.2 The fix is out of scope of H
+
+The Replica refresh is its own piece of infrastructure work — not a
+schema-evolution concern per se. Scope creep risk if folded into H.
+
+Two plausible shapes for the fix:
+
+- **(a) Push notification.** Coordinator notifies leader Replicas when
+  ZK records a schema change; each leader Replica refreshes its local
+  `tableInfo` (drop `final`, add a setter, take a write lock during the
+  swap). Cleanest for steady-state but needs a new RPC verb / Notify
+  message.
+- **(b) Per-fetch refresh.** `Replica.readRecords` re-fetches `tableInfo`
+  from the metadata cache on every fetch. Avoids the notification path
+  but adds a metadata cache hit per fetch — measurable cost on hot
+  reads.
+
+Either fix is roughly the size of E.5b (a few hundred lines including
+tests). Out of scope for this ADR; tracked as the next phase below.
 
 ## 6. Open questions
 
@@ -204,6 +269,13 @@ never exercised. Plausible mechanisms:
 **Tentative resolution:** flush via the same path E uses internally
 when EWM advances; expose a test-only helper if no public path exists.
 Resolve in H.4.
+
+### 6.5 Replica.tableInfo refresh on alter (NEW open question — discovered during H.4)
+
+See §5.1. Without this, the projection-with-merger read path returns
+stale-schema data after any `alterTable`. Tracked as the immediate
+follow-up phase. Either push-notification or per-fetch refresh; pick
+based on metadata-cache hit cost vs. notification-channel complexity.
 
 ### 6.4 Producer rejection on row arity mismatch
 

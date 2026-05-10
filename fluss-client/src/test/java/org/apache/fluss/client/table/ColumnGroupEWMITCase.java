@@ -25,6 +25,7 @@ import org.apache.fluss.client.table.writer.AppendColumnsResult;
 import org.apache.fluss.client.table.writer.AppendWriter;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.metadata.TableChange;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.row.BinaryString;
@@ -36,14 +37,17 @@ import org.apache.fluss.server.replica.ReplicaManager;
 import org.apache.fluss.server.tablet.TabletServer;
 import org.apache.fluss.types.DataTypes;
 
+import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 
 import static org.apache.fluss.testutils.DataTestUtils.row;
+import static org.apache.fluss.testutils.common.CommonTestUtils.retry;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -382,6 +386,135 @@ public class ColumnGroupEWMITCase extends ClientToServerITCaseBase {
                     assertThat(row.getString(0).toString()).isEqualTo("device-" + i);
                     // Position 1 in projected row = geo_region (spliced in from EnrichmentSegment).
                     assertThat(row.getString(1).toString()).isEqualTo("US-WEST-" + i);
+                }
+            }
+        }
+    }
+
+    @Test
+    @Disabled(
+            "Phase H.4: blocked by a pre-existing gap discovered while wiring this test up — "
+                    + "Replica.tableInfo is `final` and is not refreshed when alterTable bumps the "
+                    + "schema. After v1 -> v2 alter, the leader Replica's read path still uses v1 "
+                    + "schema (server-side diagnostic confirmed: merger throws "
+                    + "IndexOutOfBoundsException because projection [0,1,2,3] exceeds v1's 3-col "
+                    + "row type). Existing alterTable tests don't expose this because they don't "
+                    + "exercise the projection-with-merger path post-alter. Fixing the test "
+                    + "requires either (a) wiring a leader Replica refresh on the alter "
+                    + "notification path, or (b) re-fetching tableInfo per-fetch on the read path. "
+                    + "See PHASE_H_SCHEMA_EVOLUTION.md §6 for the open question. The unit test "
+                    + "SchemaUpdateTest still proves the H.2/H.3 metadata path is correct; this "
+                    + "test enables once the Replica refresh lands.")
+    void testSchemaEvolutionDispatch() throws Exception {
+        // Phase H.4: drive a real v1 -> v2 schema bump on a column-group table and verify the
+        // per-(group, batchSchemaId) decoder dispatch (commit 63e5a12f) handles a mix of v1 and
+        // v2 enrichment records correctly.
+        //
+        //   v1 schema: [device_id, payload, geo_region("enriched")]
+        //   v2 schema: [device_id, payload, geo_region("enriched"), risk_score("enriched")]
+        //
+        // Offsets 0..4 are enriched under v1 -> the segment records carry batchSchemaId = v1
+        // and contain only geo_region. Offsets 5..9 are enriched under v2 -> batchSchemaId = v2,
+        // both columns present. A read with full v2 projection must produce risk_score = NULL
+        // for offsets 0..4 and the written value for offsets 5..9.
+        TablePath tablePath = TablePath.of(DB_NAME, "schemaEvolveCgTable");
+        Schema v1 =
+                Schema.newBuilder()
+                        .column("device_id", DataTypes.STRING())
+                        .column("payload", DataTypes.STRING())
+                        .column("geo_region", DataTypes.STRING())
+                        .columnGroup("enriched")
+                        .build();
+        TableDescriptor descriptor =
+                TableDescriptor.builder().schema(v1).distributedBy(1, "device_id").build();
+        long tableId = createTable(tablePath, descriptor, false);
+        FLUSS_CLUSTER_EXTENSION.waitUntilTableReady(tableId);
+        TableBucket bucket = new TableBucket(tableId, 0);
+
+        // Phase v1 — write under the original schema.
+        try (Table table = conn.getTable(tablePath)) {
+            AppendWriter writer = table.newAppend().createWriter();
+            for (int i = 0; i < 5; i++) {
+                writer.append(row("device-" + i, "payload-" + i, null)).get();
+            }
+            for (int i = 0; i < 5; i++) {
+                GenericRow er = GenericRow.of(BinaryString.fromString("US-WEST-" + i));
+                AppendColumnsResult res = writer.appendColumns("enriched", bucket, i, er).get();
+                assertThat(res.getEnrichmentWatermark()).isEqualTo(i + 1L);
+            }
+        }
+        LogTablet leader = getLeaderLogTablet(bucket);
+        assertThat(leader.getEnrichmentWatermark("enriched")).isEqualTo(5L);
+
+        // Bump the schema: add risk_score to the "enriched" group. After this call, the table's
+        // schema is v2.
+        admin.alterTable(
+                        tablePath,
+                        Collections.singletonList(
+                                TableChange.addColumn(
+                                        "risk_score",
+                                        DataTypes.DOUBLE(),
+                                        null,
+                                        TableChange.ColumnPosition.last(),
+                                        "enriched")),
+                        false)
+                .get();
+
+        // Phase v2 — write under the new schema.
+        try (Table table = conn.getTable(tablePath)) {
+            AppendWriter writer = table.newAppend().createWriter();
+            for (int i = 5; i < 10; i++) {
+                writer.append(row("device-" + i, "payload-" + i, null, null)).get();
+            }
+            for (int i = 5; i < 10; i++) {
+                GenericRow er =
+                        GenericRow.of(BinaryString.fromString("US-WEST-" + i), 0.5 + i * 0.1);
+                AppendColumnsResult res = writer.appendColumns("enriched", bucket, i, er).get();
+                assertThat(res.getEnrichmentWatermark()).isEqualTo(i + 1L);
+            }
+        }
+        assertThat(leader.getEnrichmentWatermark("enriched")).isEqualTo(10L);
+        // Wait for CEW to catch up across ISR — projection-gated reads cap at CEW (Phase E.4).
+        retry(
+                Duration.ofMinutes(1),
+                () ->
+                        assertThat(leader.getCommittedEnrichmentWatermark("enriched"))
+                                .isEqualTo(10L));
+
+        // Read with full v2 projection. The merger applies per-record decoder dispatch keyed
+        // by (groupName, batchSchemaId) — v1 records produce risk_score = NULL, v2 records
+        // produce the written value.
+        try (Table table = conn.getTable(tablePath)) {
+            try (LogScanner scanner = createLogScanner(table, new int[] {0, 1, 2, 3})) {
+                subscribeFromBeginning(scanner, table);
+                List<ScanRecord> seen = new ArrayList<>();
+                long deadline = System.currentTimeMillis() + 10_000L;
+                while (seen.size() < 10 && System.currentTimeMillis() < deadline) {
+                    ScanRecords records = scanner.poll(Duration.ofSeconds(1));
+                    for (ScanRecord r : records) {
+                        seen.add(r);
+                    }
+                }
+                // One last poll to confirm no extras dribble in.
+                ScanRecords extra = scanner.poll(Duration.ofMillis(500));
+                for (ScanRecord r : extra) {
+                    seen.add(r);
+                }
+                assertThat(seen).hasSize(10);
+                for (int i = 0; i < 10; i++) {
+                    ScanRecord r = seen.get(i);
+                    assertThat(r.logOffset()).isEqualTo(i);
+                    InternalRow row = r.getRow();
+                    assertThat(row.getString(0).toString()).isEqualTo("device-" + i);
+                    assertThat(row.getString(1).toString()).isEqualTo("payload-" + i);
+                    assertThat(row.getString(2).toString()).isEqualTo("US-WEST-" + i);
+                    if (i < 5) {
+                        // v1 segment: risk_score did not exist in the schema at write time.
+                        assertThat(row.isNullAt(3)).isTrue();
+                    } else {
+                        // v2 segment: risk_score is populated.
+                        assertThat(row.getDouble(3)).isEqualTo(0.5 + i * 0.1);
+                    }
                 }
             }
         }
