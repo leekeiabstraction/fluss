@@ -22,6 +22,8 @@ import org.apache.fluss.annotation.Internal;
 import javax.annotation.Nullable;
 
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.Map;
 import java.util.Objects;
 
 /** The structure of fetch data. */
@@ -30,19 +32,34 @@ public final class FetchReqInfo {
     private final long tableId;
     private final long fetchOffset;
     @Nullable private final int[] projectFields;
+    /**
+     * Per-group EWM cursors advertised by a follower (E.3a). Empty for client fetches and for
+     * tables with no column groups. Drives leader-side enrichment-replication reads in E.3b.
+     */
+    private final Map<String, Long> followerEwmCursors;
 
     private int maxBytes;
 
     public FetchReqInfo(long tableId, long fetchOffset, int maxBytes) {
-        this(tableId, fetchOffset, maxBytes, null);
+        this(tableId, fetchOffset, maxBytes, null, Collections.emptyMap());
     }
 
     public FetchReqInfo(
             long tableId, long fetchOffset, int maxBytes, @Nullable int[] projectFields) {
+        this(tableId, fetchOffset, maxBytes, projectFields, Collections.emptyMap());
+    }
+
+    public FetchReqInfo(
+            long tableId,
+            long fetchOffset,
+            int maxBytes,
+            @Nullable int[] projectFields,
+            Map<String, Long> followerEwmCursors) {
         this.tableId = tableId;
         this.fetchOffset = fetchOffset;
         this.maxBytes = maxBytes;
         this.projectFields = projectFields;
+        this.followerEwmCursors = followerEwmCursors;
     }
 
     public long getTableId() {
@@ -64,6 +81,14 @@ public final class FetchReqInfo {
     @Nullable
     public int[] getProjectFields() {
         return projectFields;
+    }
+
+    /**
+     * Per-group EWM cursors a follower advertised for this bucket. Empty for client fetches,
+     * non-enrichment tables, and pre-Phase-E peers.
+     */
+    public Map<String, Long> getFollowerEwmCursors() {
+        return followerEwmCursors;
     }
 
     @Override

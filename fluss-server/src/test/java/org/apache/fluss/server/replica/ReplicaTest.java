@@ -37,6 +37,7 @@ import org.apache.fluss.server.entity.NotifyLeaderAndIsrData;
 import org.apache.fluss.server.kv.KvTablet;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshot;
 import org.apache.fluss.server.kv.snapshot.TestingCompletedKvSnapshotCommitter;
+import org.apache.fluss.server.log.EnrichmentReadResult;
 import org.apache.fluss.server.log.FetchParams;
 import org.apache.fluss.server.log.LogAppendInfo;
 import org.apache.fluss.server.log.LogReadInfo;
@@ -816,6 +817,67 @@ final class ReplicaTest extends ReplicaTestBase {
         // Follower 3 catches up — CEW advances.
         replica.updateFollowerEwm(3, groupName, 8L);
         assertThat(logTablet.getCommittedEnrichmentWatermark(groupName)).isEqualTo(8L);
+    }
+
+    @Test
+    void testFollowerFetchEmitsEnrichmentPayloadAndCew() throws Exception {
+        Replica replica =
+                makeLogReplica(DATA1_PHYSICAL_TABLE_PATH, new TableBucket(DATA1_TABLE_ID, 1));
+        makeLeaderWithIsr(
+                replica,
+                DATA1_TABLE_PATH,
+                new TableBucket(DATA1_TABLE_ID, 1),
+                Arrays.asList(TABLET_SERVER_ID, 2),
+                Arrays.asList(TABLET_SERVER_ID, 2),
+                INITIAL_LEADER_EPOCH);
+
+        String groupName = "enriched";
+        LogTablet logTablet = replica.getLogTablet();
+        for (int i = 0; i < 5; i++) {
+            replica.appendRecordsToLeader(
+                    genMemoryLogRecordsByObject(
+                            Collections.singletonList(new Object[] {i, "v" + i})),
+                    0);
+        }
+        logTablet.registerColumnGroupIfAbsent(groupName);
+        for (int i = 0; i < 5; i++) {
+            logTablet.appendColumnsAsLeader(
+                    groupName, cewBuildSingleRowEnrichment("US-WEST-" + i), new long[] {(long) i});
+        }
+        // Pretend the leader has already advanced CEW to 3 for this group.
+        logTablet.updateCommittedEnrichmentWatermark(groupName, 3L);
+
+        // Build a FetchParams that looks like a fetch from follower 2 with EWM cursor at 1
+        // — leader should ship enrichment for offsets [1, 5).
+        FetchParams fetchParams =
+                new FetchParams(
+                        2,
+                        true,
+                        (int) conf.get(ConfigOptions.CLIENT_SCANNER_LOG_FETCH_MAX_BYTES).getBytes(),
+                        FetchParams.DEFAULT_MIN_FETCH_BYTES,
+                        FetchParams.DEFAULT_MAX_WAIT_MS,
+                        null);
+        fetchParams.setCurrentFetch(
+                DATA1_TABLE_ID,
+                0L,
+                Integer.MAX_VALUE,
+                replica.getSchemaGetter(),
+                DEFAULT_COMPRESSION,
+                null,
+                new ProjectionPushdownCache());
+        fetchParams.setCurrentFollowerEwmCursors(Collections.singletonMap(groupName, 1L));
+
+        LogReadInfo readInfo = replica.fetchRecords(fetchParams);
+
+        // Enrichment payload returned for the group covering [1, 5).
+        assertThat(readInfo.getEnrichmentPayloadPerGroup()).containsKey(groupName);
+        EnrichmentReadResult slice = readInfo.getEnrichmentPayloadPerGroup().get(groupName);
+        assertThat(slice.isEmpty()).isFalse();
+        assertThat(slice.sourceOffsets()).containsExactly(1L, 2L, 3L, 4L);
+        assertThat(slice.records().sizeInBytes()).isPositive();
+
+        // CEW snapshot propagated.
+        assertThat(readInfo.getCommittedEwms()).containsEntry(groupName, 3L);
     }
 
     @Test

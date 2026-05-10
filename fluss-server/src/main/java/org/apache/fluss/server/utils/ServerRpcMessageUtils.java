@@ -939,6 +939,18 @@ public class ServerRpcMessageUtils {
             List<PbFetchLogReqForBucket> bucketsReqsList = fetchLogReqForTable.getBucketsReqsList();
             for (PbFetchLogReqForBucket fetchLogReqForBucket : bucketsReqsList) {
                 int bucketId = fetchLogReqForBucket.getBucketId();
+                Map<String, Long> followerEwmCursors;
+                int cursorCount = fetchLogReqForBucket.getFollowerEwmRequestsCount();
+                if (cursorCount == 0) {
+                    followerEwmCursors = Collections.emptyMap();
+                } else {
+                    followerEwmCursors = new HashMap<>(cursorCount);
+                    for (int i = 0; i < cursorCount; i++) {
+                        org.apache.fluss.rpc.messages.PbFollowerEwmRequest cursor =
+                                fetchLogReqForBucket.getFollowerEwmRequestAt(i);
+                        followerEwmCursors.put(cursor.getGroupName(), cursor.getCurrentEwm());
+                    }
+                }
                 fetchDataMap.put(
                         new TableBucket(
                                 tableId,
@@ -950,7 +962,8 @@ public class ServerRpcMessageUtils {
                                 tableId,
                                 fetchLogReqForBucket.getFetchOffset(),
                                 fetchLogReqForBucket.getMaxFetchBytes(),
-                                projectionFields));
+                                projectionFields,
+                                followerEwmCursors));
             }
         }
 
@@ -1040,6 +1053,44 @@ public class ServerRpcMessageUtils {
                                 "Not supported log records type: " + records.getClass().getName());
                     }
                 }
+            }
+            // E.3a/b: emit enrichment payload + CEW snapshot for follower fetches. Empty for
+            // client fetches and pre-Phase-E peers — the entity's defaults are empty list/map.
+            for (FetchLogResultForBucket.EnrichmentPayload payload :
+                    bucketResult.getEnrichmentPayloadPerGroup()) {
+                org.apache.fluss.rpc.messages.PbEnrichmentBatchForGroup pb =
+                        fetchLogRespForBucket.addEnrichmentPayloadPerGroup();
+                pb.setGroupName(payload.getGroupName());
+                LogRecords payloadRecords = payload.getRecords();
+                if (payloadRecords instanceof FileLogRecords) {
+                    FileChannelChunk chunk = ((FileLogRecords) payloadRecords).toChunk();
+                    pb.setRecords(chunk.getFileChannel(), chunk.getPosition(), chunk.getSize());
+                } else if (payloadRecords instanceof MemoryLogRecords) {
+                    if (payloadRecords == MemoryLogRecords.EMPTY) {
+                        pb.setRecords(new byte[0]);
+                    } else {
+                        MemoryLogRecords memRecords = (MemoryLogRecords) payloadRecords;
+                        pb.setRecords(
+                                memRecords.getMemorySegment(),
+                                memRecords.getPosition(),
+                                memRecords.sizeInBytes());
+                    }
+                } else if (payloadRecords instanceof BytesViewLogRecords) {
+                    pb.setRecordsBytesView(((BytesViewLogRecords) payloadRecords).getBytesView());
+                } else {
+                    throw new UnsupportedOperationException(
+                            "Not supported enrichment log records type: "
+                                    + payloadRecords.getClass().getName());
+                }
+                for (long sourceOffset : payload.getSourceOffsets()) {
+                    pb.addSourceOffset(sourceOffset);
+                }
+            }
+            for (Map.Entry<String, Long> cewEntry : bucketResult.getCommittedEwms().entrySet()) {
+                fetchLogRespForBucket
+                        .addCommittedEwm()
+                        .setGroupName(cewEntry.getKey())
+                        .setCew(cewEntry.getValue());
             }
             if (fetchLogRespMap.containsKey(tb.getTableId())) {
                 fetchLogRespMap.get(tb.getTableId()).add(fetchLogRespForBucket);

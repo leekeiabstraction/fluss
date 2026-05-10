@@ -81,6 +81,7 @@ import org.apache.fluss.server.kv.KvManager;
 import org.apache.fluss.server.kv.KvSnapshotResource;
 import org.apache.fluss.server.kv.snapshot.CompletedKvSnapshotCommitter;
 import org.apache.fluss.server.kv.snapshot.DefaultSnapshotContext;
+import org.apache.fluss.server.log.EnrichmentReadResult;
 import org.apache.fluss.server.log.FetchDataInfo;
 import org.apache.fluss.server.log.FetchParams;
 import org.apache.fluss.server.log.ListOffsetsParam;
@@ -1407,6 +1408,7 @@ public class ReplicaManager implements ServerReconfigurable {
                         replica.getArrowCompressionInfo(),
                         fetchReqInfo.getProjectFields(),
                         projectionsCache);
+                fetchParams.setCurrentFollowerEwmCursors(fetchReqInfo.getFollowerEwmCursors());
                 LogReadInfo readInfo = replica.fetchRecords(fetchParams);
 
                 // Once we read from a non-empty bucket, we stop ignoring request and bucket
@@ -1429,6 +1431,24 @@ public class ReplicaManager implements ServerReconfigurable {
                     fetchLogResult =
                             new FetchLogResultForBucket(
                                     tb, fetchedData.getRecords(), readInfo.getHighWatermark());
+                }
+                // E.3b: attach replicated enrichment payload + CEW snapshot for follower fetches.
+                // No-op for client fetches and tables without column groups (both maps empty).
+                if (!readInfo.getEnrichmentPayloadPerGroup().isEmpty()
+                        || !readInfo.getCommittedEwms().isEmpty()) {
+                    java.util.List<FetchLogResultForBucket.EnrichmentPayload> payloads =
+                            new java.util.ArrayList<>(
+                                    readInfo.getEnrichmentPayloadPerGroup().size());
+                    for (java.util.Map.Entry<String, EnrichmentReadResult> e :
+                            readInfo.getEnrichmentPayloadPerGroup().entrySet()) {
+                        payloads.add(
+                                new FetchLogResultForBucket.EnrichmentPayload(
+                                        e.getKey(),
+                                        e.getValue().records(),
+                                        e.getValue().sourceOffsets()));
+                    }
+                    fetchLogResult =
+                            fetchLogResult.withEnrichment(payloads, readInfo.getCommittedEwms());
                 }
                 logReadResult.put(
                         tb,

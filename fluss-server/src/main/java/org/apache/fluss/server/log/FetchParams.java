@@ -26,6 +26,7 @@ import org.apache.fluss.rpc.messages.FetchLogRequest;
 
 import javax.annotation.Nullable;
 
+import java.util.Collections;
 import java.util.Map;
 import java.util.Objects;
 
@@ -68,6 +69,11 @@ public final class FetchParams {
     // e.g. to resolve which column groups a projection touches for the EWM gate —
     // do not need to crack open FileLogProjection.
     @Nullable private int[] currentProjectedFields;
+    // Per-group EWM cursors advertised by a follower for the bucket currently being fetched.
+    // Empty for client fetches and pre-Phase-E peers; drives leader-side enrichment-replication
+    // reads in E.3b. Reset by every {@link #setCurrentFetch(...)} call so a stale cursor map
+    // from a previous bucket cannot leak into the current bucket's read.
+    private Map<String, Long> currentFollowerEwmCursors = Collections.emptyMap();
     // filter info per table (predicate + schema ID), null if no filters
     @Nullable private final Map<Long, FilterInfo> tableFilterInfoMap;
     // the lazily initialized projection util to read and project file logs
@@ -114,6 +120,9 @@ public final class FetchParams {
         this.fetchOffset = fetchOffset;
         this.maxFetchBytes = maxFetchBytes;
         this.currentProjectedFields = projectedFields;
+        // Reset enrichment cursors for the new bucket; caller layers cursors on top via
+        // setCurrentFollowerEwmCursors after this call.
+        this.currentFollowerEwmCursors = Collections.emptyMap();
         if (projectedFields != null) {
             projectionEnabled = true;
             if (fileLogProjection == null) {
@@ -131,6 +140,24 @@ public final class FetchParams {
     @Nullable
     public int[] currentProjectedFields() {
         return currentProjectedFields;
+    }
+
+    /**
+     * Set the per-group EWM cursors a follower advertised for the current bucket. Pass an empty map
+     * (or skip the call entirely) for client fetches and pre-Phase-E peers; that's the path that
+     * bypasses enrichment replication. Must be called after {@link #setCurrentFetch(...)} — the
+     * latter resets cursors to empty.
+     */
+    public void setCurrentFollowerEwmCursors(Map<String, Long> cursors) {
+        this.currentFollowerEwmCursors = cursors == null ? Collections.emptyMap() : cursors;
+    }
+
+    /**
+     * Per-group EWM cursors a follower advertised for the current bucket. Empty when the fetch is
+     * from a client, when the table has no column groups, or when the peer pre-dates Phase E.
+     */
+    public Map<String, Long> currentFollowerEwmCursors() {
+        return currentFollowerEwmCursors;
     }
 
     /**

@@ -27,6 +27,10 @@ import org.apache.fluss.rpc.protocol.ApiError;
 
 import javax.annotation.Nullable;
 
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+
 import static org.apache.fluss.utils.Preconditions.checkNotNull;
 
 /** Result of {@link FetchLogRequest} for each table bucket. */
@@ -36,6 +40,17 @@ public class FetchLogResultForBucket extends ResultForBucket {
     private final @Nullable LogRecords records;
     private final long highWatermark;
     private final long filteredEndOffset;
+    /**
+     * Per-group enrichment payload for replication (E.3b). Empty for client fetches. Each entry
+     * carries the records bytes plus the source offsets they cover. The wire encoder reads this to
+     * populate {@code PbFetchLogRespForBucket.enrichment_payload_per_group}.
+     */
+    private final List<EnrichmentPayload> enrichmentPayloadPerGroup;
+    /**
+     * Leader's view of CEW per group on this bucket, sent to the follower in the response so it can
+     * advance its own CEW (E.3c). Empty when no enrichment payload is shipping.
+     */
+    private final Map<String, Long> committedEwms;
 
     public FetchLogResultForBucket(
             TableBucket tableBucket, LogRecords records, long highWatermark) {
@@ -45,7 +60,9 @@ public class FetchLogResultForBucket extends ResultForBucket {
                 checkNotNull(records, "records can not be null"),
                 highWatermark,
                 -1L,
-                ApiError.NONE);
+                ApiError.NONE,
+                Collections.emptyList(),
+                Collections.emptyMap());
     }
 
     public FetchLogResultForBucket(
@@ -59,11 +76,21 @@ public class FetchLogResultForBucket extends ResultForBucket {
                 checkNotNull(records, "records can not be null"),
                 highWatermark,
                 filteredEndOffset,
-                ApiError.NONE);
+                ApiError.NONE,
+                Collections.emptyList(),
+                Collections.emptyMap());
     }
 
     public FetchLogResultForBucket(TableBucket tableBucket, ApiError error) {
-        this(tableBucket, null, null, -1L, -1L, error);
+        this(
+                tableBucket,
+                null,
+                null,
+                -1L,
+                -1L,
+                error,
+                Collections.emptyList(),
+                Collections.emptyMap());
     }
 
     public FetchLogResultForBucket(
@@ -74,7 +101,9 @@ public class FetchLogResultForBucket extends ResultForBucket {
                 null,
                 highWatermark,
                 -1L,
-                ApiError.NONE);
+                ApiError.NONE,
+                Collections.emptyList(),
+                Collections.emptyMap());
     }
 
     /**
@@ -84,7 +113,15 @@ public class FetchLogResultForBucket extends ResultForBucket {
      */
     public FetchLogResultForBucket(
             TableBucket tableBucket, long highWatermark, long filteredEndOffset) {
-        this(tableBucket, null, null, highWatermark, filteredEndOffset, ApiError.NONE);
+        this(
+                tableBucket,
+                null,
+                null,
+                highWatermark,
+                filteredEndOffset,
+                ApiError.NONE,
+                Collections.emptyList(),
+                Collections.emptyMap());
     }
 
     private FetchLogResultForBucket(
@@ -93,12 +130,34 @@ public class FetchLogResultForBucket extends ResultForBucket {
             @Nullable LogRecords records,
             long highWatermark,
             long filteredEndOffset,
-            ApiError error) {
+            ApiError error,
+            List<EnrichmentPayload> enrichmentPayloadPerGroup,
+            Map<String, Long> committedEwms) {
         super(tableBucket, error);
         this.remoteLogFetchInfo = remoteLogFetchInfo;
         this.records = records;
         this.highWatermark = highWatermark;
         this.filteredEndOffset = filteredEndOffset;
+        this.enrichmentPayloadPerGroup = enrichmentPayloadPerGroup;
+        this.committedEwms = committedEwms;
+    }
+
+    /**
+     * Returns a copy of this result with enrichment replication payload attached. Used by the
+     * leader fetch handler in E.3b to layer per-group enrichment + CEW snapshots onto an
+     * already-built local-fetch result before serialization.
+     */
+    public FetchLogResultForBucket withEnrichment(
+            List<EnrichmentPayload> enrichmentPayloadPerGroup, Map<String, Long> committedEwms) {
+        return new FetchLogResultForBucket(
+                getTableBucket(),
+                remoteLogFetchInfo,
+                records,
+                highWatermark,
+                filteredEndOffset,
+                getError(),
+                enrichmentPayloadPerGroup,
+                committedEwms);
     }
 
     /**
@@ -146,5 +205,44 @@ public class FetchLogResultForBucket extends ResultForBucket {
      */
     public long getFilteredEndOffset() {
         return filteredEndOffset;
+    }
+
+    /** Per-group enrichment payload to ship to a follower in this fetch's response. */
+    public List<EnrichmentPayload> getEnrichmentPayloadPerGroup() {
+        return enrichmentPayloadPerGroup;
+    }
+
+    /** Leader's view of CEW per group on this bucket. */
+    public Map<String, Long> getCommittedEwms() {
+        return committedEwms;
+    }
+
+    /**
+     * Entity-layer counterpart of {@code PbEnrichmentBatchForGroup}: a column group's name plus the
+     * {@link LogRecords} bytes (typically a {@link org.apache.fluss.record.FileLogRecords} slice
+     * for zero-copy) and the parallel array of source offsets they cover.
+     */
+    public static final class EnrichmentPayload {
+        private final String groupName;
+        private final LogRecords records;
+        private final long[] sourceOffsets;
+
+        public EnrichmentPayload(String groupName, LogRecords records, long[] sourceOffsets) {
+            this.groupName = checkNotNull(groupName, "groupName");
+            this.records = checkNotNull(records, "records");
+            this.sourceOffsets = checkNotNull(sourceOffsets, "sourceOffsets");
+        }
+
+        public String getGroupName() {
+            return groupName;
+        }
+
+        public LogRecords getRecords() {
+            return records;
+        }
+
+        public long[] getSourceOffsets() {
+            return sourceOffsets;
+        }
     }
 }

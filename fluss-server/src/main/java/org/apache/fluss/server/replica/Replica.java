@@ -71,6 +71,7 @@ import org.apache.fluss.server.kv.snapshot.PeriodicSnapshotManager;
 import org.apache.fluss.server.kv.snapshot.RocksIncrementalSnapshot;
 import org.apache.fluss.server.kv.snapshot.SnapshotContext;
 import org.apache.fluss.server.log.EnrichmentMerger;
+import org.apache.fluss.server.log.EnrichmentReadResult;
 import org.apache.fluss.server.log.FetchDataInfo;
 import org.apache.fluss.server.log.FetchIsolation;
 import org.apache.fluss.server.log.FetchParams;
@@ -1726,8 +1727,56 @@ public final class Replica {
                 throw new IOException("Failed to merge enrichment columns for fetch", e);
             }
         }
-        return new LogReadInfo(fetchDataInfo, initialHighWatermark, initialLogEndOffset);
+
+        // E.3b: when this is a follower fetch carrying per-group EWM cursors, ship the enrichment
+        // entries past each follower's cursor up to the leader's local EWM, plus the current CEW
+        // snapshot for the same groups. Equal-slice budget across groups (PHASE_E_REPLICATION
+        // §6.1); a tiny budget still emits at least one entry per group via the segment's
+        // forward-progress invariant.
+        java.util.Map<String, EnrichmentReadResult> enrichmentPayload =
+                java.util.Collections.emptyMap();
+        java.util.Map<String, Long> committedEwms = java.util.Collections.emptyMap();
+        java.util.Map<String, Long> followerCursors = fetchParams.currentFollowerEwmCursors();
+        if (fetchParams.isFromFollower() && !followerCursors.isEmpty()) {
+            int perGroupBudget =
+                    Math.max(1, ENRICHMENT_REPLICATION_MAX_BYTES / followerCursors.size());
+            enrichmentPayload = new java.util.HashMap<>(followerCursors.size());
+            committedEwms = new java.util.HashMap<>(followerCursors.size());
+            for (java.util.Map.Entry<String, Long> entry : followerCursors.entrySet()) {
+                String group = entry.getKey();
+                long fromEwm = entry.getValue();
+                long leaderEwm = logTablet.getEnrichmentWatermark(group);
+                if (leaderEwm <= fromEwm) {
+                    // Follower is already caught up (or group not registered locally); still
+                    // propagate CEW so the follower can advance its own.
+                    enrichmentPayload.put(group, EnrichmentReadResult.EMPTY);
+                } else {
+                    EnrichmentReadResult slice =
+                            logTablet.readEnrichmentForFollower(
+                                    group, fromEwm, leaderEwm, perGroupBudget);
+                    enrichmentPayload.put(group, slice);
+                }
+                long cew = logTablet.getCommittedEnrichmentWatermark(group);
+                if (cew >= 0L) {
+                    committedEwms.put(group, cew);
+                }
+            }
+        }
+        return new LogReadInfo(
+                fetchDataInfo,
+                initialHighWatermark,
+                initialLogEndOffset,
+                enrichmentPayload,
+                committedEwms);
     }
+
+    /**
+     * Total bytes of enrichment payload allowed in a single follower fetch response, across all
+     * groups on the bucket. Each group gets {@code ENRICHMENT_REPLICATION_MAX_BYTES / groupCount}
+     * (with a floor of 1 so even tiny budgets allow forward progress). TODO: turn this into a
+     * {@code replication.fetch.enrichment.max-bytes} ConfigOption.
+     */
+    private static final int ENRICHMENT_REPLICATION_MAX_BYTES = 8 * 1024 * 1024;
 
     /**
      * Compute the effective enrichment-watermark cap for a fetch (Option 02 EWM gate). When a

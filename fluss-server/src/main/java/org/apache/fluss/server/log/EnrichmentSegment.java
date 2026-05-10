@@ -132,34 +132,6 @@ final class EnrichmentSegment implements Closeable {
     }
 
     /**
-     * Slice of an enrichment segment for replication: zero-copy {@link FileLogRecords} view of the
-     * concatenated batches plus the parallel array of source offsets they cover.
-     */
-    static final class RangeResult {
-        static final RangeResult EMPTY = new RangeResult(MemoryLogRecords.EMPTY, new long[0]);
-
-        private final org.apache.fluss.record.LogRecords records;
-        private final long[] sourceOffsets;
-
-        RangeResult(org.apache.fluss.record.LogRecords records, long[] sourceOffsets) {
-            this.records = records;
-            this.sourceOffsets = sourceOffsets;
-        }
-
-        org.apache.fluss.record.LogRecords records() {
-            return records;
-        }
-
-        long[] sourceOffsets() {
-            return sourceOffsets;
-        }
-
-        boolean isEmpty() {
-            return sourceOffsets.length == 0;
-        }
-    }
-
-    /**
      * Return the enrichment entries in the half-open interval {@code [fromInclusive, toExclusive)},
      * subject to {@code maxBytes} on the underlying file slice (always returns at least one entry
      * if the from-bound is in range, to guarantee forward progress under tiny budgets).
@@ -169,20 +141,21 @@ final class EnrichmentSegment implements Closeable {
      * slot in {@link OffsetIndex} for offset {@code N} is just {@code (int) N}, so the lookups here
      * are O(1) array accesses.
      *
-     * @return a {@link RangeResult} carrying the file-backed records slice (zero-copy) and the
-     *     parallel array of source offsets it covers; or {@link RangeResult#EMPTY} if the requested
-     *     range is entirely past {@link #lastEnrichedOffset()} or empty.
+     * @return an {@link EnrichmentReadResult} carrying the file-backed records slice (zero-copy)
+     *     and the parallel array of source offsets it covers; or {@link EnrichmentReadResult#EMPTY}
+     *     if the requested range is entirely past {@link #lastEnrichedOffset()} or empty.
      */
-    RangeResult range(long fromInclusive, long toExclusive, int maxBytes) throws IOException {
+    EnrichmentReadResult range(long fromInclusive, long toExclusive, int maxBytes)
+            throws IOException {
         if (offsetIndex.entries() == 0
                 || fromInclusive < 0L
                 || fromInclusive >= toExclusive
                 || maxBytes <= 0) {
-            return RangeResult.EMPTY;
+            return EnrichmentReadResult.EMPTY;
         }
         long lastEnriched = lastEnrichedOffset();
         if (fromInclusive > lastEnriched) {
-            return RangeResult.EMPTY;
+            return EnrichmentReadResult.EMPTY;
         }
         long clampedTo = Math.min(toExclusive, lastEnriched + 1L);
 
@@ -190,7 +163,7 @@ final class EnrichmentSegment implements Closeable {
         int toSlot = Math.toIntExact(clampedTo);
         int totalEntries = offsetIndex.entries();
         if (fromSlot >= totalEntries) {
-            return RangeResult.EMPTY;
+            return EnrichmentReadResult.EMPTY;
         }
 
         int startPos = offsetIndex.entry(fromSlot).getPosition();
@@ -220,7 +193,7 @@ final class EnrichmentSegment implements Closeable {
         for (int i = 0; i < count; i++) {
             sourceOffsets[i] = fromInclusive + i;
         }
-        return new RangeResult(slice, sourceOffsets);
+        return new EnrichmentReadResult(slice, sourceOffsets);
     }
 
     /**
