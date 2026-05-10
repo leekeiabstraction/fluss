@@ -867,6 +867,15 @@ message PbFetchLogReqForBucket {
   // TODO leader epoch
   required int64 fetch_offset = 3;
   required int32 max_fetch_bytes = 4;
+  // Per-column-group EWM cursor advertised by the follower so the leader knows what
+  // enrichment to ship in the response (E.3a). Empty for clients and for tables without
+  // column groups; pre-Phase-E peers leave it unset and the leader sees an empty list.
+  repeated PbFollowerEwmRequest follower_ewm_requests = 5;
+}
+
+message PbFollowerEwmRequest {
+  required string group_name = 1;
+  required int64 current_ewm = 2;
 }
 
 message PbFetchLogRespForTable {
@@ -886,6 +895,30 @@ message PbFetchLogRespForBucket {
   // filter. When set (>= 0), the records field MUST be empty — the two fields are mutually
   // exclusive. The client should use this offset as the starting offset for the next fetch.
   optional int64 filtered_end_offset = 9;
+  // Enrichment payload replicated to this follower in this fetch response, one entry per
+  // column group whose cursor lagged the leader's local EWM (E.3a). Empty when the request
+  // had no follower_ewm_requests (consumer fetch, or pre-Phase-E follower).
+  repeated PbEnrichmentBatchForGroup enrichment_payload_per_group = 10;
+  // Leader's view of the committed EWM per group on this bucket, propagated to followers
+  // so they can update their LogTablet.committedEnrichmentWatermarks (E.3c). Empty when
+  // the request had no follower_ewm_requests.
+  repeated PbCommittedEnrichmentWatermark committed_ewms = 11;
+}
+
+message PbEnrichmentBatchForGroup {
+  required string group_name = 1;
+  // Concatenated MemoryLogRecords (ARROW format) carrying the enrichment rows for
+  // source_offsets in [follower_ewm, leader_local_ewm). Same on-the-wire shape as
+  // PbProduceLogColumnsReq's records field.
+  required bytes records = 2;
+  // Source offsets parallel to the rows in records. Strictly monotonic, contiguous from the
+  // follower's reported EWM cursor.
+  repeated int64 source_offsets = 3;
+}
+
+message PbCommittedEnrichmentWatermark {
+  required string group_name = 1;
+  required int64 cew = 2;
 }
 
 message PbPutKvReqForBucket {
