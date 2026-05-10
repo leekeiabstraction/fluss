@@ -17,7 +17,10 @@
 
 package org.apache.fluss.lake.paimon.tiering;
 
+import org.apache.fluss.client.table.Table;
 import org.apache.fluss.client.table.getter.PartitionGetter;
+import org.apache.fluss.client.table.writer.AppendColumnsResult;
+import org.apache.fluss.client.table.writer.AppendWriter;
 import org.apache.fluss.config.AutoPartitionTimeUnit;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.lake.paimon.testutils.FlinkPaimonTieringTestBase;
@@ -30,6 +33,7 @@ import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.row.BinaryString;
 import org.apache.fluss.row.Decimal;
+import org.apache.fluss.row.GenericRow;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.row.TimestampLtz;
 import org.apache.fluss.row.TimestampNtz;
@@ -68,6 +72,7 @@ import java.util.Map;
 import java.util.stream.Stream;
 
 import static org.apache.fluss.testutils.DataTestUtils.row;
+import static org.apache.fluss.testutils.common.CommonTestUtils.retry;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /** IT case for tiering tables to paimon. */
@@ -547,6 +552,111 @@ class PaimonTieringITCase extends FlinkPaimonTieringTestBase {
                                         .newScan()
                                         .plan());
         return reader.toCloseableIterator();
+    }
+
+    @Test
+    void testTieringForColumnGroupLogTable() throws Exception {
+        // Phase F.4: tiering a column-group log table to Paimon, end-to-end. This exercises:
+        //   F.2 — TieringSplitReader projects all columns so the on-server merge-on-read fires
+        //         and enrichment values are spliced into the records the tiering reader sees.
+        //   F.3 — listOffsets caps tiering at min(HW, min(CEW)). HW=10 but only 5 offsets are
+        //         enriched, so the first tiering round must stop at offset 5; after enriching
+        //         the rest, the next round catches up to HW=10.
+        TablePath tablePath = TablePath.of(DEFAULT_DB, "columnGroupLogTable");
+        String groupName = "enriched";
+        Schema schema =
+                Schema.newBuilder()
+                        .column("device_id", DataTypes.INT())
+                        .column("payload", DataTypes.STRING())
+                        .column("geo_region", DataTypes.STRING())
+                        .columnGroup(groupName)
+                        .column("risk_score", DataTypes.DOUBLE())
+                        .columnGroup(groupName)
+                        .build();
+        TableDescriptor descriptor =
+                TableDescriptor.builder()
+                        .schema(schema)
+                        .distributedBy(1, "device_id")
+                        .property(ConfigOptions.TABLE_DATALAKE_ENABLED.key(), "true")
+                        .property(ConfigOptions.TABLE_DATALAKE_FRESHNESS, Duration.ofMillis(500))
+                        .build();
+        long tableId = createTable(tablePath, descriptor);
+        TableBucket bucket = new TableBucket(tableId, 0);
+
+        try (Table table = conn.getTable(tablePath)) {
+            AppendWriter writer = table.newAppend().createWriter();
+
+            // Phase A: write 10 base rows with enrichment columns null.
+            for (int i = 0; i < 10; i++) {
+                writer.append(row(i, "p" + i, null, null)).get();
+            }
+            writer.flush();
+
+            // Phase B: enrich offsets 0..4 → leader EWM=5; CEW catches up via follower fetch.
+            for (int i = 0; i < 5; i++) {
+                GenericRow enrichmentRow =
+                        GenericRow.of(BinaryString.fromString("US-WEST-" + i), 0.5 + i * 0.1);
+                AppendColumnsResult result =
+                        writer.appendColumns(groupName, bucket, i, enrichmentRow).get();
+                assertThat(result.getEnrichmentWatermark()).isEqualTo(i + 1L);
+            }
+            retry(
+                    Duration.ofMinutes(1),
+                    () ->
+                            assertThat(
+                                            getLeaderReplica(bucket)
+                                                    .getLogTablet()
+                                                    .getCommittedEnrichmentWatermark(groupName))
+                                    .isEqualTo(5L));
+
+            // Phase C: tiering should stop at the F.3 cap = min(HW=10, CEW=5) = 5.
+            JobClient jobClient = buildTieringJob(execEnv);
+            try {
+                assertReplicaStatus(bucket, 5);
+                checkFlussOffsetsInSnapshot(tablePath, Collections.singletonMap(bucket, 5L));
+                assertPaimonRowsForColumnGroupTable(tablePath, 5);
+
+                // Phase D: enrich offsets 5..9 → CEW=10 → tiering catches up to HW.
+                for (int i = 5; i < 10; i++) {
+                    GenericRow enrichmentRow =
+                            GenericRow.of(BinaryString.fromString("US-WEST-" + i), 0.5 + i * 0.1);
+                    AppendColumnsResult result =
+                            writer.appendColumns(groupName, bucket, i, enrichmentRow).get();
+                    assertThat(result.getEnrichmentWatermark()).isEqualTo(i + 1L);
+                }
+                retry(
+                        Duration.ofMinutes(1),
+                        () ->
+                                assertThat(
+                                                getLeaderReplica(bucket)
+                                                        .getLogTablet()
+                                                        .getCommittedEnrichmentWatermark(groupName))
+                                        .isEqualTo(10L));
+                assertReplicaStatus(bucket, 10);
+                checkFlussOffsetsInSnapshot(tablePath, Collections.singletonMap(bucket, 10L));
+                assertPaimonRowsForColumnGroupTable(tablePath, 10);
+            } finally {
+                jobClient.cancel().get();
+            }
+        }
+    }
+
+    private void assertPaimonRowsForColumnGroupTable(TablePath tablePath, int expectedRowCount)
+            throws Exception {
+        try (CloseableIterator<org.apache.paimon.data.InternalRow> it =
+                getPaimonRowCloseableIterator(tablePath)) {
+            for (int i = 0; i < expectedRowCount; i++) {
+                assertThat(it.hasNext()).isTrue();
+                org.apache.paimon.data.InternalRow paimonRow = it.next();
+                assertThat(paimonRow.getInt(0)).isEqualTo(i);
+                assertThat(paimonRow.getString(1).toString()).isEqualTo("p" + i);
+                assertThat(paimonRow.getString(2).toString()).isEqualTo("US-WEST-" + i);
+                assertThat(paimonRow.getDouble(3)).isEqualTo(0.5 + i * 0.1);
+                int offsetIndex = paimonRow.getFieldCount() - 2;
+                assertThat(paimonRow.getLong(offsetIndex)).isEqualTo((long) i);
+            }
+            assertThat(it.hasNext()).isFalse();
+        }
     }
 
     @Test
