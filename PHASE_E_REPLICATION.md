@@ -238,6 +238,37 @@ E.7  Metrics, observability, schema-evolve dispatch ─┘
 **Critical path:** E.5b → E.2 → E.3a → E.3{b,c,d} → E.4. E.5{a,c,d} can land
 parallel to E.4. E.6 deferred. E.7 anytime after E.3.
 
+### 5.1 Deferred follow-ups (post-replication baseline)
+
+These were intentionally cut from the initial replication baseline to keep
+the headline durability guarantee (`E.4`) shippable. Not blocking; track here
+so they're not lost.
+
+- **E.7 metrics & observability.** Per-(bucket, group) gauges/counters for
+  `enrichment_watermark`, `committed_enrichment_watermark`, replication lag
+  (`leader_ewm − follower_cursor` aggregated per group), and per-fetch
+  `enrichment_payload_bytes`. Wire into `BucketMetricGroup` next to the
+  existing log/HW metrics. Deferred 2026-05-10 — operational visibility
+  only, no correctness impact.
+- **E.7 schema-evolution ITCase.** The decoder dispatch infrastructure
+  landed in commit `63e5a12f` (per-`(group, batchSchemaId)` cache,
+  name-based column lookup). The matching ITCase is deferred until
+  `alterTable` can target a column-group column — today's `addColumn`-only
+  evolution path doesn't change a group's row type, so there's no
+  production scenario that produces mixed-shape enrichment batches in a
+  single segment.
+- **E.5c catch-up after follower gap.** Largely subsumed by base-log
+  truncation/recovery (§4.4, §5.5d) — once the follower's base log resyncs,
+  the next fetch advertises the right cursor and replication resumes.
+  Worth a verification pass to confirm no extra glue is needed.
+- **E.5d same-node recovery clamp.** Should already be handled by
+  `LogTablet.discoverEnrichmentSegments` (the recovery clamp landed in
+  E.5b). Verify that the clamp fires correctly when a fresh leader inherits
+  a stale enrichment tail from a crashed predecessor on the same node.
+- **E.6 ISR coupling.** Deferred per §4.5 — Option A keeps enrichment lag
+  out of the ISR shrink criterion. Revisit if operational data shows
+  enrichment-replication lag becoming a stability concern.
+
 ## 6. Resolved design questions
 
 These were open during initial E.1 drafting; resolved before E.3a starts.
