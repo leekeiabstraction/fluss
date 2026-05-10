@@ -676,6 +676,64 @@ final class LogTabletTest extends LogTestBase {
         }
     }
 
+    @Test
+    void testCommittedEnrichmentWatermarkUnregistered() {
+        // Unregistered group → -1L, mirroring getEnrichmentWatermark.
+        assertThat(logTablet.getCommittedEnrichmentWatermark("nonexistent")).isEqualTo(-1L);
+    }
+
+    @Test
+    void testCommittedEnrichmentWatermarkMonotonic() {
+        String groupName = "enriched_test";
+        logTablet.registerColumnGroupIfAbsent(groupName);
+        // Registered → 0L (registered, nothing committed yet).
+        assertThat(logTablet.getCommittedEnrichmentWatermark(groupName)).isEqualTo(0L);
+
+        logTablet.updateCommittedEnrichmentWatermark(groupName, 5L);
+        assertThat(logTablet.getCommittedEnrichmentWatermark(groupName)).isEqualTo(5L);
+
+        // Lower value never regresses.
+        logTablet.updateCommittedEnrichmentWatermark(groupName, 3L);
+        assertThat(logTablet.getCommittedEnrichmentWatermark(groupName)).isEqualTo(5L);
+
+        // Higher value advances.
+        logTablet.updateCommittedEnrichmentWatermark(groupName, 7L);
+        assertThat(logTablet.getCommittedEnrichmentWatermark(groupName)).isEqualTo(7L);
+
+        // Update on unregistered group is a no-op (computeIfPresent).
+        logTablet.updateCommittedEnrichmentWatermark("ghost", 9L);
+        assertThat(logTablet.getCommittedEnrichmentWatermark("ghost")).isEqualTo(-1L);
+    }
+
+    @Test
+    void testCommittedEnrichmentWatermarkClampsOnTruncate() throws Exception {
+        for (int i = 0; i < 5; i++) {
+            logTablet.appendAsLeader(
+                    genMemoryLogRecordsByObject(
+                            Collections.singletonList(new Object[] {i, "v" + i})));
+        }
+
+        String groupName = "enriched_test";
+        logTablet.registerColumnGroupIfAbsent(groupName);
+        for (int i = 0; i < 5; i++) {
+            logTablet.appendColumnsAsLeader(
+                    groupName, buildSingleRowEnrichment("US-WEST-" + i), new long[] {(long) i});
+        }
+        // Simulate the leader having advanced CEW alongside its local EWM.
+        logTablet.updateCommittedEnrichmentWatermark(groupName, 5L);
+        assertThat(logTablet.getCommittedEnrichmentWatermark(groupName)).isEqualTo(5L);
+
+        // Truncating base log to 3 must clamp both EWM and CEW — CEW <= EWM is invariant.
+        logTablet.truncateTo(3L);
+        assertThat(logTablet.getEnrichmentWatermark(groupName)).isEqualTo(3L);
+        assertThat(logTablet.getCommittedEnrichmentWatermark(groupName)).isEqualTo(3L);
+
+        // truncateFullyAndStartAt resets CEW to 0 alongside EWM.
+        logTablet.truncateFullyAndStartAt(10L);
+        assertThat(logTablet.getEnrichmentWatermark(groupName)).isEqualTo(0L);
+        assertThat(logTablet.getCommittedEnrichmentWatermark(groupName)).isEqualTo(0L);
+    }
+
     private MemoryLogRecords buildSingleRowEnrichment(String value) throws Exception {
         RowType groupRowType =
                 RowType.of(

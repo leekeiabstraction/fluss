@@ -40,6 +40,7 @@ import org.apache.fluss.server.kv.snapshot.TestingCompletedKvSnapshotCommitter;
 import org.apache.fluss.server.log.FetchParams;
 import org.apache.fluss.server.log.LogAppendInfo;
 import org.apache.fluss.server.log.LogReadInfo;
+import org.apache.fluss.server.log.LogTablet;
 import org.apache.fluss.server.testutils.KvTestUtils;
 import org.apache.fluss.server.zk.NOPErrorHandler;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
@@ -768,6 +769,139 @@ final class ReplicaTest extends ReplicaTestBase {
         // update to false
         logReplica.updateIsDataLakeEnabled(false);
         assertThat(logReplica.getLogTablet().isDataLakeEnabled()).isFalse();
+    }
+
+    @Test
+    void testMaybeAdvanceCEWComputesMinOverIsr() throws Exception {
+        Replica replica =
+                makeLogReplica(DATA1_PHYSICAL_TABLE_PATH, new TableBucket(DATA1_TABLE_ID, 1));
+        makeLeaderWithIsr(
+                replica,
+                DATA1_TABLE_PATH,
+                new TableBucket(DATA1_TABLE_ID, 1),
+                Arrays.asList(TABLET_SERVER_ID, 2, 3),
+                Arrays.asList(TABLET_SERVER_ID, 2, 3),
+                INITIAL_LEADER_EPOCH);
+
+        String groupName = "enriched";
+        LogTablet logTablet = replica.getLogTablet();
+        // Drive leader-local EWM to 10 by appending 10 base records, then 10 enrichment entries.
+        for (int i = 0; i < 10; i++) {
+            replica.appendRecordsToLeader(
+                    genMemoryLogRecordsByObject(
+                            Collections.singletonList(new Object[] {i, "v" + i})),
+                    0);
+        }
+        logTablet.registerColumnGroupIfAbsent(groupName);
+        for (int i = 0; i < 10; i++) {
+            logTablet.appendColumnsAsLeader(
+                    groupName, cewBuildSingleRowEnrichment("US-WEST-" + i), new long[] {(long) i});
+        }
+        assertThat(logTablet.getEnrichmentWatermark(groupName)).isEqualTo(10L);
+        // CEW starts at 0 (registered, nothing committed yet).
+        assertThat(logTablet.getCommittedEnrichmentWatermark(groupName)).isEqualTo(0L);
+
+        // Only follower 2 has reported — follower 3 is missing, hold the line.
+        replica.updateFollowerEwm(2, groupName, 7L);
+        assertThat(logTablet.getCommittedEnrichmentWatermark(groupName)).isEqualTo(0L);
+
+        // Follower 3 reports; CEW = min(leader=10, f2=7, f3=5) = 5.
+        replica.updateFollowerEwm(3, groupName, 5L);
+        assertThat(logTablet.getCommittedEnrichmentWatermark(groupName)).isEqualTo(5L);
+
+        // Follower 2 advances to 9 but follower 3 is still the laggard.
+        replica.updateFollowerEwm(2, groupName, 9L);
+        assertThat(logTablet.getCommittedEnrichmentWatermark(groupName)).isEqualTo(5L);
+
+        // Follower 3 catches up — CEW advances.
+        replica.updateFollowerEwm(3, groupName, 8L);
+        assertThat(logTablet.getCommittedEnrichmentWatermark(groupName)).isEqualTo(8L);
+    }
+
+    @Test
+    void testFollowerEwmDroppedOnAssignmentChange() throws Exception {
+        Replica replica =
+                makeLogReplica(DATA1_PHYSICAL_TABLE_PATH, new TableBucket(DATA1_TABLE_ID, 1));
+        makeLeaderWithIsr(
+                replica,
+                DATA1_TABLE_PATH,
+                new TableBucket(DATA1_TABLE_ID, 1),
+                Arrays.asList(TABLET_SERVER_ID, 2, 3),
+                Arrays.asList(TABLET_SERVER_ID, 2, 3),
+                INITIAL_LEADER_EPOCH);
+
+        String groupName = "enriched";
+        LogTablet logTablet = replica.getLogTablet();
+        for (int i = 0; i < 10; i++) {
+            replica.appendRecordsToLeader(
+                    genMemoryLogRecordsByObject(
+                            Collections.singletonList(new Object[] {i, "v" + i})),
+                    0);
+        }
+        logTablet.registerColumnGroupIfAbsent(groupName);
+        for (int i = 0; i < 10; i++) {
+            logTablet.appendColumnsAsLeader(
+                    groupName, cewBuildSingleRowEnrichment("US-WEST-" + i), new long[] {(long) i});
+        }
+        replica.updateFollowerEwm(2, groupName, 7L);
+        replica.updateFollowerEwm(3, groupName, 5L);
+        assertThat(logTablet.getCommittedEnrichmentWatermark(groupName)).isEqualTo(5L);
+
+        // Reassign without follower 3. Follower 3's EWM cursor must be dropped — otherwise CEW
+        // would still be pinned at 5 even though 3 is no longer in the assignment.
+        makeLeaderWithIsr(
+                replica,
+                DATA1_TABLE_PATH,
+                new TableBucket(DATA1_TABLE_ID, 1),
+                Arrays.asList(TABLET_SERVER_ID, 2),
+                Arrays.asList(TABLET_SERVER_ID, 2),
+                INITIAL_LEADER_EPOCH + 1);
+
+        // Now CEW should advance once follower 2 reports a fresh value, with no stale 3.
+        replica.updateFollowerEwm(2, groupName, 9L);
+        assertThat(logTablet.getCommittedEnrichmentWatermark(groupName)).isEqualTo(9L);
+    }
+
+    private void makeLeaderWithIsr(
+            Replica replica,
+            TablePath tablePath,
+            TableBucket tableBucket,
+            List<Integer> replicas,
+            List<Integer> isr,
+            int leaderEpoch)
+            throws Exception {
+        replica.makeLeader(
+                new NotifyLeaderAndIsrData(
+                        PhysicalTablePath.of(tablePath),
+                        tableBucket,
+                        replicas,
+                        new LeaderAndIsr(
+                                TABLET_SERVER_ID,
+                                leaderEpoch,
+                                isr,
+                                INITIAL_COORDINATOR_EPOCH,
+                                leaderEpoch)));
+    }
+
+    private MemoryLogRecords cewBuildSingleRowEnrichment(String value) throws Exception {
+        RowType groupRowType =
+                RowType.of(
+                        new org.apache.fluss.types.DataType[] {
+                            org.apache.fluss.types.DataTypes.STRING()
+                        },
+                        new String[] {"geo"});
+        return DataTestUtils.createBasicMemoryLogRecords(
+                groupRowType,
+                DEFAULT_SCHEMA_ID,
+                0L,
+                System.currentTimeMillis(),
+                CURRENT_LOG_MAGIC_VALUE,
+                NO_WRITER_ID,
+                NO_BATCH_SEQUENCE,
+                Collections.singletonList(org.apache.fluss.record.ChangeType.APPEND_ONLY),
+                Collections.singletonList(new Object[] {value}),
+                org.apache.fluss.metadata.LogFormat.ARROW,
+                org.apache.fluss.compression.ArrowCompressionInfo.NO_COMPRESSION);
     }
 
     private void makeLogReplicaAsLeader(Replica replica) throws Exception {

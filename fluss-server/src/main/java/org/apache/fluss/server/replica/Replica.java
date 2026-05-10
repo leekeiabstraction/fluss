@@ -200,6 +200,17 @@ public final class Replica {
     private final Map<Integer, FollowerReplica> followerReplicasMap =
             MapUtils.newConcurrentHashMap();
 
+    /**
+     * Per-(group, follower) latest acknowledged Enrichment Watermark. Leader-only state — populated
+     * by {@link #updateFollowerEwm} when a follower fetch arrives carrying the follower's EWM
+     * cursors (E.3c/d), drained by {@link #updateAssignmentAndIsr} when a follower leaves the
+     * assignment, and consumed by {@link #maybeAdvanceCEW} to compute the committed EWM.
+     *
+     * <p>Outer key: groupName. Inner key: followerId. Empty on followers.
+     */
+    private final Map<String, Map<Integer, Long>> followerEwmByGroup =
+            MapUtils.newConcurrentHashMap();
+
     private volatile IsrState isrState = new IsrState.CommittedIsrState(Collections.emptyList());
     private volatile int leaderEpoch = LeaderAndIsr.INITIAL_LEADER_EPOCH - 1;
     private volatile int bucketEpoch = LeaderAndIsr.INITIAL_BUCKET_EPOCH;
@@ -1232,6 +1243,57 @@ public final class Replica {
         }
     }
 
+    /**
+     * Record the latest Enrichment Watermark a follower has reported for the given group, then try
+     * to advance the committed EWM. Called from the leader's fetch-handling path (E.3d) when the
+     * follower's request includes per-group EWM cursors. Updates are monotonic.
+     */
+    public void updateFollowerEwm(int followerId, String groupName, long ewm) {
+        followerEwmByGroup
+                .computeIfAbsent(groupName, k -> MapUtils.newConcurrentHashMap())
+                .merge(followerId, ewm, Math::max);
+        maybeAdvanceCEW(groupName);
+    }
+
+    /**
+     * Recompute the committed EWM for one group as {@code min(EWM_g across ISR ∪ {leader})}, and
+     * advance {@link LogTablet#updateCommittedEnrichmentWatermark} if it's higher than the current
+     * value. Symmetrical to {@link #maybeIncrementLeaderHW}: same {@link #isUnderMinIsr()} guard,
+     * same {@link IsrState#maximalIsr()} membership filter, same min reduction across ISR.
+     *
+     * <p>Returns silently without advancing if any ISR follower has not yet reported an EWM for
+     * this group — we cannot prove ISR has the data without that ack, so we hold the line. The
+     * trade-off is that the first CEW advance for any group only fires after every ISR member has
+     * reported at least once.
+     */
+    private void maybeAdvanceCEW(String groupName) {
+        if (isUnderMinIsr()) {
+            return;
+        }
+        long leaderEwm = logTablet.getEnrichmentWatermark(groupName);
+        if (leaderEwm < 0L) {
+            // Group is not registered locally — nothing to advance.
+            return;
+        }
+        long newCew = leaderEwm;
+        Map<Integer, Long> cursors = followerEwmByGroup.get(groupName);
+        for (FollowerReplica remoteFollowerReplica : followerReplicasMap.values()) {
+            int followerId = remoteFollowerReplica.getFollowerId();
+            if (!isrState.maximalIsr().contains(followerId)) {
+                continue;
+            }
+            Long followerEwm = cursors == null ? null : cursors.get(followerId);
+            if (followerEwm == null) {
+                // ISR member hasn't reported yet for this group; can't safely advance.
+                return;
+            }
+            if (followerEwm < newCew) {
+                newCew = followerEwm;
+            }
+        }
+        logTablet.updateCommittedEnrichmentWatermark(groupName, newCew);
+    }
+
     private boolean shouldWaitForReplicaToJoinIsr(
             FollowerReplica.FollowerReplicaState replicaState,
             LogOffsetMetadata leaderLogEndOffset,
@@ -1260,9 +1322,16 @@ public final class Replica {
             }
             for (Integer replica : removedReplicas) {
                 followerReplicasMap.remove(replica);
+                // Drop the removed follower's per-group EWM entries so a stale cursor cannot
+                // hold CEW back. A follower rejoining the assignment will repopulate via the
+                // next fetch cycle.
+                for (Map<Integer, Long> cursors : followerEwmByGroup.values()) {
+                    cursors.remove(replica);
+                }
             }
         } else {
             followerReplicasMap.clear();
+            followerEwmByGroup.clear();
         }
 
         // update isr info.

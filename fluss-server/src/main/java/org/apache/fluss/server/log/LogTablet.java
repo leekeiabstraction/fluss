@@ -137,6 +137,13 @@ public final class LogTablet {
             enrichmentSegments = org.apache.fluss.utils.MapUtils.newConcurrentHashMap();
     private final java.util.concurrent.ConcurrentHashMap<String, Long> enrichmentWatermarks =
             org.apache.fluss.utils.MapUtils.newConcurrentHashMap();
+    // Committed Enrichment Watermark per group: every ISR replica has reported EWM_g >= this
+    // value (computed leader-side as min(EWM_g across ISR)). On followers this is set from
+    // the leader's fetch response; on the leader it's recomputed by Replica.maybeAdvanceCEW
+    // after each follower-fetch state update. The read-side gate (E.4) caps client fetches
+    // at CEW rather than the leader-local EWM, so a clean failover does not lose visibility.
+    private final java.util.concurrent.ConcurrentHashMap<String, Long>
+            committedEnrichmentWatermarks = org.apache.fluss.utils.MapUtils.newConcurrentHashMap();
     private final int enrichmentMaxIndexSize;
 
     private LogTablet(
@@ -297,6 +304,11 @@ public final class LogTablet {
                                             getLogDir(), g, 0L, enrichmentMaxIndexSize);
                             long lastWritten = seg.lastEnrichedOffset();
                             enrichmentWatermarks.put(g, lastWritten + 1L);
+                            // CEW starts at 0 (registered, nothing committed yet). The leader's
+                            // Replica.maybeAdvanceCEW will pull this forward as ISR acks; on
+                            // followers it's overwritten from the leader's fetch response.
+                            // E.5a's onBecomeNewLeader will set CEW := local EWM at election.
+                            committedEnrichmentWatermarks.putIfAbsent(g, 0L);
                             return seg;
                         } catch (IOException e) {
                             throw new FlussRuntimeException(
@@ -360,6 +372,33 @@ public final class LogTablet {
         return new HashMap<>(enrichmentWatermarks);
     }
 
+    /**
+     * Get the committed enrichment watermark for a group, or -1L if not registered. CEW is the
+     * largest source offset such that every replica in ISR has reported EWM >= CEW + 1 (i.e. every
+     * ISR replica has the enrichment durably applied). The read-side gate caps client fetches at
+     * CEW so that data visible to a client survives a clean leader failover. Updated by {@code
+     * Replica.maybeAdvanceCEW} on the leader and by fetch responses on followers.
+     */
+    public long getCommittedEnrichmentWatermark(String groupName) {
+        Long cew = committedEnrichmentWatermarks.get(groupName);
+        return cew != null ? cew : -1L;
+    }
+
+    /** Snapshot of CEW across all registered groups, for tests and metrics. */
+    public Map<String, Long> getAllCommittedEnrichmentWatermarks() {
+        return new HashMap<>(committedEnrichmentWatermarks);
+    }
+
+    /**
+     * Monotonically advance the committed enrichment watermark. No-op for unregistered groups, and
+     * never regresses a previously-set CEW. Intended callers: {@code Replica.maybeAdvanceCEW} on
+     * the leader, and the fetch-response handler on followers (E.3c).
+     */
+    public void updateCommittedEnrichmentWatermark(String groupName, long newCew) {
+        committedEnrichmentWatermarks.computeIfPresent(
+                groupName, (g, current) -> newCew > current ? newCew : current);
+    }
+
     /** Returns the on-disk segment for a column group, or null if unregistered. Used by Phase D. */
     @Nullable
     EnrichmentSegment getEnrichmentSegment(String groupName) {
@@ -380,6 +419,13 @@ public final class LogTablet {
         for (Map.Entry<String, EnrichmentSegment> e : enrichmentSegments.entrySet()) {
             e.getValue().truncateTo(sourceOffsetExclusive);
             enrichmentWatermarks.computeIfPresent(
+                    e.getKey(),
+                    (g, current) ->
+                            current > sourceOffsetExclusive ? sourceOffsetExclusive : current);
+            // CEW must stay <= EWM. The leader will naturally re-derive CEW from ISR EWMs on
+            // the next follower fetch, but clamp explicitly here so a stale CEW does not
+            // briefly exceed local EWM in the window between truncate and the next advance.
+            committedEnrichmentWatermarks.computeIfPresent(
                     e.getKey(),
                     (g, current) ->
                             current > sourceOffsetExclusive ? sourceOffsetExclusive : current);
@@ -541,6 +587,10 @@ public final class LogTablet {
             }
             enrichmentSegments.put(groupName, seg);
             enrichmentWatermarks.put(groupName, seg.lastEnrichedOffset() + 1L);
+            // Seed CEW = 0 on startup; the role-specific source of truth runs after this:
+            // E.5a's onBecomeNewLeader sets CEW := local EWM, and on followers the leader's
+            // fetch response carries the authoritative CEW.
+            committedEnrichmentWatermarks.put(groupName, 0L);
         }
     }
 
