@@ -73,12 +73,14 @@ public final class EnrichmentMerger implements AutoCloseable {
 
     private final long tableId;
     private final int tableSchemaId;
+    private final Schema tableSchema;
     private final RowType tableRowType;
     private final RowType projectedRowType;
     private final int[] projectedFields;
     private final ArrowCompressionInfo compressionInfo;
     private final BufferAllocator allocator;
     private final ArrowWriterPool writerPool;
+    private final SchemaGetter schemaGetter;
 
     /**
      * Per projected position, the lookup info for an enrichment column, or {@code null} if the
@@ -92,8 +94,12 @@ public final class EnrichmentMerger implements AutoCloseable {
     /** Field getters indexed by table column position; used to copy base columns into output. */
     private final FieldGetter[] tableFieldGetters;
 
-    /** Lazy per-group decoder for enrichment Arrow batches. */
-    private final Map<String, GroupDecoder> groupDecoders = new HashMap<>();
+    /**
+     * Lazy decoder cache keyed by {@code (groupName, batchSchemaId)}. Each batch in an enrichment
+     * segment carries its own schemaId in its header; the merger picks the matching decoder so
+     * mixed-schema segments (the result of a schema evolution mid-stream) decode correctly.
+     */
+    private final Map<String, Map<Integer, GroupDecoder>> groupDecoders = new HashMap<>();
 
     /** Synthetic schemaId for the output ArrowWriter pool — keeps base/enrichment writers apart. */
     private final int outputPoolSchemaId;
@@ -107,6 +113,7 @@ public final class EnrichmentMerger implements AutoCloseable {
             SchemaGetter schemaGetter) {
         this.tableId = tableId;
         this.tableSchemaId = tableSchemaId;
+        this.tableSchema = tableSchema;
         this.tableRowType = tableSchema.getRowType();
         this.projectedFields = projectedFields;
         this.projectedRowType = tableRowType.project(projectedFields);
@@ -115,6 +122,7 @@ public final class EnrichmentMerger implements AutoCloseable {
         this.writerPool = new ArrowWriterPool(allocator);
         this.outputPoolSchemaId = tableSchemaId ^ java.util.Arrays.hashCode(projectedFields);
         this.tableFieldGetters = InternalRow.createFieldGetters(tableRowType);
+        this.schemaGetter = schemaGetter;
         this.baseReadContext =
                 LogRecordReadContext.createArrowReadContext(
                         tableRowType, tableSchemaId, schemaGetter);
@@ -243,10 +251,53 @@ public final class EnrichmentMerger implements AutoCloseable {
             // caller decide — Phase B's EWM cap is the trusted gate.
             return null;
         }
-        GroupDecoder decoder =
-                groupDecoders.computeIfAbsent(
-                        ref.groupName, k -> new GroupDecoder(ref.groupRowType, tableSchemaId));
-        return decoder.readColumnAt(seg, pos.getPosition(), ref.colIdxInGroup);
+        AbstractIterator<FileLogInputStream.FileChannelLogRecordBatch> iter =
+                seg.records().batchIterator(pos.getPosition(), seg.records().sizeInBytes());
+        if (!iter.hasNext()) {
+            return null;
+        }
+        FileLogInputStream.FileChannelLogRecordBatch batch = iter.next();
+        if (batch.getRecordCount() != 1) {
+            throw new IllegalStateException(
+                    "Multi-row enrichment batches are not yet supported (Phase D); "
+                            + "batch at position "
+                            + pos.getPosition()
+                            + " has "
+                            + batch.getRecordCount()
+                            + " rows.");
+        }
+        // E.7: dispatch on the batch's schemaId so a segment that spans a schema evolution
+        // decodes correctly. The cache holds a decoder per (group, schemaId) pair.
+        GroupDecoder decoder = getOrBuildDecoder(ref.groupName, batch.schemaId());
+        return decoder.readColumnByName(batch, ref.columnName);
+    }
+
+    private GroupDecoder getOrBuildDecoder(String groupName, int batchSchemaId) {
+        return groupDecoders
+                .computeIfAbsent(groupName, k -> new HashMap<>())
+                .computeIfAbsent(batchSchemaId, sid -> buildDecoder(groupName, sid));
+    }
+
+    private GroupDecoder buildDecoder(String groupName, int batchSchemaId) {
+        Schema schemaForBatch =
+                batchSchemaId == tableSchemaId
+                        ? tableSchema
+                        : schemaGetter.getSchema(batchSchemaId);
+        Map<String, List<Integer>> batchGroups = schemaForBatch.getColumnGroups();
+        List<Integer> batchGroupCols = batchGroups.get(groupName);
+        if (batchGroupCols == null) {
+            // Group existed at fetch time but not in the batch's schema. Should not happen on
+            // the read path because the writer only stamps a schemaId that defines the group.
+            // Fail loudly instead of silently nulling the column.
+            throw new IllegalStateException(
+                    "Enrichment batch schemaId "
+                            + batchSchemaId
+                            + " has no column group '"
+                            + groupName
+                            + "'.");
+        }
+        RowType batchGroupRowType = buildGroupRowType(schemaForBatch, batchGroupCols);
+        return new GroupDecoder(batchGroupRowType, batchSchemaId);
     }
 
     private EnrichmentColumnRef[] buildEnrichmentRefs(Schema schema, int[] projection) {
@@ -254,13 +305,13 @@ public final class EnrichmentMerger implements AutoCloseable {
         EnrichmentColumnRef[] refs = new EnrichmentColumnRef[projection.length];
         for (int p = 0; p < projection.length; p++) {
             int colIdx = projection[p];
-            String groupName = schema.getColumns().get(colIdx).getColumnGroup().orElse(null);
+            Schema.Column col = schema.getColumns().get(colIdx);
+            String groupName = col.getColumnGroup().orElse(null);
             if (groupName == null) {
                 continue;
             }
             List<Integer> groupCols = groups.get(groupName);
-            int idxInGroup = groupCols.indexOf(colIdx);
-            if (idxInGroup < 0) {
+            if (groupCols.indexOf(colIdx) < 0) {
                 throw new IllegalStateException(
                         "Column "
                                 + colIdx
@@ -269,9 +320,7 @@ public final class EnrichmentMerger implements AutoCloseable {
                                 + "' but is not in the group's column list "
                                 + groupCols);
             }
-            refs[p] =
-                    new EnrichmentColumnRef(
-                            groupName, idxInGroup, buildGroupRowType(schema, groupCols));
+            refs[p] = new EnrichmentColumnRef(groupName, col.getName());
         }
         return refs;
     }
@@ -302,8 +351,10 @@ public final class EnrichmentMerger implements AutoCloseable {
 
     @Override
     public void close() {
-        for (GroupDecoder d : groupDecoders.values()) {
-            d.close();
+        for (Map<Integer, GroupDecoder> perSchema : groupDecoders.values()) {
+            for (GroupDecoder d : perSchema.values()) {
+                d.close();
+            }
         }
         groupDecoders.clear();
         baseReadContext.close();
@@ -318,54 +369,51 @@ public final class EnrichmentMerger implements AutoCloseable {
     /** Per-projection-position lookup for an enrichment column. */
     private static final class EnrichmentColumnRef {
         final String groupName;
-        final int colIdxInGroup;
-        final RowType groupRowType;
+        final String columnName;
 
-        EnrichmentColumnRef(String groupName, int colIdxInGroup, RowType groupRowType) {
+        EnrichmentColumnRef(String groupName, String columnName) {
             this.groupName = groupName;
-            this.colIdxInGroup = colIdxInGroup;
-            this.groupRowType = groupRowType;
+            this.columnName = columnName;
         }
     }
 
-    /** Decodes Arrow batches stored in an {@link EnrichmentSegment}. */
+    /**
+     * Decodes Arrow batches stored in an {@link EnrichmentSegment} for one specific {@code (group,
+     * batchSchemaId)} pair. Built lazily by {@link #getOrBuildDecoder} when a batch with that
+     * schemaId is first encountered. Looks up columns by name so that an evolution which reorders
+     * columns within the group is handled transparently.
+     */
     private static final class GroupDecoder implements AutoCloseable {
 
+        private final RowType groupRowType;
         private final FieldGetter[] groupFieldGetters;
         private final LogRecordReadContext readContext;
 
         GroupDecoder(RowType groupRowType, int batchSchemaId) {
+            this.groupRowType = groupRowType;
             this.groupFieldGetters = InternalRow.createFieldGetters(groupRowType);
-            // The enrichment writer stamps the table's schemaId into each batch (see
-            // AppendWriterImpl.appendColumns), so the read context's targetSchemaId must match
-            // for isSameRowType to short-circuit and use our provided groupRowType.
+            // schemaGetter is null because the decoder is constructed for one specific schemaId
+            // and only ever applied to batches with that schemaId — the dispatch in the parent
+            // already routes to the right decoder.
             this.readContext =
                     LogRecordReadContext.createArrowReadContext(groupRowType, batchSchemaId, null);
         }
 
-        Object readColumnAt(EnrichmentSegment seg, int filePosition, int colIdxInGroup)
+        Object readColumnByName(
+                FileLogInputStream.FileChannelLogRecordBatch batch, String columnName)
                 throws IOException {
-            AbstractIterator<FileLogInputStream.FileChannelLogRecordBatch> iter =
-                    seg.records().batchIterator(filePosition, seg.records().sizeInBytes());
-            if (!iter.hasNext()) {
+            int idx = groupRowType.getFieldNames().indexOf(columnName);
+            if (idx < 0) {
+                // Column was added in a later schema; this batch's schema doesn't have it.
+                // Surfacing null is the right behaviour — the row predates the column.
                 return null;
-            }
-            FileLogInputStream.FileChannelLogRecordBatch batch = iter.next();
-            if (batch.getRecordCount() != 1) {
-                throw new IllegalStateException(
-                        "Multi-row enrichment batches are not yet supported (Phase D); "
-                                + "batch at position "
-                                + filePosition
-                                + " has "
-                                + batch.getRecordCount()
-                                + " rows.");
             }
             try (CloseableIterator<LogRecord> rowIter = batch.records(readContext)) {
                 if (!rowIter.hasNext()) {
                     return null;
                 }
                 LogRecord rec = rowIter.next();
-                return groupFieldGetters[colIdxInGroup].getFieldOrNull(rec.getRow());
+                return groupFieldGetters[idx].getFieldOrNull(rec.getRow());
             }
         }
 
