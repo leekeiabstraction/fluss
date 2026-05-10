@@ -90,6 +90,15 @@ public class SchemaUpdate {
             builder.withComment(comment);
         }
 
+        // Phase H: tag the column to a column group when requested. Reuses
+        // Schema.Builder#columnGroup, which assigns the most recently added column. If the named
+        // group doesn't exist on the table yet, it is created with this column as its sole member
+        // (PHASE_H §3.1, §4.2).
+        String columnGroup = addColumn.getColumnGroup();
+        if (columnGroup != null) {
+            builder.columnGroup(columnGroup);
+        }
+
         return this;
     }
 

@@ -653,6 +653,9 @@ public class ClientRpcMessageUtils {
         if (addColumn.getComment() != null) {
             pbAddColumn.setComment(addColumn.getComment());
         }
+        if (addColumn.getColumnGroup() != null) {
+            pbAddColumn.setColumnGroup(addColumn.getColumnGroup());
+        }
 
         return pbAddColumn;
     }

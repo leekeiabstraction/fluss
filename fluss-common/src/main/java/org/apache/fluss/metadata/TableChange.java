@@ -42,7 +42,21 @@ public interface TableChange {
             DataType dataType,
             @Nullable String comment,
             ColumnPosition position) {
-        return new AddColumn(columnName, dataType, comment, position);
+        return new AddColumn(columnName, dataType, comment, position, null);
+    }
+
+    /**
+     * A table change to add a column and tag it to a column group (creates the group if absent).
+     * Phase H — see {@code PHASE_H_SCHEMA_EVOLUTION.md} §3.1. {@code columnGroup == null} is
+     * equivalent to the four-arg overload (column joins the default base group).
+     */
+    static AddColumn addColumn(
+            String columnName,
+            DataType dataType,
+            @Nullable String comment,
+            ColumnPosition position,
+            @Nullable String columnGroup) {
+        return new AddColumn(columnName, dataType, comment, position, columnGroup);
     }
 
     /**
@@ -232,13 +246,19 @@ public interface TableChange {
         private final @Nullable String comment;
 
         private final ColumnPosition position;
+        private final @Nullable String columnGroup;
 
         private AddColumn(
-                String name, DataType dataType, @Nullable String comment, ColumnPosition position) {
+                String name,
+                DataType dataType,
+                @Nullable String comment,
+                ColumnPosition position,
+                @Nullable String columnGroup) {
             this.name = name;
             this.dataType = dataType;
             this.comment = comment;
             this.position = position;
+            this.columnGroup = columnGroup;
         }
 
         public String getName() {
@@ -258,6 +278,11 @@ public interface TableChange {
             return position;
         }
 
+        @Nullable
+        public String getColumnGroup() {
+            return columnGroup;
+        }
+
         @Override
         public String toString() {
             return "AddColumn{"
@@ -271,6 +296,9 @@ public interface TableChange {
                     + '\''
                     + ", position="
                     + position
+                    + ", columnGroup='"
+                    + columnGroup
+                    + '\''
                     + '}';
         }
     }

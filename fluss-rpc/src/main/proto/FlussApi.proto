@@ -1192,6 +1192,9 @@ message PbAddColumn {
   required bytes data_type_json = 2;
   optional string comment = 3;
   required int32 column_position_type = 4; // LAST=0,FIRST=1,AFTER=3
+  // Phase H: tag the new column to a column group (creates the group if absent).
+  // Absent => column joins the default base group.
+  optional string column_group = 5;
 }
 
 message PbDropColumn {

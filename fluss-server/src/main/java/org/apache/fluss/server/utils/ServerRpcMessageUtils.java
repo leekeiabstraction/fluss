@@ -362,7 +362,10 @@ public class ServerRpcMessageUtils {
                                                 pbAddColumn.getDataTypeJson(),
                                                 DataTypeJsonSerde.INSTANCE),
                                         pbAddColumn.hasComment() ? pbAddColumn.getComment() : null,
-                                        toColumnPosition(pbAddColumn.getColumnPositionType())))
+                                        toColumnPosition(pbAddColumn.getColumnPositionType()),
+                                        pbAddColumn.hasColumnGroup()
+                                                ? pbAddColumn.getColumnGroup()
+                                                : null))
                 .collect(Collectors.toList());
     }
 
