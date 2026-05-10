@@ -1104,6 +1104,12 @@ public final class Replica {
                                         + tableBucket,
                                 e);
                     }
+                    // E.4: try to advance CEW after a leader-side write. With ISR = {leader} the
+                    // min reduction yields CEW = leader EWM, so single-replica tables see new
+                    // enrichment immediately. With more replicas in ISR, CEW only moves once the
+                    // follower fetch round-trip completes — that's the durability gate's whole
+                    // point.
+                    maybeAdvanceCEW(columnGroup);
                     return logTablet.getEnrichmentWatermark(columnGroup);
                 });
     }
@@ -1791,12 +1797,16 @@ public final class Replica {
     private static final int ENRICHMENT_REPLICATION_MAX_BYTES = 8 * 1024 * 1024;
 
     /**
-     * Compute the effective enrichment-watermark cap for a fetch (Option 02 EWM gate). When a
-     * client's projection includes a column belonging to an enrichment column group, the visible
-     * offset range is bounded at {@code min(EWM_g for those groups)}. Returns {@link
-     * Long#MAX_VALUE} when the gate does not apply: follower fetches, tables with no enrichment
-     * groups, no projection set (full-row reads keep the existing HWM-only path for backward
-     * compatibility), and explicit projections that touch only base columns.
+     * Compute the effective enrichment cap for a fetch (Option 02 enrichment gate). When a client's
+     * projection includes a column belonging to an enrichment column group, the visible offset
+     * range is bounded at {@code min(CEW_g for those groups)} — the committed enrichment watermark,
+     * which is the largest source offset every ISR replica has the enrichment for. This is what
+     * guarantees client-visible enrichment survives a clean leader failover (E.4): capping at local
+     * EWM was sufficient on a single leader but a new leader could lose the uncommitted tail.
+     *
+     * <p>Returns {@link Long#MAX_VALUE} when the gate does not apply: follower fetches, tables with
+     * no enrichment groups, no projection set (full-row reads keep the existing HWM-only path for
+     * backward compatibility), and explicit projections that touch only base columns.
      */
     private long computeEffectiveEnrichmentCap(FetchParams fetchParams, LogTablet logTablet) {
         if (fetchParams.isFromFollower()) {
@@ -1820,9 +1830,9 @@ public final class Replica {
         for (java.util.Map.Entry<String, java.util.List<Integer>> e : groups.entrySet()) {
             for (int colIdx : e.getValue()) {
                 if (projectedSet.contains(colIdx)) {
-                    long ewm = logTablet.getEnrichmentWatermark(e.getKey());
-                    if (ewm < cap) {
-                        cap = ewm;
+                    long cew = logTablet.getCommittedEnrichmentWatermark(e.getKey());
+                    if (cew < cap) {
+                        cap = cew;
                     }
                     break;
                 }
