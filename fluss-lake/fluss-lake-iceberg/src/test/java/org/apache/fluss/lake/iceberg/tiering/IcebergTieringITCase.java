@@ -17,6 +17,9 @@
 
 package org.apache.fluss.lake.iceberg.tiering;
 
+import org.apache.fluss.client.table.Table;
+import org.apache.fluss.client.table.writer.AppendColumnsResult;
+import org.apache.fluss.client.table.writer.AppendWriter;
 import org.apache.fluss.config.AutoPartitionTimeUnit;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.lake.iceberg.testutils.FlinkIcebergTieringTestBase;
@@ -26,6 +29,7 @@ import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.row.BinaryString;
 import org.apache.fluss.row.Decimal;
+import org.apache.fluss.row.GenericRow;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.row.TimestampLtz;
 import org.apache.fluss.row.TimestampNtz;
@@ -55,6 +59,7 @@ import java.util.List;
 import java.util.Map;
 
 import static org.apache.fluss.testutils.DataTestUtils.row;
+import static org.apache.fluss.testutils.common.CommonTestUtils.retry;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /** The ITCase for tiering into iceberg. */
@@ -390,5 +395,101 @@ class IcebergTieringITCase extends FlinkIcebergTieringTestBase {
         }
 
         checkFlussOffsetsInSnapshot(partitionedTablePath, expectedOffsets);
+    }
+
+    @Test
+    void testTieringForColumnGroupLogTable() throws Exception {
+        // Phase F.4: tiering a column-group log table to Iceberg, end-to-end.
+        // Mirrors PaimonTieringITCase#testTieringForColumnGroupLogTable. Verifies F.2 + F.3
+        // against the Iceberg LakeWriter plugin (catches plugin-side schema-mapping or
+        // encoding bugs the Paimon test cannot surface).
+        TablePath tablePath = TablePath.of(DEFAULT_DB, "columnGroupLogTable");
+        String groupName = "enriched";
+        Schema schema =
+                Schema.newBuilder()
+                        .column("device_id", DataTypes.INT())
+                        .column("payload", DataTypes.STRING())
+                        .column("geo_region", DataTypes.STRING())
+                        .columnGroup(groupName)
+                        .column("risk_score", DataTypes.DOUBLE())
+                        .columnGroup(groupName)
+                        .build();
+        TableDescriptor descriptor =
+                TableDescriptor.builder()
+                        .schema(schema)
+                        .distributedBy(1, "device_id")
+                        .property(ConfigOptions.TABLE_DATALAKE_ENABLED.key(), "true")
+                        .property(ConfigOptions.TABLE_DATALAKE_FRESHNESS, Duration.ofMillis(500))
+                        .build();
+        long tableId = createTable(tablePath, descriptor);
+        TableBucket bucket = new TableBucket(tableId, 0);
+
+        try (Table table = conn.getTable(tablePath)) {
+            AppendWriter writer = table.newAppend().createWriter();
+
+            for (int i = 0; i < 10; i++) {
+                writer.append(row(i, "p" + i, null, null)).get();
+            }
+            writer.flush();
+
+            for (int i = 0; i < 5; i++) {
+                GenericRow enrichmentRow =
+                        GenericRow.of(BinaryString.fromString("US-WEST-" + i), 0.5 + i * 0.1);
+                AppendColumnsResult result =
+                        writer.appendColumns(groupName, bucket, i, enrichmentRow).get();
+                assertThat(result.getEnrichmentWatermark()).isEqualTo(i + 1L);
+            }
+            retry(
+                    Duration.ofMinutes(1),
+                    () ->
+                            assertThat(
+                                            getLeaderReplica(bucket)
+                                                    .getLogTablet()
+                                                    .getCommittedEnrichmentWatermark(groupName))
+                                    .isEqualTo(5L));
+
+            JobClient jobClient = buildTieringJob(execEnv);
+            try {
+                assertReplicaStatus(bucket, 5);
+                checkFlussOffsetsInSnapshot(tablePath, Collections.singletonMap(bucket, 5L));
+                assertIcebergRowsForColumnGroupTable(tablePath, 5);
+
+                for (int i = 5; i < 10; i++) {
+                    GenericRow enrichmentRow =
+                            GenericRow.of(BinaryString.fromString("US-WEST-" + i), 0.5 + i * 0.1);
+                    AppendColumnsResult result =
+                            writer.appendColumns(groupName, bucket, i, enrichmentRow).get();
+                    assertThat(result.getEnrichmentWatermark()).isEqualTo(i + 1L);
+                }
+                retry(
+                        Duration.ofMinutes(1),
+                        () ->
+                                assertThat(
+                                                getLeaderReplica(bucket)
+                                                        .getLogTablet()
+                                                        .getCommittedEnrichmentWatermark(groupName))
+                                        .isEqualTo(10L));
+                assertReplicaStatus(bucket, 10);
+                checkFlussOffsetsInSnapshot(tablePath, Collections.singletonMap(bucket, 10L));
+                assertIcebergRowsForColumnGroupTable(tablePath, 10);
+            } finally {
+                jobClient.cancel().get();
+            }
+        }
+    }
+
+    private void assertIcebergRowsForColumnGroupTable(TablePath tablePath, int expectedRowCount)
+            throws Exception {
+        List<org.apache.iceberg.data.Record> records = getIcebergRecords(tablePath);
+        assertThat(records).hasSize(expectedRowCount);
+        for (int i = 0; i < expectedRowCount; i++) {
+            org.apache.iceberg.data.Record record = records.get(i);
+            assertThat(record.get(0)).isEqualTo(i);
+            assertThat(record.get(1)).isEqualTo("p" + i);
+            assertThat(record.get(2)).isEqualTo("US-WEST-" + i);
+            assertThat(record.get(3)).isEqualTo(0.5 + i * 0.1);
+            // system columns: __bucket (idx 4), __offset (idx 5)
+            assertThat(record.get(5)).isEqualTo((long) i);
+        }
     }
 }

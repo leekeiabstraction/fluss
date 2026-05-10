@@ -17,21 +17,31 @@
 
 package org.apache.fluss.lake.lance.tiering;
 
+import org.apache.fluss.client.table.Table;
+import org.apache.fluss.client.table.writer.AppendColumnsResult;
+import org.apache.fluss.client.table.writer.AppendWriter;
+import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.lake.lance.LanceConfig;
 import org.apache.fluss.lake.lance.testutils.FlinkLanceTieringTestBase;
+import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.row.BinaryString;
 import org.apache.fluss.row.GenericArray;
 import org.apache.fluss.row.GenericRow;
 import org.apache.fluss.server.zk.data.lake.LakeTable;
+import org.apache.fluss.types.DataTypes;
 
 import com.lancedb.lance.Dataset;
 import com.lancedb.lance.ReadOptions;
 import com.lancedb.lance.Transaction;
 import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.Float8Vector;
+import org.apache.arrow.vector.IntVector;
+import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.flink.core.execution.JobClient;
@@ -39,12 +49,14 @@ import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Map;
 
 import static org.apache.fluss.lake.committer.LakeCommitter.FLUSS_LAKE_SNAP_BUCKET_OFFSET_PROPERTY;
 import static org.apache.fluss.testutils.DataTestUtils.row;
+import static org.apache.fluss.testutils.common.CommonTestUtils.retry;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /** IT case for tiering tables to lance. */
@@ -413,5 +425,119 @@ class LanceTieringITCase extends FlinkLanceTieringTestBase {
                     "3\tOrder3\t[{\"item_name\":\"Apple\",\"quantity\":5},{\"item_name\":\"Banana\",\"quantity\":3},{\"item_name\":\"Orange\",\"quantity\":7}]\n");
         }
         return sb.toString();
+    }
+
+    @Test
+    void testTieringForColumnGroupLogTable() throws Exception {
+        // Phase F.4: tiering a column-group log table to Lance, end-to-end.
+        // Mirrors PaimonTieringITCase / IcebergTieringITCase. Verifies F.2 + F.3 against the
+        // Lance LakeWriter plugin. Uses direct Arrow VectorSchemaRoot inspection (instead of
+        // Lance's TSV-comparison helper) to avoid floating-point precision issues with
+        // risk_score = 0.5 + i * 0.1.
+        TablePath tablePath = TablePath.of(DEFAULT_DB, "columnGroupLogTable");
+        String groupName = "enriched";
+        Schema schema =
+                Schema.newBuilder()
+                        .column("device_id", DataTypes.INT())
+                        .column("payload", DataTypes.STRING())
+                        .column("geo_region", DataTypes.STRING())
+                        .columnGroup(groupName)
+                        .column("risk_score", DataTypes.DOUBLE())
+                        .columnGroup(groupName)
+                        .build();
+        TableDescriptor descriptor =
+                TableDescriptor.builder()
+                        .schema(schema)
+                        .distributedBy(1, "device_id")
+                        .property(ConfigOptions.TABLE_DATALAKE_ENABLED.key(), "true")
+                        .property(ConfigOptions.TABLE_DATALAKE_FRESHNESS, Duration.ofMillis(500))
+                        .build();
+        long tableId = createTable(tablePath, descriptor);
+        TableBucket bucket = new TableBucket(tableId, 0);
+
+        try (Table table = conn.getTable(tablePath)) {
+            AppendWriter writer = table.newAppend().createWriter();
+            for (int i = 0; i < 10; i++) {
+                writer.append(row(i, "p" + i, null, null)).get();
+            }
+            writer.flush();
+
+            for (int i = 0; i < 5; i++) {
+                GenericRow enrichmentRow =
+                        GenericRow.of(BinaryString.fromString("US-WEST-" + i), 0.5 + i * 0.1);
+                AppendColumnsResult result =
+                        writer.appendColumns(groupName, bucket, i, enrichmentRow).get();
+                assertThat(result.getEnrichmentWatermark()).isEqualTo(i + 1L);
+            }
+            retry(
+                    Duration.ofMinutes(1),
+                    () ->
+                            assertThat(
+                                            getLeaderReplica(bucket)
+                                                    .getLogTablet()
+                                                    .getCommittedEnrichmentWatermark(groupName))
+                                    .isEqualTo(5L));
+
+            JobClient jobClient = buildTieringJob(execEnv);
+            try {
+                assertReplicaStatus(bucket, 5);
+                LanceConfig config =
+                        LanceConfig.from(
+                                lanceConf.toMap(),
+                                Collections.emptyMap(),
+                                tablePath.getDatabaseName(),
+                                tablePath.getTableName());
+                assertLanceRowsForColumnGroupTable(config, 5);
+
+                for (int i = 5; i < 10; i++) {
+                    GenericRow enrichmentRow =
+                            GenericRow.of(BinaryString.fromString("US-WEST-" + i), 0.5 + i * 0.1);
+                    AppendColumnsResult result =
+                            writer.appendColumns(groupName, bucket, i, enrichmentRow).get();
+                    assertThat(result.getEnrichmentWatermark()).isEqualTo(i + 1L);
+                }
+                retry(
+                        Duration.ofMinutes(1),
+                        () ->
+                                assertThat(
+                                                getLeaderReplica(bucket)
+                                                        .getLogTablet()
+                                                        .getCommittedEnrichmentWatermark(groupName))
+                                        .isEqualTo(10L));
+                assertReplicaStatus(bucket, 10);
+                assertLanceRowsForColumnGroupTable(config, 10);
+            } finally {
+                jobClient.cancel().get();
+            }
+        }
+    }
+
+    private void assertLanceRowsForColumnGroupTable(LanceConfig config, int expectedRowCount)
+            throws Exception {
+        try (Dataset dataset =
+                Dataset.open(
+                        allocator,
+                        config.getDatasetUri(),
+                        LanceConfig.genReadOptionFromConfig(config))) {
+            ArrowReader reader = dataset.newScan().scanBatches();
+            VectorSchemaRoot root = reader.getVectorSchemaRoot();
+            int seen = 0;
+            while (reader.loadNextBatch()) {
+                IntVector deviceId = (IntVector) root.getVector("device_id");
+                VarCharVector payload = (VarCharVector) root.getVector("payload");
+                VarCharVector geoRegion = (VarCharVector) root.getVector("geo_region");
+                Float8Vector riskScore = (Float8Vector) root.getVector("risk_score");
+                int rowsInBatch = root.getRowCount();
+                for (int row = 0; row < rowsInBatch; row++) {
+                    int i = seen + row;
+                    assertThat(deviceId.get(row)).isEqualTo(i);
+                    assertThat(new String(payload.get(row))).isEqualTo("p" + i);
+                    assertThat(new String(geoRegion.get(row))).isEqualTo("US-WEST-" + i);
+                    assertThat(riskScore.get(row)).isEqualTo(0.5 + i * 0.1);
+                }
+                seen += rowsInBatch;
+            }
+            assertThat(seen).isEqualTo(expectedRowCount);
+        }
     }
 }
