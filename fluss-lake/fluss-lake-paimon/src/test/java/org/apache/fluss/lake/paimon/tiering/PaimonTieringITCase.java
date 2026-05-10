@@ -19,6 +19,9 @@ package org.apache.fluss.lake.paimon.tiering;
 
 import org.apache.fluss.client.table.Table;
 import org.apache.fluss.client.table.getter.PartitionGetter;
+import org.apache.fluss.client.table.scanner.ScanRecord;
+import org.apache.fluss.client.table.scanner.log.LogScanner;
+import org.apache.fluss.client.table.scanner.log.ScanRecords;
 import org.apache.fluss.client.table.writer.AppendColumnsResult;
 import org.apache.fluss.client.table.writer.AppendWriter;
 import org.apache.fluss.config.AutoPartitionTimeUnit;
@@ -657,6 +660,119 @@ class PaimonTieringITCase extends FlinkPaimonTieringTestBase {
             }
             assertThat(it.hasNext()).isFalse();
         }
+    }
+
+    @Test
+    void testTieringReadAlignmentForColumnGroupTable() throws Exception {
+        // Phase F.5: lake reads of a column-group table return exactly the same rows as a
+        // Fluss-client read with full projection at the same wall-clock moment. Setup:
+        //   - 10 base rows, 5 enriched (CEW=5, HW=10).
+        //   - Tiering commits offsets [0, 5) to Paimon (F.3 cap).
+        // Read alignment claim:
+        //   - Paimon read: 5 fully-materialized rows.
+        //   - Fluss LogScanner with projection [0,1,2,3]: 5 rows (gated at CEW=5, F.4 read-side
+        //     gate from Phase E.4) with the same merged values.
+        //   - Both must contain the same content for the same 4 user columns.
+        TablePath tablePath = TablePath.of(DEFAULT_DB, "columnGroupReadAlignTable");
+        String groupName = "enriched";
+        Schema schema =
+                Schema.newBuilder()
+                        .column("device_id", DataTypes.INT())
+                        .column("payload", DataTypes.STRING())
+                        .column("geo_region", DataTypes.STRING())
+                        .columnGroup(groupName)
+                        .column("risk_score", DataTypes.DOUBLE())
+                        .columnGroup(groupName)
+                        .build();
+        TableDescriptor descriptor =
+                TableDescriptor.builder()
+                        .schema(schema)
+                        .distributedBy(1, "device_id")
+                        .property(ConfigOptions.TABLE_DATALAKE_ENABLED.key(), "true")
+                        .property(ConfigOptions.TABLE_DATALAKE_FRESHNESS, Duration.ofMillis(500))
+                        .build();
+        long tableId = createTable(tablePath, descriptor);
+        TableBucket bucket = new TableBucket(tableId, 0);
+
+        try (Table table = conn.getTable(tablePath)) {
+            AppendWriter writer = table.newAppend().createWriter();
+            for (int i = 0; i < 10; i++) {
+                writer.append(row(i, "p" + i, null, null)).get();
+            }
+            writer.flush();
+            for (int i = 0; i < 5; i++) {
+                GenericRow er =
+                        GenericRow.of(BinaryString.fromString("US-WEST-" + i), 0.5 + i * 0.1);
+                writer.appendColumns(groupName, bucket, i, er).get();
+            }
+            retry(
+                    Duration.ofMinutes(1),
+                    () ->
+                            assertThat(
+                                            getLeaderReplica(bucket)
+                                                    .getLogTablet()
+                                                    .getCommittedEnrichmentWatermark(groupName))
+                                    .isEqualTo(5L));
+
+            JobClient jobClient = buildTieringJob(execEnv);
+            try {
+                assertReplicaStatus(bucket, 5);
+
+                List<List<Object>> lakeRows = readPaimonUserCols(tablePath);
+                List<List<Object>> flussRows = readFlussUserColsWithFullProjection(table, bucket);
+
+                assertThat(lakeRows).hasSize(5);
+                assertThat(flussRows).hasSize(5);
+                assertThat(flussRows).isEqualTo(lakeRows);
+            } finally {
+                jobClient.cancel().get();
+            }
+        }
+    }
+
+    private List<List<Object>> readPaimonUserCols(TablePath tablePath) throws Exception {
+        List<List<Object>> rows = new ArrayList<>();
+        try (CloseableIterator<org.apache.paimon.data.InternalRow> it =
+                getPaimonRowCloseableIterator(tablePath)) {
+            while (it.hasNext()) {
+                org.apache.paimon.data.InternalRow r = it.next();
+                List<Object> userCols = new ArrayList<>(4);
+                userCols.add(r.getInt(0));
+                userCols.add(r.getString(1).toString());
+                userCols.add(r.getString(2).toString());
+                userCols.add(r.getDouble(3));
+                rows.add(userCols);
+            }
+        }
+        return rows;
+    }
+
+    private List<List<Object>> readFlussUserColsWithFullProjection(Table table, TableBucket bucket)
+            throws Exception {
+        List<List<Object>> rows = new ArrayList<>();
+        try (LogScanner scanner =
+                table.newScan().project(new int[] {0, 1, 2, 3}).createLogScanner()) {
+            scanner.subscribe(bucket.getBucket(), 0L);
+            // CEW gate caps reads at 5; poll until quiescent (no new records for ~500ms after
+            // expected count is reached).
+            long deadline = System.currentTimeMillis() + 10_000L;
+            while (System.currentTimeMillis() < deadline) {
+                ScanRecords scanRecords = scanner.poll(Duration.ofSeconds(1));
+                for (ScanRecord r : scanRecords) {
+                    InternalRow row = r.getRow();
+                    List<Object> userCols = new ArrayList<>(4);
+                    userCols.add(row.getInt(0));
+                    userCols.add(row.getString(1).toString());
+                    userCols.add(row.getString(2).toString());
+                    userCols.add(row.getDouble(3));
+                    rows.add(userCols);
+                }
+                if (rows.size() >= 5 && scanner.poll(Duration.ofMillis(500)).isEmpty()) {
+                    break;
+                }
+            }
+        }
+        return rows;
     }
 
     @Test
