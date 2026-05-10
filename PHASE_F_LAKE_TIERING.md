@@ -1,6 +1,7 @@
 # Phase F — Lake tiering for enrichment columns
 
-**Status:** ADR — F.1 (this doc).
+**Status:** F.1 → F.6 implemented and verified end-to-end against
+Paimon, Iceberg, and Lance. F.6 is this doc; see §5 for landed commits.
 **Authors:** option02-lateMaterialized branch.
 **Depends on:** Phase E (durable enrichment replication; CEW-bound read gate).
 
@@ -140,17 +141,17 @@ plain log rows to them.
 ## 5. Phasing
 
 ```
-F.1  Design ADR (this doc)              ─┐
-F.2  TieringSplitReader: detect column   │
+F.1  Design ADR (this doc)              ─┐  ✓ 9711826b, 58f866bd, c7eb94fe
+F.2  TieringSplitReader: detect column   │  ✓ fbc8df7a
      groups, project all columns         │
 F.3  Split generator: cap stoppingOffset │  Critical path
-     at CEW for column-group tables      │
-F.4  ITCase per lake format (Paimon →   ─┘
+     at CEW for column-group tables      │  ✓ 78ea5797
+F.4  ITCase per lake format (Paimon →   ─┘  ✓ 827f7383 (Paimon), 5f1d9aef (Iceberg+Lance)
      Iceberg → Lance)
-F.5  Snapshot reads — verify lake reads
+F.5  Snapshot reads — verify lake reads      ✓ b23893a8
      align with Fluss-client reads at
      same wall-clock time
-F.6  Documentation: lake column-group
+F.6  Documentation: lake column-group         ← this update
      visibility semantics
 ```
 
@@ -190,6 +191,40 @@ The CEW lookup can either:
 **Tentative resolution:** server-side. Listing offsets already returns
 HW; adding a sibling field "tier-safe end offset" keeps the round-trip
 count flat and means client code stays minimal.
+
+**Implemented:** server-side. `PbListOffsetsRespForBucket` gained an
+optional `tier_safe_end_offset` field; server emits it for column-group
+tables on `LATEST_OFFSET` queries (`ReplicaManager.computeTierSafeEndOffset`);
+the client (`FlussAdmin.sendListOffsetsRequest`) caps the returned offset
+when the field is present.
+
+### 5.2 Cross-module install gotcha (build-time)
+
+`TieringSplitReader` lives in `fluss-flink-common`, but the per-Flink-version
+modules — `fluss-flink-1.18` / `fluss-flink-1.19` / `fluss-flink-1.20` /
+`fluss-flink-2.2` — bundle a *shaded copy* of it. Lake-format ITCases (e.g.
+`fluss-lake-paimon`) depend on one of those per-version jars in test scope,
+not on `fluss-flink-common` directly.
+
+Consequence: after editing `TieringSplitReader`, running `./mvnw install -pl
+fluss-flink/fluss-flink-common -am` is **not** sufficient — surefire for
+the lake ITCases will still load the stale shaded copy. You must also
+install the per-version module the test depends on:
+
+```
+./mvnw install -DskipTests -pl fluss-flink/fluss-flink-common,fluss-flink/fluss-flink-1.20
+```
+
+Symptom when this is missed: server-side merge-on-read works in unit tests
+but the F.4 lake ITCase shows enrichment columns as null in the lake,
+because the stale `TieringSplitReader` never sets the projection that
+triggers the merger. To verify which jar contains the live class:
+
+```
+unzip -p ~/.m2/repository/org/apache/fluss/fluss-flink-1.20/.../fluss-flink-1.20-*.jar \
+  org/apache/fluss/flink/tiering/source/TieringSplitReader.class \
+  | javap -v - | grep <some-recently-added-string>
+```
 
 ## 6. Open questions
 
@@ -270,14 +305,88 @@ commitment.
 
 - **F.2 unit:** TieringSplitReader correctly switches to full-column
   projection for column-group tables and stays no-projection otherwise.
+  *Implemented inline in F.4 ITCases — `computeProjectionForTiering(...)`
+  is exercised on every column-group ITCase run.*
 - **F.3 unit:** the tiering offset tracking advance is bounded by CEW.
-- **F.4 ITCases:** one per lake format. Pattern:
-  1. Create column-group table, enable tiering.
-  2. Write 10 base + 10 enrichment rows on leader.
-  3. Wait for ISR ack (E.3c machinery) → CEW = 10.
-  4. Wait for tiering job → lake snapshot has 10 rows with full column set.
-  5. Read from lake via lake-native reader → assert row contents
-     match Fluss-client reads.
-- **F.5 ITCase:** time-aligned consistency check. Same data, two readers
-  (Fluss client at HW, lake reader at lake snapshot). Difference is
-  bounded by `HW - CEW + tiering_lag`.
+  *Covered by `assertReplicaStatus(bucket, 5)` in each F.4 ITCase, with
+  HW = 10 — proves the cap held.*
+- **F.4 ITCases:** one per lake format. Implemented as
+  `testTieringForColumnGroupLogTable` in:
+  - `PaimonTieringITCase` (commit `827f7383`)
+  - `IcebergTieringITCase` (commit `5f1d9aef`)
+  - `LanceTieringITCase` (commit `5f1d9aef`)
+
+  The implemented pattern advances CEW partway (write 10 base, enrich
+  5 → CEW=5) so each test simultaneously verifies F.2 (merger fires,
+  rows are fully materialized) and F.3 (lake stops at CEW=5 even with
+  HW=10), then enriches the rest and confirms catch-up to HW=10. Each
+  format uses its native reader: Paimon's `getPaimonRowCloseableIterator`,
+  Iceberg's `Record` API, Lance's Arrow `VectorSchemaRoot` (TSV
+  comparison was infeasible because of FP precision in `0.5 + i*0.1`).
+
+- **F.5 ITCase:** `testTieringReadAlignmentForColumnGroupTable` in
+  `PaimonTieringITCase` (commit `b23893a8`). Reads the same column-group
+  table both ways at the same wall-clock moment — once via Paimon, once
+  via Fluss `LogScanner` with full projection — and asserts row-equality
+  on the 4 user columns. Catches inconsistencies between the lake-side
+  and live-Fluss read paths that neither F.4 nor `ColumnGroupEWMITCase`
+  surfaces alone.
+
+## 9. Lake column-group visibility semantics
+
+This section is the user-facing contract for what a lake reader sees
+when querying a column-group log table tiered by Fluss. It is normative
+for downstream tools (Spark / Trino / lake-native readers).
+
+### 9.1 What is in the lake
+
+For a **column-group log table** (one or more column groups declared on
+the schema):
+
+- The lake contains exactly the rows in offset range
+  `[lake_log_start_offset, lake_log_end_offset)` where
+  `lake_log_end_offset = min(HW, min(CEW_g)) ≤ HW`
+  evaluated at lake-commit time.
+- Every row in that range has all enrichment columns fully populated —
+  there are no rows with `geo_region = NULL` for offsets where Fluss
+  knows a value. If a column is null in the lake for an offset, the
+  enrichment for that offset was never written to Fluss.
+
+For a **plain log table** (no column groups): the lake contains
+`[lake_log_start_offset, lake_log_end_offset)` with
+`lake_log_end_offset ≤ HW`. Behavior is byte-identical to pre-Phase F.
+
+### 9.2 Lag relative to live Fluss
+
+A column-group lake table is structurally less timely than the live
+Fluss table by `HW - CEW + tiering_lag`:
+
+- `HW - CEW`: base records exist in Fluss past the latest enrichment
+  watermark, but cannot be tiered until enrichment catches up.
+- `tiering_lag`: the difference between when CEW advances and when the
+  next tiering snapshot commits, governed by
+  `TABLE_DATALAKE_FRESHNESS` (default 1s).
+
+A query against the lake at wall-clock time T returns the same set of
+rows that a Fluss `LogScanner` with full projection would return at
+some `T' ≤ T`. There is **no scenario** in which the lake leads Fluss.
+
+### 9.3 Operational implications
+
+- **Sparse enrichment is sparse in the lake.** If the application keeps
+  base writes hot but only enriches periodically, the lake will lag
+  proportionally. Tiering will catch up on each enrichment burst.
+- **Ingestion stalls don't corrupt the lake.** If a follower lags and
+  CEW stops advancing, tiering stops. No partial / null rows leak into
+  the lake. Recovery resumes tiering automatically.
+- **Lake schema is the full Fluss schema.** Every base column and every
+  column-group column appears in the lake-side schema with its
+  declared Fluss type, plus the standard system columns
+  (`__bucket`, `__offset`, and on Paimon `__timestamp`).
+
+### 9.4 What is *not* covered by these semantics
+
+- Schema evolution on a column group (deferred — see §6.3).
+- Per-group lake opt-out (deferred — see §6.5). Today, every group's
+  columns appear in the lake.
+- Primary-key / KV tables — Phase F is log-tables-only.
