@@ -96,6 +96,15 @@ public class SchemaUpdate {
         // (PHASE_H §3.1, §4.2).
         String columnGroup = addColumn.getColumnGroup();
         if (columnGroup != null) {
+            // Reject malformed group names early (PHASE_H §6.1). null means "default group" and
+            // is the long-standing addColumn behaviour; an empty string is never a valid group
+            // identifier and would silently land as a literal "" group otherwise.
+            if (columnGroup.isEmpty()) {
+                throw new InvalidAlterTableException(
+                        "Column group name must not be empty (got empty string for column "
+                                + addColumn.getName()
+                                + ").");
+            }
             builder.columnGroup(columnGroup);
         }
 

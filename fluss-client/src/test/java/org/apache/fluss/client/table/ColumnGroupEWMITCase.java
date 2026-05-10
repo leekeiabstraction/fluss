@@ -506,6 +506,40 @@ public class ColumnGroupEWMITCase extends ClientToServerITCaseBase {
         }
     }
 
+    @Test
+    void testAppendColumnsRejectsWrongArity() throws Exception {
+        // Phase H.5: writes that don't match the current group's row type must fail loudly,
+        // not be silently coerced into a half-shaped enrichment segment record.
+        long tableId = createTable(TABLE_PATH, TABLE_DESCRIPTOR, false);
+        FLUSS_CLUSTER_EXTENSION.waitUntilTableReady(tableId);
+        TableBucket bucket = new TableBucket(tableId, 0);
+
+        try (Table table = conn.getTable(TABLE_PATH)) {
+            AppendWriter writer = table.newAppend().createWriter();
+            // Establish offset 0 so the source-offset isn't the failure trigger.
+            writer.append(row("device-0", "10.0.0.0", "payload-0", 0L, null, null)).get();
+
+            // The "enriched" group has two columns (geo_region, risk_score). Try passing a
+            // one-field row and assert a clear arity-mismatch error. AppendWriterImpl validates
+            // synchronously before constructing the future, so the IllegalArgumentException
+            // propagates without ExecutionException wrapping.
+            GenericRow oneField = GenericRow.of(BinaryString.fromString("US-WEST-0"));
+            assertThatThrownBy(() -> writer.appendColumns("enriched", bucket, 0L, oneField))
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining("1 fields")
+                    .hasMessageContaining("enriched")
+                    .hasMessageContaining("2 columns");
+
+            // A three-field row should fail symmetrically.
+            GenericRow threeFields = GenericRow.of(BinaryString.fromString("US-WEST-0"), 0.5, 99);
+            assertThatThrownBy(() -> writer.appendColumns("enriched", bucket, 0L, threeFields))
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining("3 fields")
+                    .hasMessageContaining("enriched")
+                    .hasMessageContaining("2 columns");
+        }
+    }
+
     /** Find the leader LogTablet for a given table bucket across all tablet servers. */
     private LogTablet getLeaderLogTablet(TableBucket tableBucket) {
         for (TabletServer ts : FLUSS_CLUSTER_EXTENSION.getTabletServers()) {

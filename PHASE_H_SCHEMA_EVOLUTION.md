@@ -1,6 +1,6 @@
 # Phase H — Schema evolution for column groups
 
-**Status:** H.1 → H.4 landed and verified. H.5 not started.
+**Status:** H.1 → H.5 landed and verified.
 **Authors:** option02-lateMaterialized branch.
 **Depends on:** Phase B (column-group schema), Phase E (per-(group, batchSchemaId) decoder dispatch — commit `63e5a12f`).
 
@@ -162,7 +162,7 @@ H.3  Wire format: PbAddColumn.column_group
      + client/server util plumbing                   ✓ 87d24f85
 H.4  Schema-evolution ITCase                         ✓ green
      (drives v1 → v2 dispatch end-to-end)               (after the §5.2 fix landed)
-H.5  Negative tests                                  not started
+H.5  Negative tests                                  ✓ landed
 ```
 
 H.2 and H.3 are coupled (the proto change has to land with the Java

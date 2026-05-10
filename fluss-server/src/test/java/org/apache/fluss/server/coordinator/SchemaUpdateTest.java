@@ -17,6 +17,7 @@
 
 package org.apache.fluss.server.coordinator;
 
+import org.apache.fluss.exception.InvalidAlterTableException;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableChange;
 import org.apache.fluss.types.DataTypes;
@@ -28,6 +29,7 @@ import java.util.List;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Unit tests for {@link SchemaUpdate}. */
 class SchemaUpdateTest {
@@ -108,6 +110,28 @@ class SchemaUpdateTest {
         Map<String, List<Integer>> groups = updated.getColumnGroups();
         assertThat(groups).containsOnlyKeys("enriched");
         assertThat(groups.get("enriched")).containsExactly(2);
+    }
+
+    @Test
+    void rejectsEmptyColumnGroupName() {
+        Schema initial =
+                Schema.newBuilder()
+                        .column("device_id", DataTypes.INT())
+                        .column("payload", DataTypes.STRING())
+                        .build();
+        assertThatThrownBy(
+                        () ->
+                                SchemaUpdate.applySchemaChanges(
+                                        initial,
+                                        Collections.singletonList(
+                                                TableChange.addColumn(
+                                                        "bad",
+                                                        DataTypes.STRING(),
+                                                        null,
+                                                        TableChange.ColumnPosition.last(),
+                                                        ""))))
+                .isInstanceOf(InvalidAlterTableException.class)
+                .hasMessageContaining("Column group name must not be empty");
     }
 
     @Test
