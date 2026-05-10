@@ -1,6 +1,6 @@
 # Phase I — Flink connector for column-group tables
 
-**Status:** ADR — I.1 (this doc).
+**Status:** I.1, I.2, I.3 landed. I.4 and I.5 outstanding.
 **Authors:** option02-lateMaterialized branch.
 **Depends on:** Phase E (CEW-bound read gate), Phase F (lake tiering),
 Phase H (schema evolution).
@@ -176,17 +176,46 @@ incidentally by their copies of the shared source.
 ## 5. Phasing
 
 ```
-I.1  ADR (this doc)                                  ← landing now
-I.2  ITCase: Flink SQL read of column-group table    (next)
-     ─ asserts projected read produces merged rows up to CEW
-     ─ asserts base-only projection returns rows up to HW
-I.3  Whatever fixes I.2 surfaces                     (may be empty)
-I.4  Schema-evolution ITCase under a running query   (after I.2)
+I.1  ADR (this doc)                                  ✓ cbb339da
+I.2  ITCase: Flink SQL read of column-group table    ✓ landed alongside I.3
+     ─ explicit projection of enrichment col is gated at CEW with merged values
+     ─ base-only projection is gated at HW
+     ─ SELECT * also gated at CEW (after the I.3 fix)
+I.3  FlinkSourceSplitReader: force full projection   ✓ landed alongside I.2
+     when none was applied and the table has column
+     groups. Required for SELECT * to see merged
+     enrichment values; see §5.2 below.
+I.4  Schema-evolution ITCase under a running query   not started
      ─ alter mid-query; assert no crash / corruption
-I.5  Documentation                                    (after I.2 + I.4)
+I.5  Documentation                                    not started
      ─ section in this doc describing user-facing contract
      ─ code example for Java-API enrichment write pattern
 ```
+
+### 5.2 What I.2 surfaced and I.3 fixed
+
+I.2 ran with three assertions: base-only projection (gated at HW),
+explicit enrichment projection (gated at CEW with merged values), and
+`SELECT *` (expected gated at CEW per §3.3). The first two passed on
+first run. The third returned the first 5 rows with **null enrichment
+columns** — the merger never fired.
+
+Cause: Flink's planner doesn't push a projection when nothing is
+pruned. `SELECT *` references every column, so the planner sends the
+source no projection. `Replica.readRecords` then takes the
+"no-projection" path (`enrichmentTouched = false`), returns raw
+base-log records, and Flink decodes them with null enrichment columns.
+
+Fix in `FlinkSourceSplitReader#forceFullProjectionForColumnGroups`:
+when `projectedFields == null` and the table has at least one column
+group, synthesize an identity projection `[0..n-1]`. The server then
+takes the merge-on-read path and applies the CEW gate. Mirrors
+Phase F.2's `TieringSplitReader.computeProjectionForTiering`. Plain
+log tables are unaffected.
+
+Side note: when the test asserted on the SELECT * output, Flink's
+`Row#toString` formats `0.5 + 3 * 0.1` as `"0.8"`, not Java's
+`"0.7999999999999999"`. The test expected `"0.8"`.
 
 Optimistic path: I.2 passes first run → I.3 empty → I.4 either passes
 or finds a minor schema-cache wrinkle → I.5 pure docs.

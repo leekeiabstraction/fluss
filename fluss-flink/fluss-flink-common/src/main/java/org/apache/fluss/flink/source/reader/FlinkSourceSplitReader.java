@@ -136,10 +136,17 @@ public class FlinkSourceSplitReader implements SplitReader<RecordAndPos, SourceS
         this.projectedFields = projectedFields;
 
         this.flinkSourceReaderMetrics = flinkSourceReaderMetrics;
-        sanityCheck(table.getTableInfo().getRowType(), projectedFields);
+        // Phase I.3: column-group tables always need the server-side merger to fire so the
+        // Flink reader sees merged enrichment values up to CEW. The merger trigger is
+        // EnrichmentMerger.projectionTouchesEnrichment(...) — it only fires when a projection
+        // is set. When Flink's planner doesn't push one (e.g. SELECT *, where nothing is pruned),
+        // synthesize an identity projection covering every column so the server takes the
+        // merge-on-read path. For tables with no column groups this is a no-op (null kept).
+        int[] effectiveProjectedFields = forceFullProjectionForColumnGroups(projectedFields);
+        sanityCheck(table.getTableInfo().getRowType(), effectiveProjectedFields);
         this.logScanner =
                 table.newScan()
-                        .project(projectedFields)
+                        .project(effectiveProjectedFields)
                         .filter(logRecordBatchFilter)
                         .createLogScanner();
         this.stoppingOffsets = new HashMap<>();
@@ -574,6 +581,32 @@ public class FlinkSourceSplitReader implements SplitReader<RecordAndPos, SourceS
         table.close();
         connection.close();
         flinkMetricRegistry.close();
+    }
+
+    /**
+     * Phase I.3: if {@code projectedFields} is null and the table has at least one column group,
+     * synthesize an identity projection over every column. Mirrors {@code
+     * TieringSplitReader.computeProjectionForTiering} from Phase F.2 — both readers need the
+     * server-side merger to fire on column-group tables, which happens iff a projection is set.
+     *
+     * <p>This converts a "no-projection" read from a column-group table (e.g. {@code SELECT *}
+     * where Flink prunes nothing) into "projection over every column", which trips the merger and
+     * applies the CEW gate. Plain log tables are unaffected — null is returned unchanged.
+     */
+    @Nullable
+    private int[] forceFullProjectionForColumnGroups(@Nullable int[] projectedFields) {
+        if (projectedFields != null) {
+            return projectedFields;
+        }
+        if (table.getTableInfo().getSchema().getColumnGroups().isEmpty()) {
+            return null;
+        }
+        int colCount = table.getTableInfo().getSchema().getColumns().size();
+        int[] all = new int[colCount];
+        for (int i = 0; i < colCount; i++) {
+            all[i] = i;
+        }
+        return all;
     }
 
     private void sanityCheck(RowType flussTableRowType, @Nullable int[] projectedFields) {

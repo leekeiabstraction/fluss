@@ -21,11 +21,16 @@ import org.apache.fluss.client.Connection;
 import org.apache.fluss.client.ConnectionFactory;
 import org.apache.fluss.client.admin.Admin;
 import org.apache.fluss.client.table.Table;
+import org.apache.fluss.client.table.writer.AppendColumnsResult;
+import org.apache.fluss.client.table.writer.AppendWriter;
 import org.apache.fluss.client.table.writer.UpsertWriter;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.exception.InvalidConfigException;
+import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.row.BinaryString;
 import org.apache.fluss.row.GenericRow;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.server.testutils.FlussClusterExtension;
@@ -207,6 +212,106 @@ abstract class FlinkTableSourceITCase extends AbstractTestBase {
 
         List<String> expected = Arrays.asList("+I[1, v1]", "+I[2, v2]", "+I[3, v3]");
         assertQueryResultExactOrder(tEnv, "select * from non_pk_table_test", expected);
+    }
+
+    @Test
+    void testColumnGroupTableSqlRead() throws Exception {
+        // Phase I.2: verify Flink SQL reads of a column-group table mirror direct Java-client
+        // semantics — projection touching enrichment columns is gated at CEW; base-only
+        // projection is gated at HW (PHASE_I §3.3).
+        //
+        // Setup mirrors PaimonTieringITCase#testTieringForColumnGroupLogTable: 10 base rows,
+        // enrichment on offsets 0..4, so HW=10 and CEW=5.
+        TablePath tablePath = TablePath.of(DEFAULT_DB, "cg_sql_read");
+        String groupName = "enriched";
+        // Use Java API to create the column-group table — Flink DDL has no column-group syntax
+        // (PHASE_I §4.3). Column groups are server-side metadata; the Flink catalog reads
+        // tableInfo.getRowType() and exposes the columns as regular Table columns.
+        org.apache.fluss.metadata.Schema flussSchema =
+                org.apache.fluss.metadata.Schema.newBuilder()
+                        .column("device_id", org.apache.fluss.types.DataTypes.INT())
+                        .column("payload", org.apache.fluss.types.DataTypes.STRING())
+                        .column("geo_region", org.apache.fluss.types.DataTypes.STRING())
+                        .columnGroup(groupName)
+                        .column("risk_score", org.apache.fluss.types.DataTypes.DOUBLE())
+                        .columnGroup(groupName)
+                        .build();
+        TableDescriptor descriptor =
+                TableDescriptor.builder().schema(flussSchema).distributedBy(1, "device_id").build();
+        admin.createTable(tablePath, descriptor, false).get();
+        long tableId = admin.getTableInfo(tablePath).get().getTableId();
+        FLUSS_CLUSTER_EXTENSION.waitUntilTableReady(tableId);
+        TableBucket bucket = new TableBucket(tableId, 0);
+
+        try (Table table = conn.getTable(tablePath)) {
+            AppendWriter writer = table.newAppend().createWriter();
+            for (int i = 0; i < 10; i++) {
+                writer.append(row(i, "p" + i, null, null)).get();
+            }
+            writer.flush();
+            for (int i = 0; i < 5; i++) {
+                GenericRow enrichmentRow =
+                        GenericRow.of(BinaryString.fromString("US-WEST-" + i), 0.5 + i * 0.1);
+                AppendColumnsResult result =
+                        writer.appendColumns(groupName, bucket, i, enrichmentRow).get();
+                assertThat(result.getEnrichmentWatermark()).isEqualTo(i + 1L);
+            }
+        }
+        // Wait for CEW to catch up across ISR so projecting reads see all 5 enriched rows.
+        retry(
+                java.time.Duration.ofMinutes(1),
+                () ->
+                        assertThat(
+                                        FLUSS_CLUSTER_EXTENSION
+                                                .waitAndGetLeaderReplica(bucket)
+                                                .getLogTablet()
+                                                .getCommittedEnrichmentWatermark(groupName))
+                                .isEqualTo(5L));
+
+        // Base-only projection: gated at HW = 10. All 10 rows are visible; enrichment columns
+        // are not in the projection so the server merger never fires.
+        List<String> baseOnlyExpected =
+                Arrays.asList(
+                        "+I[0, p0]",
+                        "+I[1, p1]",
+                        "+I[2, p2]",
+                        "+I[3, p3]",
+                        "+I[4, p4]",
+                        "+I[5, p5]",
+                        "+I[6, p6]",
+                        "+I[7, p7]",
+                        "+I[8, p8]",
+                        "+I[9, p9]");
+        assertQueryResultExactOrder(
+                tEnv, "select device_id, payload from cg_sql_read", baseOnlyExpected);
+
+        // Projection touching enrichment: gated at CEW = 5. Only 5 rows visible, with the
+        // enrichment values merged in.
+        List<String> enrichedProjectionExpected =
+                Arrays.asList(
+                        "+I[0, US-WEST-0]",
+                        "+I[1, US-WEST-1]",
+                        "+I[2, US-WEST-2]",
+                        "+I[3, US-WEST-3]",
+                        "+I[4, US-WEST-4]");
+        assertQueryResultExactOrder(
+                tEnv, "select device_id, geo_region from cg_sql_read", enrichedProjectionExpected);
+
+        // SELECT * implicitly projects every column including enrichment ones. Flink's planner
+        // doesn't push a projection when nothing is pruned, so for column-group tables
+        // FlinkSourceSplitReader#forceFullProjectionForColumnGroups synthesizes an identity
+        // projection — without that the server would return raw base-log rows with null
+        // enrichment columns. Note: Flink's Row#toString rounds doubles to the shortest
+        // representation, so 0.5 + 3*0.1 prints "0.8" here even though Java's
+        // Double.toString yields "0.7999999999999999".
+        List<String> selectStarExpected =
+                Arrays.asList(
+                        "+I[0, p0, US-WEST-0, 0.5]",
+                        "+I[1, p1, US-WEST-1, 0.6]",
+                        "+I[2, p2, US-WEST-2, 0.7]",
+                        "+I[3, p3, US-WEST-3, 0.8]",
+                        "+I[4, p4, US-WEST-4, 0.9]");
+        assertQueryResultExactOrder(tEnv, "select * from cg_sql_read", selectStarExpected);
     }
 
     @ParameterizedTest
