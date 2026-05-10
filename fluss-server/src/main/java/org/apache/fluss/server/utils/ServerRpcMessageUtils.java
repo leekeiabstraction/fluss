@@ -1504,6 +1504,9 @@ public class ServerRpcMessageUtils {
                 respForBucket.setError(result.getErrorCode(), result.getErrorMessage());
             } else {
                 respForBucket.setOffset(result.getOffset());
+                if (result.getTierSafeEndOffset() >= 0L) {
+                    respForBucket.setTierSafeEndOffset(result.getTierSafeEndOffset());
+                }
             }
             respForBucketList.add(respForBucket);
         }

@@ -865,7 +865,18 @@ public class FlussAdmin implements Admin {
                         .get(resp.getBucketId())
                         .completeExceptionally(ApiError.fromErrorMessage(resp).exception());
             } else {
-                bucketToOffsetMap.get(resp.getBucketId()).complete(resp.getOffset());
+                // Phase F.3: when the server populates tier_safe_end_offset (column-group log
+                // tables, latest-offset query), cap the returned offset at that bound. The
+                // tier-safe bound = min(HW, min(CEW across groups)) — the largest offset a
+                // client could actually read with a projection touching enrichment, which is
+                // also the right stopping offset for tiering. For non-column-group tables and
+                // for offset types other than LATEST_OFFSET the field is absent and we return
+                // the raw offset unchanged.
+                long offset = resp.getOffset();
+                if (resp.hasTierSafeEndOffset()) {
+                    offset = Math.min(offset, resp.getTierSafeEndOffset());
+                }
+                bucketToOffsetMap.get(resp.getBucketId()).complete(offset);
             }
         }
     }

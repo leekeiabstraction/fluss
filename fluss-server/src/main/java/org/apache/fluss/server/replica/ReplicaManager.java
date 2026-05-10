@@ -903,15 +903,48 @@ public class ReplicaManager implements ServerReconfigurable {
         for (TableBucket tb : tableBuckets) {
             try {
                 Replica replica = getReplicaOrException(tb);
-                result.add(
-                        new ListOffsetsResultForBucket(
-                                tb, replica.getOffset(remoteLogManager, listOffsetsParam)));
+                long offset = replica.getOffset(remoteLogManager, listOffsetsParam);
+                long tierSafeEndOffset =
+                        computeTierSafeEndOffset(replica, listOffsetsParam, offset);
+                result.add(new ListOffsetsResultForBucket(tb, offset, tierSafeEndOffset));
             } catch (Exception e) {
                 LOG.error("Error processing list offsets operation on replica {}", tb, e);
                 result.add(new ListOffsetsResultForBucket(tb, ApiError.fromThrowable(e)));
             }
         }
         responseCallBack.accept(result);
+    }
+
+    /**
+     * Compute the tier-safe upper bound for a column-group log table (Phase F.3): min(HW, min(CEW
+     * across all groups)). Returns {@code -1L} when the cap does not apply — table has no column
+     * groups, or the offset type is not LATEST_OFFSET (the only path the tiering generator uses to
+     * drive splits today). Other offset types fall through unchanged because they describe
+     * positions a tiering job never asks about.
+     */
+    private static long computeTierSafeEndOffset(
+            Replica replica, ListOffsetsParam param, long highWatermark) {
+        if (param.getOffsetType() != ListOffsetsParam.LATEST_OFFSET_TYPE) {
+            return -1L;
+        }
+        java.util.Map<String, java.util.List<Integer>> groups =
+                replica.getTableInfo().getSchema().getColumnGroups();
+        if (groups.isEmpty()) {
+            return -1L;
+        }
+        long minCew = Long.MAX_VALUE;
+        for (String group : groups.keySet()) {
+            long cew = replica.getLogTablet().getCommittedEnrichmentWatermark(group);
+            if (cew < 0L) {
+                // Group registered in the schema but not on disk yet — CEW is effectively 0
+                // (nothing committed). Tiering shouldn't pass any rows for this group.
+                cew = 0L;
+            }
+            if (cew < minCew) {
+                minCew = cew;
+            }
+        }
+        return Math.min(highWatermark, minCew);
     }
 
     public void stopReplicas(

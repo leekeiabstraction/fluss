@@ -1017,6 +1017,13 @@ message PbListOffsetsRespForBucket {
   optional int32 error_code = 2;
   optional string error_message = 3;
   optional int64 offset = 4;
+  // Tier-safe upper bound for tiering jobs reading column-group tables (Phase F.3). When set,
+  // equals min(HW, min(CEW_g across all groups on this bucket)). For tables with no column
+  // groups this field is omitted and the consumer falls back to `offset` (= HW). The field
+  // exists so that TieringSplitGenerator can stop a split where the read-side gate stops
+  // returning records — without it, tiering would spin past CEW waiting for records the
+  // server is intentionally not serving.
+  optional int64 tier_safe_end_offset = 5;
 }
 
 message PbNotifyLeaderAndIsrReqForBucket {
