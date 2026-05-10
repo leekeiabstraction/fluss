@@ -257,14 +257,21 @@ so they're not lost.
   evolution path doesn't change a group's row type, so there's no
   production scenario that produces mixed-shape enrichment batches in a
   single segment.
-- **E.5c catch-up after follower gap.** Largely subsumed by base-log
-  truncation/recovery (§4.4, §5.5d) — once the follower's base log resyncs,
-  the next fetch advertises the right cursor and replication resumes.
-  Worth a verification pass to confirm no extra glue is needed.
-- **E.5d same-node recovery clamp.** Should already be handled by
-  `LogTablet.discoverEnrichmentSegments` (the recovery clamp landed in
-  E.5b). Verify that the clamp fires correctly when a fresh leader inherits
-  a stale enrichment tail from a crashed predecessor on the same node.
+- **E.5c catch-up after follower gap. Done — verified 2026-05-10.**
+  Subsumed by the truncation hooks in `LogTablet.{truncateTo,
+  truncateFullyAndStartAt}` (both call `truncateEnrichmentSegmentsTo`,
+  which clamps EWM/CEW) plus the E.3c fetcher loop. When a far-behind
+  follower has its base log truncated by
+  `ReplicaFetcherThread.fetchOffsetAndTruncate`, enrichment is dropped
+  with it; the next fetch advertises the right cursor and replication
+  resumes. `FollowerEnrichmentReplicationITCase` exercises a two-round
+  ongoing catch-up — same loop drives both rounds.
+- **E.5d same-node recovery clamp. Done — verified 2026-05-10.** Code
+  is `LogTablet.discoverEnrichmentSegments`'s clamp from E.5b; test is
+  `LogTabletTest.testRecoveryClampsEnrichmentAheadOfBaseLog`. A fresh
+  leader inheriting a stale enrichment tail from a crashed predecessor
+  on the same node has its EWM clamped to localLogEnd at startup, and
+  the dangling enrichment is truncated.
 - **E.6 ISR coupling.** Deferred per §4.5 — Option A keeps enrichment lag
   out of the ISR shrink criterion. Revisit if operational data shows
   enrichment-replication lag becoming a stability concern.

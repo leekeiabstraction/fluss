@@ -174,6 +174,31 @@ class FollowerEnrichmentReplicationITCase {
                                     .isEqualTo(5L));
             assertThat(leaderLog.getCommittedEnrichmentWatermark(groupName)).isEqualTo(5L);
 
+            // E.5c: ongoing catch-up. Append a second round of base + enrichment and verify
+            // the follower picks up the new tail without manual intervention. Same fetcher loop
+            // as the first round — the cursor advances from 5 to 10, and the leader serves
+            // [5, 10) in response.
+            for (int i = 5; i < 10; i++) {
+                leaderReplica.appendRecordsToLeader(
+                        genMemoryLogRecordsByObject(
+                                BASE_ROW_TYPE,
+                                DEFAULT_SCHEMA_ID,
+                                CURRENT_LOG_MAGIC_VALUE,
+                                Collections.singletonList(new Object[] {i, "payload-" + i})),
+                        0);
+                leaderLog.appendColumnsAsLeader(
+                        groupName, buildSingleRowEnrichment("US-WEST-" + i), new long[] {(long) i});
+            }
+            assertThat(leaderLog.getEnrichmentWatermark(groupName)).isEqualTo(10L);
+            retry(
+                    Duration.ofMinutes(1),
+                    () -> assertThat(followerLog.getEnrichmentWatermark(groupName)).isEqualTo(10L));
+            retry(
+                    Duration.ofMinutes(1),
+                    () ->
+                            assertThat(followerLog.getCommittedEnrichmentWatermark(groupName))
+                                    .isEqualTo(10L));
+
             // On-disk: the enrichment log + index files must exist in the follower's bucket dir.
             File followerTabletDir = followerLog.getLogDir();
             File[] colFiles = followerTabletDir.listFiles((d, name) -> name.contains(".col."));
