@@ -201,6 +201,27 @@ escalate, or just lag indefinitely?
 (deferred E.7). Tiering catching up after replication recovers is the
 correct steady-state behavior.
 
+### 6.5 Per-group tiering opt-out (deferred)
+
+Some column groups carry data that doesn't belong in the lake — e.g. a
+short-lived enrichment used only for in-Fluss queries, or PII-bearing
+columns subject to deletion SLAs that the lake table can't honour
+cheaply. Phase F as currently scoped tiers every group; opting one out
+would require a per-table or per-group config.
+
+**Tentative shape (not implemented):** a table-level property
+`table.datalake.excluded-column-groups` (comma-separated group names).
+TieringSplitReader projects all columns *except* the columns belonging
+to excluded groups, the merger naturally skips those groups, and the
+lake table's schema is built from `tableSchema − excluded-group-columns`.
+Tiering offset advances at `min(CEW_g)` over the *included* groups
+only — excluding a slow group would unstick tiering progress for the
+remaining ones.
+
+**Status:** deferred — not on the F.1→F.6 critical path. Revisit when
+a concrete need surfaces; the design above is a sketch, not a
+commitment.
+
 ## 7. Risks
 
 | Risk | Mitigation |
