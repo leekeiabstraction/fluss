@@ -132,6 +132,109 @@ final class EnrichmentSegment implements Closeable {
     }
 
     /**
+     * Slice of an enrichment segment for replication: zero-copy {@link FileLogRecords} view of the
+     * concatenated batches plus the parallel array of source offsets they cover.
+     */
+    static final class RangeResult {
+        static final RangeResult EMPTY = new RangeResult(MemoryLogRecords.EMPTY, new long[0]);
+
+        private final org.apache.fluss.record.LogRecords records;
+        private final long[] sourceOffsets;
+
+        RangeResult(org.apache.fluss.record.LogRecords records, long[] sourceOffsets) {
+            this.records = records;
+            this.sourceOffsets = sourceOffsets;
+        }
+
+        org.apache.fluss.record.LogRecords records() {
+            return records;
+        }
+
+        long[] sourceOffsets() {
+            return sourceOffsets;
+        }
+
+        boolean isEmpty() {
+            return sourceOffsets.length == 0;
+        }
+    }
+
+    /**
+     * Return the enrichment entries in the half-open interval {@code [fromInclusive, toExclusive)},
+     * subject to {@code maxBytes} on the underlying file slice (always returns at least one entry
+     * if the from-bound is in range, to guarantee forward progress under tiny budgets).
+     *
+     * <p>Used by E.3b to ship enrichment to followers in fetch responses. Under the Phase C
+     * dense-index invariant (one entry per source offset, contiguous from 0, baseOffset=0), the
+     * slot in {@link OffsetIndex} for offset {@code N} is just {@code (int) N}, so the lookups here
+     * are O(1) array accesses.
+     *
+     * @return a {@link RangeResult} carrying the file-backed records slice (zero-copy) and the
+     *     parallel array of source offsets it covers; or {@link RangeResult#EMPTY} if the requested
+     *     range is entirely past {@link #lastEnrichedOffset()} or empty.
+     */
+    RangeResult range(long fromInclusive, long toExclusive, int maxBytes) throws IOException {
+        if (offsetIndex.entries() == 0
+                || fromInclusive < 0L
+                || fromInclusive >= toExclusive
+                || maxBytes <= 0) {
+            return RangeResult.EMPTY;
+        }
+        long lastEnriched = lastEnrichedOffset();
+        if (fromInclusive > lastEnriched) {
+            return RangeResult.EMPTY;
+        }
+        long clampedTo = Math.min(toExclusive, lastEnriched + 1L);
+
+        int fromSlot = Math.toIntExact(fromInclusive);
+        int toSlot = Math.toIntExact(clampedTo);
+        int totalEntries = offsetIndex.entries();
+        if (fromSlot >= totalEntries) {
+            return RangeResult.EMPTY;
+        }
+
+        int startPos = offsetIndex.entry(fromSlot).getPosition();
+        int endPos = positionForEndSlot(toSlot, totalEntries);
+
+        // Greedy trim to maxBytes: always include at least one entry so callers make progress
+        // even when a single batch is larger than the budget.
+        int includedEndSlot;
+        if (endPos - startPos <= maxBytes) {
+            includedEndSlot = toSlot;
+        } else {
+            includedEndSlot = fromSlot + 1;
+            for (int k = fromSlot + 2; k <= toSlot; k++) {
+                int kEnd = positionForEndSlot(k, totalEntries);
+                if (kEnd - startPos > maxBytes) {
+                    break;
+                }
+                includedEndSlot = k;
+            }
+            endPos = positionForEndSlot(includedEndSlot, totalEntries);
+        }
+
+        int sliceSize = endPos - startPos;
+        FileLogRecords slice = fileLogRecords.slice(startPos, sliceSize);
+        int count = includedEndSlot - fromSlot;
+        long[] sourceOffsets = new long[count];
+        for (int i = 0; i < count; i++) {
+            sourceOffsets[i] = fromInclusive + i;
+        }
+        return new RangeResult(slice, sourceOffsets);
+    }
+
+    /**
+     * File position immediately past the last byte of the entry at {@code slot - 1}. When {@code
+     * slot} is past the last index entry, that's the file's current end.
+     */
+    private int positionForEndSlot(int slot, int totalEntries) {
+        if (slot >= totalEntries) {
+            return fileLogRecords.sizeInBytes();
+        }
+        return offsetIndex.entry(slot).getPosition();
+    }
+
+    /**
      * Drop all entries with {@code source_offset >= sourceOffsetExclusive}. The on-disk {@link
      * FileLogRecords} is truncated to the file position of the first dropped entry, and the {@link
      * OffsetIndex} drops the corresponding tail. After this call, {@link #lastEnrichedOffset()} is

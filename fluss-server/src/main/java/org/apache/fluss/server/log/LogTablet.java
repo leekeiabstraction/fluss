@@ -406,6 +406,26 @@ public final class LogTablet {
     }
 
     /**
+     * Read enrichment entries for the given group in the half-open range {@code [fromInclusive,
+     * toExclusive)}, bounded by {@code maxBytes}. Used by E.3b to satisfy a follower's request to
+     * replicate enrichment past its current cursor.
+     *
+     * <p>Returns {@link EnrichmentSegment.RangeResult#EMPTY} if the group is not registered, the
+     * range is empty, or {@code fromInclusive} is past the leader's local EWM. Otherwise the result
+     * carries a zero-copy {@link org.apache.fluss.record.FileLogRecords} slice and the parallel
+     * source-offset array.
+     */
+    public EnrichmentSegment.RangeResult readEnrichmentForFollower(
+            String groupName, long fromInclusive, long toExclusive, int maxBytes)
+            throws IOException {
+        EnrichmentSegment seg = enrichmentSegments.get(groupName);
+        if (seg == null) {
+            return EnrichmentSegment.RangeResult.EMPTY;
+        }
+        return seg.range(fromInclusive, toExclusive, maxBytes);
+    }
+
+    /**
      * Drop every enrichment entry with {@code source_offset >= sourceOffsetExclusive} across all
      * registered groups, and clamp each group's EWM to {@code min(current, sourceOffsetExclusive)}.
      * Called from {@link #truncateTo} and {@link #truncateFullyAndStartAt} as the mirror of

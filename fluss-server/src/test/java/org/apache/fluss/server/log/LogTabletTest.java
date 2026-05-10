@@ -734,6 +734,95 @@ final class LogTabletTest extends LogTestBase {
         assertThat(logTablet.getCommittedEnrichmentWatermark(groupName)).isEqualTo(0L);
     }
 
+    @Test
+    void testReadEnrichmentForFollowerCoversFullRange() throws Exception {
+        // Five base records and five 1-row enrichment entries → EWM = 5.
+        for (int i = 0; i < 5; i++) {
+            logTablet.appendAsLeader(
+                    genMemoryLogRecordsByObject(
+                            Collections.singletonList(new Object[] {i, "v" + i})));
+        }
+        String groupName = "enriched";
+        logTablet.registerColumnGroupIfAbsent(groupName);
+        for (int i = 0; i < 5; i++) {
+            logTablet.appendColumnsAsLeader(
+                    groupName, buildSingleRowEnrichment("US-WEST-" + i), new long[] {(long) i});
+        }
+        int totalSegBytes = logTablet.getEnrichmentSegment(groupName).records().sizeInBytes();
+        assertThat(totalSegBytes).isPositive();
+
+        // Full range [0, 5) with a generous budget returns every entry.
+        EnrichmentSegment.RangeResult full =
+                logTablet.readEnrichmentForFollower(groupName, 0L, 5L, Integer.MAX_VALUE);
+        assertThat(full.isEmpty()).isFalse();
+        assertThat(full.sourceOffsets()).containsExactly(0L, 1L, 2L, 3L, 4L);
+        assertThat(full.records().sizeInBytes()).isEqualTo(totalSegBytes);
+
+        // Sub-range [2, 4): two entries, less than full bytes.
+        EnrichmentSegment.RangeResult middle =
+                logTablet.readEnrichmentForFollower(groupName, 2L, 4L, Integer.MAX_VALUE);
+        assertThat(middle.sourceOffsets()).containsExactly(2L, 3L);
+        assertThat(middle.records().sizeInBytes()).isPositive();
+        assertThat(middle.records().sizeInBytes()).isLessThan(totalSegBytes);
+
+        // Range past EWM clamps and returns empty when the entire range is past EWM.
+        assertThat(
+                        logTablet
+                                .readEnrichmentForFollower(groupName, 5L, 10L, Integer.MAX_VALUE)
+                                .isEmpty())
+                .isTrue();
+        // Range partially past EWM clamps to lastEnrichedOffset+1.
+        EnrichmentSegment.RangeResult clamped =
+                logTablet.readEnrichmentForFollower(groupName, 3L, 100L, Integer.MAX_VALUE);
+        assertThat(clamped.sourceOffsets()).containsExactly(3L, 4L);
+    }
+
+    @Test
+    void testReadEnrichmentForFollowerHonoursMaxBytesAndForwardProgress() throws Exception {
+        for (int i = 0; i < 5; i++) {
+            logTablet.appendAsLeader(
+                    genMemoryLogRecordsByObject(
+                            Collections.singletonList(new Object[] {i, "v" + i})));
+        }
+        String groupName = "enriched";
+        logTablet.registerColumnGroupIfAbsent(groupName);
+        for (int i = 0; i < 5; i++) {
+            logTablet.appendColumnsAsLeader(
+                    groupName, buildSingleRowEnrichment("US-WEST-" + i), new long[] {(long) i});
+        }
+        EnrichmentSegment seg = logTablet.getEnrichmentSegment(groupName);
+        // Each batch is one row; figure out per-batch byte size from index spacing.
+        int firstBatchSize = seg.lookup(1L).getPosition() - seg.lookup(0L).getPosition();
+        assertThat(firstBatchSize).isPositive();
+
+        // Budget of one full batch + 1 byte → should fit exactly one batch (the second won't fit).
+        EnrichmentSegment.RangeResult oneBatch =
+                logTablet.readEnrichmentForFollower(groupName, 0L, 5L, firstBatchSize + 1);
+        assertThat(oneBatch.sourceOffsets()).containsExactly(0L);
+        assertThat(oneBatch.records().sizeInBytes()).isEqualTo(firstBatchSize);
+
+        // Budget of three full batches → exactly three.
+        EnrichmentSegment.RangeResult threeBatches =
+                logTablet.readEnrichmentForFollower(groupName, 0L, 5L, firstBatchSize * 3);
+        assertThat(threeBatches.sourceOffsets()).containsExactly(0L, 1L, 2L);
+        assertThat(threeBatches.records().sizeInBytes()).isEqualTo(firstBatchSize * 3);
+
+        // Budget = 1 byte (smaller than even one batch) → forward progress: emit one batch anyway.
+        EnrichmentSegment.RangeResult tinyBudget =
+                logTablet.readEnrichmentForFollower(groupName, 0L, 5L, 1);
+        assertThat(tinyBudget.sourceOffsets()).containsExactly(0L);
+        assertThat(tinyBudget.records().sizeInBytes()).isEqualTo(firstBatchSize);
+    }
+
+    @Test
+    void testReadEnrichmentForFollowerUnregisteredGroupReturnsEmpty() throws Exception {
+        EnrichmentSegment.RangeResult result =
+                logTablet.readEnrichmentForFollower("nonexistent", 0L, 10L, 1024);
+        assertThat(result.isEmpty()).isTrue();
+        assertThat(result.sourceOffsets()).isEmpty();
+        assertThat(result.records().sizeInBytes()).isZero();
+    }
+
     private MemoryLogRecords buildSingleRowEnrichment(String value) throws Exception {
         RowType groupRowType =
                 RowType.of(
