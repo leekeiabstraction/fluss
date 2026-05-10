@@ -93,6 +93,11 @@ public class TieringSplitReader<WriteResult>
     @Nullable private TablePath currentTablePath;
     @Nullable private LogScanner currentLogScanner;
     @Nullable private Table currentTable;
+    // Column projection for the current table. Null when the table has no column groups —
+    // tiering reads the base log untouched. Non-null when at least one column group is
+    // registered, in which case it covers every column of the table so the server-side
+    // EnrichmentMerger fires and emits fully-materialized rows up to CEW (Phase F.2).
+    @Nullable private int[] currentProjectedColumns;
 
     private final Queue<TieringSnapshotSplit> currentPendingSnapshotSplits;
     @Nullable private BoundedSplitReader currentSnapshotSplitReader;
@@ -283,14 +288,43 @@ public class TieringSplitReader<WriteResult>
                     currentTableInfo.getTableId(),
                     tablePath,
                     split.getTableBucket().getTableId());
-            LOG.info("Start to tier table {} with table id {}.", currentTablePath, currentTableId);
+            currentProjectedColumns = computeProjectionForTiering(currentTableInfo);
+            LOG.info(
+                    "Start to tier table {} with table id {}{}.",
+                    currentTablePath,
+                    currentTableId,
+                    currentProjectedColumns == null ? "" : " (column-group merge enabled)");
         }
         return currentTable;
     }
 
+    /**
+     * Returns the column projection the tiering scanner should request, or {@code null} for the
+     * default no-projection path. Tables with no column groups are tiered as raw base-log records
+     * (the existing behaviour). Tables with at least one column group are projected over every
+     * column so the server's EnrichmentMerger applies and the lake receives fully-materialized rows
+     * bounded by CEW (PHASE_F §3.2).
+     */
+    @Nullable
+    private static int[] computeProjectionForTiering(TableInfo tableInfo) {
+        if (tableInfo.getSchema().getColumnGroups().isEmpty()) {
+            return null;
+        }
+        int colCount = tableInfo.getSchema().getColumns().size();
+        int[] all = new int[colCount];
+        for (int i = 0; i < colCount; i++) {
+            all[i] = i;
+        }
+        return all;
+    }
+
     private void mayCreateLogScanner() {
         if (currentLogScanner == null) {
-            currentLogScanner = checkNotNull(currentTable).newScan().createLogScanner();
+            org.apache.fluss.client.table.scanner.Scan scan = checkNotNull(currentTable).newScan();
+            if (currentProjectedColumns != null) {
+                scan = scan.project(currentProjectedColumns);
+            }
+            currentLogScanner = scan.createLogScanner();
         }
     }
 
@@ -562,6 +596,7 @@ public class TieringSplitReader<WriteResult>
         currentTableId = null;
         currentTablePath = null;
         currentTableNumberOfSplits = null;
+        currentProjectedColumns = null;
         currentPendingSnapshotSplits.clear();
         currentTableStoppingOffsets.clear();
         currentTableTieredOffsetAndTimestamp.clear();
