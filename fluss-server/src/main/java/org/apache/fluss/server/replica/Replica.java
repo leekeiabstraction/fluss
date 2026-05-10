@@ -1166,6 +1166,18 @@ public final class Replica {
                     logReadInfo.getFetchedData().getFetchOffsetMetadata(),
                     followerFetchTimeMs,
                     logReadInfo.getLogEndOffset());
+
+            // E.3d: record this follower's per-group EWM cursors and try to advance CEW. Empty
+            // for pre-Phase-E peers and tables without column groups, so this is a no-op outside
+            // of column-group replication. Done after readRecords (and HW update) so a follower
+            // can never advance CEW past data it doesn't yet have on disk.
+            java.util.Map<String, Long> cursors = fetchParams.currentFollowerEwmCursors();
+            if (!cursors.isEmpty()) {
+                int followerId = fetchParams.replicaId();
+                for (java.util.Map.Entry<String, Long> entry : cursors.entrySet()) {
+                    updateFollowerEwm(followerId, entry.getKey(), entry.getValue());
+                }
+            }
             return logReadInfo;
         } else {
             return inReadLock(

@@ -881,6 +881,68 @@ final class ReplicaTest extends ReplicaTestBase {
     }
 
     @Test
+    void testFollowerFetchAdvancesCewViaCursorUpdate() throws Exception {
+        // E.3d: a follower fetch carrying cursors should record the follower's EWM and
+        // recompute CEW as min(leader EWM, ISR follower EWMs). This is the wire-up that turns
+        // E.2's standalone updateFollowerEwm into the actual replication-driven CEW advance.
+        Replica replica =
+                makeLogReplica(DATA1_PHYSICAL_TABLE_PATH, new TableBucket(DATA1_TABLE_ID, 1));
+        makeLeaderWithIsr(
+                replica,
+                DATA1_TABLE_PATH,
+                new TableBucket(DATA1_TABLE_ID, 1),
+                Arrays.asList(TABLET_SERVER_ID, 2),
+                Arrays.asList(TABLET_SERVER_ID, 2),
+                INITIAL_LEADER_EPOCH);
+
+        String groupName = "enriched";
+        LogTablet logTablet = replica.getLogTablet();
+        for (int i = 0; i < 5; i++) {
+            replica.appendRecordsToLeader(
+                    genMemoryLogRecordsByObject(
+                            Collections.singletonList(new Object[] {i, "v" + i})),
+                    0);
+        }
+        logTablet.registerColumnGroupIfAbsent(groupName);
+        for (int i = 0; i < 5; i++) {
+            logTablet.appendColumnsAsLeader(
+                    groupName, cewBuildSingleRowEnrichment("US-WEST-" + i), new long[] {(long) i});
+        }
+        // Initial CEW is 0 — registered, nothing committed yet.
+        assertThat(logTablet.getCommittedEnrichmentWatermark(groupName)).isEqualTo(0L);
+
+        // Follower 2 fetches with cursor=3 → CEW = min(leader=5, f2=3) = 3.
+        fetchAsFollowerWithCursor(replica, 2, groupName, 3L);
+        assertThat(logTablet.getCommittedEnrichmentWatermark(groupName)).isEqualTo(3L);
+
+        // Follower 2 catches up on its next fetch — cursor=5 → CEW = min(leader=5, f2=5) = 5.
+        fetchAsFollowerWithCursor(replica, 2, groupName, 5L);
+        assertThat(logTablet.getCommittedEnrichmentWatermark(groupName)).isEqualTo(5L);
+    }
+
+    private void fetchAsFollowerWithCursor(
+            Replica replica, int followerId, String groupName, long cursor) throws IOException {
+        FetchParams fetchParams =
+                new FetchParams(
+                        followerId,
+                        true,
+                        (int) conf.get(ConfigOptions.CLIENT_SCANNER_LOG_FETCH_MAX_BYTES).getBytes(),
+                        FetchParams.DEFAULT_MIN_FETCH_BYTES,
+                        FetchParams.DEFAULT_MAX_WAIT_MS,
+                        null);
+        fetchParams.setCurrentFetch(
+                DATA1_TABLE_ID,
+                0L,
+                Integer.MAX_VALUE,
+                replica.getSchemaGetter(),
+                DEFAULT_COMPRESSION,
+                null,
+                new ProjectionPushdownCache());
+        fetchParams.setCurrentFollowerEwmCursors(Collections.singletonMap(groupName, cursor));
+        replica.fetchRecords(fetchParams);
+    }
+
+    @Test
     void testFollowerEwmDroppedOnAssignmentChange() throws Exception {
         Replica replica =
                 makeLogReplica(DATA1_PHYSICAL_TABLE_PATH, new TableBucket(DATA1_TABLE_ID, 1));

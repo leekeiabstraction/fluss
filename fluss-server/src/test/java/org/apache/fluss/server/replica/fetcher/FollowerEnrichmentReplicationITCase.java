@@ -149,27 +149,30 @@ class FollowerEnrichmentReplicationITCase {
                     Duration.ofMinutes(1),
                     () -> assertThat(followerLog.localLogEndOffset()).isEqualTo(5L));
 
-            // Now write enrichment for offsets 0..4 on the leader and bump CEW to 3 to simulate
-            // what E.3d will do — we want to confirm the follower propagates it.
+            // Now write enrichment for offsets 0..4 on the leader. With E.3d wired up the
+            // leader's CEW will auto-advance from 0 to 5 once the follower's fetch round-trip
+            // completes — we don't need to set CEW manually.
             leaderLog.registerColumnGroupIfAbsent(groupName);
             for (int i = 0; i < 5; i++) {
                 leaderLog.appendColumnsAsLeader(
                         groupName, buildSingleRowEnrichment("US-WEST-" + i), new long[] {(long) i});
             }
             assertThat(leaderLog.getEnrichmentWatermark(groupName)).isEqualTo(5L);
-            leaderLog.updateCommittedEnrichmentWatermark(groupName, 3L);
 
             // Follower picks up enrichment via its periodic fetch. Wait for it.
             retry(
                     Duration.ofMinutes(1),
                     () -> assertThat(followerLog.getEnrichmentWatermark(groupName)).isEqualTo(5L));
 
-            // CEW must match too — that's what unblocks the future read-side gate (E.4).
+            // CEW must converge to 5 too — that's what unblocks the future read-side gate
+            // (E.4). The leader auto-advances CEW as the follower's cursor catches up; the
+            // follower then learns the new value through the next fetch response.
             retry(
                     Duration.ofMinutes(1),
                     () ->
                             assertThat(followerLog.getCommittedEnrichmentWatermark(groupName))
-                                    .isEqualTo(3L));
+                                    .isEqualTo(5L));
+            assertThat(leaderLog.getCommittedEnrichmentWatermark(groupName)).isEqualTo(5L);
 
             // On-disk: the enrichment log + index files must exist in the follower's bucket dir.
             File followerTabletDir = followerLog.getLogDir();
