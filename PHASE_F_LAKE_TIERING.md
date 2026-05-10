@@ -143,8 +143,8 @@ plain log rows to them.
 F.1  Design ADR (this doc)              ─┐
 F.2  TieringSplitReader: detect column   │
      groups, project all columns         │
-F.3  Tier-side offset tracking — track   │  Critical path
-     against CEW, expose on metadata     │
+F.3  Split generator: cap stoppingOffset │  Critical path
+     at CEW for column-group tables      │
 F.4  ITCase per lake format (Paimon →   ─┘
      Iceberg → Lance)
 F.5  Snapshot reads — verify lake reads
@@ -154,7 +154,42 @@ F.6  Documentation: lake column-group
      visibility semantics
 ```
 
-**Critical path:** F.2 → F.3 → F.4. F.5/F.6 anytime after F.4.
+**Critical path:** F.2 + F.3 must land together (see §5.1). F.5/F.6
+anytime after F.4.
+
+### 5.1 F.2 + F.3 are coupled
+
+F.2 alone produces a hang. The tiering job's completion loop is:
+
+```java
+while (lastRecord.logOffset() < stoppingOffset - 1) {
+    fetchResult = tieringSplitReader.fetch();
+    ...
+}
+```
+
+Today's `stoppingOffset` is the bucket's high watermark, returned by
+`bucketOffsetsRetriever.latestOffsets(...)`. With F.2 the LogScanner
+applies a full-column projection on column-group tables, which trips
+the EnrichmentMerger's CEW cap. If `CEW < HW`, the server stops
+returning records once `lastRecord.logOffset() == CEW - 1`, but the
+loop is waiting for `HW - 1`. Spin forever.
+
+**F.3 closes the gap** by setting the split's `stoppingOffset` to
+`min(HW, CEW_min)` for column-group tables, where `CEW_min` is the
+minimum CEW across all groups on the bucket. The tiering job then
+covers `[start, CEW_min)` per pass; whatever HW reaches past CEW_min
+is picked up on the next tiering cycle once enrichment catches up.
+
+The CEW lookup can either:
+- live server-side (extend the listOffsets RPC response with a
+  tier-safe upper bound), or
+- live client-side in the generator (a new admin call `getMinCew(tb,
+  groupNames)`).
+
+**Tentative resolution:** server-side. Listing offsets already returns
+HW; adding a sibling field "tier-safe end offset" keeps the round-trip
+count flat and means client code stays minimal.
 
 ## 6. Open questions
 
