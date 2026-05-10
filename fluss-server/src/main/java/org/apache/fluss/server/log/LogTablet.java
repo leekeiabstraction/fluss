@@ -295,31 +295,34 @@ public final class LogTablet {
      */
     public void registerColumnGroupIfAbsent(String groupName) {
         synchronized (lock) {
-            enrichmentSegments.computeIfAbsent(
-                    groupName,
-                    g -> {
-                        try {
-                            EnrichmentSegment seg =
-                                    EnrichmentSegment.open(
-                                            getLogDir(), g, 0L, enrichmentMaxIndexSize);
-                            long lastWritten = seg.lastEnrichedOffset();
-                            enrichmentWatermarks.put(g, lastWritten + 1L);
-                            // CEW starts at 0 (registered, nothing committed yet). The leader's
-                            // Replica.maybeAdvanceCEW will pull this forward as ISR acks; on
-                            // followers it's overwritten from the leader's fetch response.
-                            // E.5a's onBecomeNewLeader will set CEW := local EWM at election.
-                            committedEnrichmentWatermarks.putIfAbsent(g, 0L);
-                            return seg;
-                        } catch (IOException e) {
-                            throw new FlussRuntimeException(
-                                    "Failed to open enrichment segment for group '"
-                                            + g
-                                            + "' on bucket "
-                                            + getTableBucket(),
-                                    e);
-                        }
-                    });
+            registerColumnGroupIfAbsentLocked(groupName);
         }
+    }
+
+    private void registerColumnGroupIfAbsentLocked(String groupName) {
+        enrichmentSegments.computeIfAbsent(
+                groupName,
+                g -> {
+                    try {
+                        EnrichmentSegment seg =
+                                EnrichmentSegment.open(getLogDir(), g, 0L, enrichmentMaxIndexSize);
+                        long lastWritten = seg.lastEnrichedOffset();
+                        enrichmentWatermarks.put(g, lastWritten + 1L);
+                        // CEW starts at 0 (registered, nothing committed yet). The leader's
+                        // Replica.maybeAdvanceCEW will pull this forward as ISR acks; on
+                        // followers it's overwritten from the leader's fetch response.
+                        // E.5a's onBecomeNewLeader will set CEW := local EWM at election.
+                        committedEnrichmentWatermarks.putIfAbsent(g, 0L);
+                        return seg;
+                    } catch (IOException e) {
+                        throw new FlussRuntimeException(
+                                "Failed to open enrichment segment for group '"
+                                        + g
+                                        + "' on bucket "
+                                        + getTableBucket(),
+                                e);
+                    }
+                });
     }
 
     /**
@@ -343,6 +346,43 @@ public final class LogTablet {
                                 + groupName
                                 + "' is not registered on bucket "
                                 + getTableBucket());
+            }
+            segment.append(records, sourceOffsets);
+            segment.flush();
+            long newEwm = sourceOffsets[sourceOffsets.length - 1] + 1L;
+            enrichmentWatermarks.merge(groupName, newEwm, Math::max);
+        }
+    }
+
+    /**
+     * Persist a batch of enrichment rows replicated from the leader (E.3c). Auto-registers the
+     * group on first arrival so a fresh follower can bootstrap without a separate registration
+     * step. Verifies that {@code sourceOffsets[0]} matches the local EWM — the leader's range read
+     * is contract-bound to start at the cursor we advertised, so a mismatch means the leader, our
+     * local index, or the wire format is wrong; failing loudly is preferable to a silent gap.
+     *
+     * <p>Mirrors {@link #appendColumnsAsLeader} for the storage step (segment append, flush, EWM
+     * merge), but skips the per-row strict-order check the leader already enforced before sending.
+     */
+    public void appendColumnsAsFollower(
+            String groupName, MemoryLogRecords records, long[] sourceOffsets) throws IOException {
+        if (sourceOffsets.length == 0) {
+            return;
+        }
+        synchronized (lock) {
+            registerColumnGroupIfAbsentLocked(groupName);
+            EnrichmentSegment segment = enrichmentSegments.get(groupName);
+            long currentEwm = enrichmentWatermarks.get(groupName);
+            if (sourceOffsets[0] != currentEwm) {
+                throw new IllegalStateException(
+                        "Out-of-order enrichment replication for bucket "
+                                + getTableBucket()
+                                + " group '"
+                                + groupName
+                                + "': expected source_offset "
+                                + currentEwm
+                                + " (local EWM) but got "
+                                + sourceOffsets[0]);
             }
             segment.append(records, sourceOffsets);
             segment.flush();

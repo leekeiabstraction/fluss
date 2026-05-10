@@ -822,6 +822,41 @@ final class LogTabletTest extends LogTestBase {
         assertThat(result.records().sizeInBytes()).isZero();
     }
 
+    @Test
+    void testAppendColumnsAsFollowerAdvancesEwmAndAutoRegisters() throws Exception {
+        // Need base records so the group can be referenced — same constraint as the leader path.
+        for (int i = 0; i < 3; i++) {
+            logTablet.appendAsLeader(
+                    genMemoryLogRecordsByObject(
+                            Collections.singletonList(new Object[] {i, "v" + i})));
+        }
+
+        String groupName = "geo";
+        // Group is NOT pre-registered: the follower path should auto-register on first arrival.
+        assertThat(logTablet.getEnrichmentWatermark(groupName)).isEqualTo(-1L);
+
+        logTablet.appendColumnsAsFollower(
+                groupName, buildSingleRowEnrichment("US-WEST-0"), new long[] {0L});
+        assertThat(logTablet.getEnrichmentWatermark(groupName)).isEqualTo(1L);
+
+        logTablet.appendColumnsAsFollower(
+                groupName, buildSingleRowEnrichment("US-WEST-1"), new long[] {1L});
+        assertThat(logTablet.getEnrichmentWatermark(groupName)).isEqualTo(2L);
+
+        // Out-of-order replication (gap or duplicate) must fail loudly so we never silently
+        // produce a sparse on-disk index.
+        org.assertj.core.api.Assertions.assertThatThrownBy(
+                        () ->
+                                logTablet.appendColumnsAsFollower(
+                                        groupName,
+                                        buildSingleRowEnrichment("US-WEST-X"),
+                                        new long[] {3L}))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("Out-of-order enrichment replication")
+                .hasMessageContaining("expected source_offset 2")
+                .hasMessageContaining("got 3");
+    }
+
     private MemoryLogRecords buildSingleRowEnrichment(String value) throws Exception {
         RowType groupRowType =
                 RowType.of(

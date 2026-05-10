@@ -28,6 +28,8 @@ import org.apache.fluss.remote.RemoteLogSegment;
 import org.apache.fluss.rpc.entity.FetchLogResultForBucket;
 import org.apache.fluss.rpc.messages.PbAclFilter;
 import org.apache.fluss.rpc.messages.PbAclInfo;
+import org.apache.fluss.rpc.messages.PbCommittedEnrichmentWatermark;
+import org.apache.fluss.rpc.messages.PbEnrichmentBatchForGroup;
 import org.apache.fluss.rpc.messages.PbFetchLogRespForBucket;
 import org.apache.fluss.rpc.messages.PbKeyValue;
 import org.apache.fluss.rpc.messages.PbPartitionSpec;
@@ -49,7 +51,10 @@ import org.apache.fluss.shaded.netty4.io.netty.buffer.ByteBuf;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.stream.Collectors;
 
@@ -216,6 +221,31 @@ public class CommonRpcMessageUtils {
                                     tb, records, respForBucket.getHighWatermark());
                 }
             }
+        }
+
+        // E.3c: layer enrichment payload + CEW snapshot from the response onto the result so the
+        // follower's fetcher thread can persist them. Empty for client fetches and pre-Phase-E
+        // peers — both fields are absent on the wire and produce empty maps here.
+        int payloadCount = respForBucket.getEnrichmentPayloadPerGroupsCount();
+        int cewCount = respForBucket.getCommittedEwmsCount();
+        if (payloadCount > 0 || cewCount > 0) {
+            List<FetchLogResultForBucket.EnrichmentPayload> payloads =
+                    payloadCount == 0 ? Collections.emptyList() : new ArrayList<>(payloadCount);
+            for (int i = 0; i < payloadCount; i++) {
+                PbEnrichmentBatchForGroup pb = respForBucket.getEnrichmentPayloadPerGroupAt(i);
+                ByteBuffer buf = toByteBuffer(pb.getRecordsSlice());
+                LogRecords payloadRecords = MemoryLogRecords.pointToByteBuffer(buf);
+                payloads.add(
+                        new FetchLogResultForBucket.EnrichmentPayload(
+                                pb.getGroupName(), payloadRecords, pb.getSourceOffsets()));
+            }
+            Map<String, Long> cews =
+                    cewCount == 0 ? Collections.emptyMap() : new HashMap<>(cewCount);
+            for (int i = 0; i < cewCount; i++) {
+                PbCommittedEnrichmentWatermark cew = respForBucket.getCommittedEwmAt(i);
+                cews.put(cew.getGroupName(), cew.getCew());
+            }
+            fetchLogResultForBucket = fetchLogResultForBucket.withEnrichment(payloads, cews);
         }
 
         return fetchLogResultForBucket;
