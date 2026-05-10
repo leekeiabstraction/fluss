@@ -1,6 +1,6 @@
 # Phase I — Flink connector for column-group tables
 
-**Status:** I.1, I.2, I.3 landed. I.4 and I.5 outstanding.
+**Status:** I.1 → I.5 landed and verified.
 **Authors:** option02-lateMaterialized branch.
 **Depends on:** Phase E (CEW-bound read gate), Phase F (lake tiering),
 Phase H (schema evolution).
@@ -185,11 +185,13 @@ I.3  FlinkSourceSplitReader: force full projection   ✓ landed alongside I.2
      when none was applied and the table has column
      groups. Required for SELECT * to see merged
      enrichment values; see §5.2 below.
-I.4  Schema-evolution ITCase under a running query   not started
-     ─ alter mid-query; assert no crash / corruption
-I.5  Documentation                                    not started
-     ─ section in this doc describing user-facing contract
-     ─ code example for Java-API enrichment write pattern
+I.4  Schema-evolution ITCase under a running query   ✓ green first try
+     ─ Flink streaming SELECT keeps emitting under
+       cached projection after alterTable; v2 segments
+       decode under v1-shaped projection via Phase H
+       per-(group, batchSchemaId) dispatch.
+I.5  User-facing contract + Java-API enrichment       ✓ §9 below
+     pattern documentation
 ```
 
 ### 5.2 What I.2 surfaced and I.3 fixed
@@ -290,3 +292,136 @@ I.2 will surface this if there's a wiring issue.
 
 - **I.5 — no tests, pure docs** — code example for "Flink writes base
   rows; separate Java-API service writes enrichment."
+
+## 9. User-facing contract for Flink users
+
+### 9.1 Reading column-group tables in Flink SQL
+
+A column-group table is queryable as a regular Flink `Table`. Every
+column — base and column-group — is visible in the schema and can be
+referenced from SQL. There is no Flink-side concept of "column group";
+the grouping is server-side metadata that controls when the merger
+fires.
+
+For a column-group table whose schema is
+`(device_id INT, payload STRING, geo_region STRING TO GROUP enriched,
+risk_score DOUBLE TO GROUP enriched)`:
+
+| Flink SQL                                        | Rows returned | Why                                                                                  |
+|---|---|---|
+| `SELECT device_id, payload FROM cg`              | up to HW       | projection doesn't reference enrichment; server gate inactive                        |
+| `SELECT device_id, geo_region FROM cg`           | up to CEW      | projection touches `geo_region` (enrichment); server fires merger, gates at CEW      |
+| `SELECT * FROM cg`                               | up to CEW      | `*` covers enrichment columns; `FlinkSourceSplitReader` synthesizes full projection  |
+| `SELECT risk_score FROM cg`                      | up to CEW      | same as above                                                                        |
+
+The CEW gate is per-(bucket, group). With multiple groups, projection
+touching *any* enrichment column gates at `min(CEW_g)` over the groups
+the projection touches. This matches the Java-client semantics from
+Phase E.4.
+
+### 9.2 Writing to column-group tables from Flink
+
+The Flink Fluss sink uses `AppendWriter.append(...)`. For a column-group
+table, that means inserting **base rows with enrichment columns as
+NULL**:
+
+```sql
+-- The schema is (device_id INT, payload STRING, geo_region STRING, risk_score DOUBLE)
+INSERT INTO cg VALUES
+    (1, 'p1', CAST(NULL AS STRING), CAST(NULL AS DOUBLE)),
+    (2, 'p2', CAST(NULL AS STRING), CAST(NULL AS DOUBLE));
+```
+
+The enrichment columns can only be filled **later**, via the Java
+client API's `AppendWriter.appendColumns(group, bucket, sourceOffset, row)`.
+There is no Flink SQL surface for this today (PHASE_I §2 / §4.1).
+
+#### Canonical enrichment pattern
+
+A typical column-group workload runs **two jobs**:
+
+1. **Base ingest** (Flink): `INSERT INTO cg SELECT ... FROM kafka_source`.
+   Standard Flink Fluss sink. Writes base rows with enrichment columns
+   null.
+2. **Enrichment service** (Java): reads the base log via
+   `LogScanner` (no projection — gets all rows, including unfilled
+   enrichment), computes enrichment for each offset, writes via
+   `appendColumns(...)`.
+
+```java
+// Sketch of the enrichment service.
+try (Connection conn = ConnectionFactory.createConnection(flussConf);
+     Table table = conn.getTable(TablePath.of("db", "cg"))) {
+    AppendWriter writer = table.newAppend().createWriter();
+    try (LogScanner scanner = table.newScan().createLogScanner()) {
+        scanner.subscribeFromBeginning(0);  // bucket 0
+        while (running) {
+            ScanRecords records = scanner.poll(Duration.ofSeconds(1));
+            for (ScanRecord r : records) {
+                long offset = r.logOffset();
+                InternalRow baseRow = r.getRow();
+                // Compute enrichment values for this offset.
+                GenericRow enrichmentRow = computeEnrichmentFor(baseRow);
+                writer.appendColumns(
+                        "enriched",
+                        new TableBucket(tableId, 0),
+                        offset,
+                        enrichmentRow).get();
+            }
+        }
+    }
+}
+```
+
+The enrichment writes must arrive **strictly in source-offset order**
+per group — `appendColumns` rejects out-of-order writes loudly
+(`ColumnGroupEWMITCase#testAppendColumnsRejectsOutOfOrder`). A
+single-threaded service per bucket is the simplest pattern.
+
+### 9.3 Schema evolution while a Flink query is running
+
+Phase I.4 verified that a streaming `SELECT` survives a mid-query
+`alterTable` (adding a column to a group). The running query keeps
+emitting rows under the **projection it computed at job-start**:
+
+- Old projection indices remain valid in v2 (additions go to the end
+  of the column list, so existing indices don't shift).
+- The server-side merger uses
+  `schemaGetter.getLatestSchemaInfo()` for the output row type and
+  per-`(group, batchSchemaId)` decoders for inputs (Phase H §5.2 fix).
+- v1 segments produce v1 enrichment values; v2 segments produce v2
+  values. Both fit into the v1-shaped output (newly-added columns are
+  outside the projection and not emitted).
+
+To **see** the new column in a Flink query, the user has to restart
+the job. Until restart, the running query continues with full row-set
+correctness for the columns it already references — the new column is
+simply invisible until reload.
+
+### 9.4 Catalog: how column-group tables get created
+
+Today's Flink Fluss catalog has no DDL syntax for declaring column
+groups (`PHASE_I §4.3`). The expected pattern:
+
+1. Create the table once via the **Java admin API** with the
+   column-group schema:
+
+   ```java
+   Schema schema = Schema.newBuilder()
+       .column("device_id", DataTypes.INT())
+       .column("payload", DataTypes.STRING())
+       .column("geo_region", DataTypes.STRING()).columnGroup("enriched")
+       .column("risk_score", DataTypes.DOUBLE()).columnGroup("enriched")
+       .build();
+   TableDescriptor descriptor = TableDescriptor.builder().schema(schema)
+       .distributedBy(1, "device_id")
+       .build();
+   admin.createTable(TablePath.of("db", "cg"), descriptor, false).get();
+   ```
+
+2. Query from Flink SQL as usual. The Flink catalog reads
+   `tableInfo.getRowType()`; column groups are transparent to it.
+
+Adding a `WITH ('column-groups.<g>' = 'col1,col2')` parser to the
+catalog is a small follow-up (~30 lines) but deferred until a real
+need surfaces.

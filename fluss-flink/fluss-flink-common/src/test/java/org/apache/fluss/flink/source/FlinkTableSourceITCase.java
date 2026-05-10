@@ -28,6 +28,7 @@ import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.exception.InvalidConfigException;
 import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.metadata.TableChange;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.row.BinaryString;
@@ -312,6 +313,125 @@ abstract class FlinkTableSourceITCase extends AbstractTestBase {
                         "+I[3, p3, US-WEST-3, 0.8]",
                         "+I[4, p4, US-WEST-4, 0.9]");
         assertQueryResultExactOrder(tEnv, "select * from cg_sql_read", selectStarExpected);
+    }
+
+    @Test
+    void testColumnGroupTableSchemaEvolutionDuringStreamingQuery() throws Exception {
+        // Phase I.4: a streaming Flink SQL query against a column-group table survives a
+        // mid-query alterTable. The query keeps emitting rows under the projection that was
+        // synthesized at job-start time; new columns are out of projection and not visible
+        // until the job restarts. No crash, no malformed rows (PHASE_I §3.3, §4.2, §6.2).
+        TablePath tablePath = TablePath.of(DEFAULT_DB, "cg_streaming_alter");
+        String groupName = "enriched";
+        org.apache.fluss.metadata.Schema flussSchema =
+                org.apache.fluss.metadata.Schema.newBuilder()
+                        .column("device_id", org.apache.fluss.types.DataTypes.INT())
+                        .column("payload", org.apache.fluss.types.DataTypes.STRING())
+                        .column("geo_region", org.apache.fluss.types.DataTypes.STRING())
+                        .columnGroup(groupName)
+                        .build();
+        TableDescriptor descriptor =
+                TableDescriptor.builder().schema(flussSchema).distributedBy(1, "device_id").build();
+        admin.createTable(tablePath, descriptor, false).get();
+        long tableId = admin.getTableInfo(tablePath).get().getTableId();
+        FLUSS_CLUSTER_EXTENSION.waitUntilTableReady(tableId);
+        TableBucket bucket = new TableBucket(tableId, 0);
+
+        // Phase v1: write 5 base + enrich each one so CEW reaches 5.
+        try (Table table = conn.getTable(tablePath)) {
+            AppendWriter writer = table.newAppend().createWriter();
+            for (int i = 0; i < 5; i++) {
+                writer.append(row(i, "p" + i, (Object) null)).get();
+            }
+            writer.flush();
+            for (int i = 0; i < 5; i++) {
+                writer.appendColumns(
+                                groupName,
+                                bucket,
+                                i,
+                                GenericRow.of(BinaryString.fromString("US-WEST-" + i)))
+                        .get();
+            }
+        }
+        retry(
+                java.time.Duration.ofMinutes(1),
+                () ->
+                        assertThat(
+                                        FLUSS_CLUSTER_EXTENSION
+                                                .waitAndGetLeaderReplica(bucket)
+                                                .getLogTablet()
+                                                .getCommittedEnrichmentWatermark(groupName))
+                                .isEqualTo(5L));
+
+        // Start a streaming query whose projection (synthesized at job-start) is
+        // [device_id, geo_region]. Collect the first 5 rows pre-alter.
+        try (CloseableIterator<Row> rowIter =
+                tEnv.executeSql("select device_id, geo_region from cg_streaming_alter").collect()) {
+            List<String> preAlter = collectRowsWithTimeout(rowIter, 5, false);
+            assertThat(preAlter)
+                    .containsExactly(
+                            "+I[0, US-WEST-0]",
+                            "+I[1, US-WEST-1]",
+                            "+I[2, US-WEST-2]",
+                            "+I[3, US-WEST-3]",
+                            "+I[4, US-WEST-4]");
+
+            // Bump the schema: add risk_score to the "enriched" group. The running query's
+            // projection still references columns by their v1 indices (0 = device_id,
+            // 2 = geo_region). Those indices remain stable in v2 (risk_score is appended at
+            // index 3), so the query keeps working under the v1 projection — risk_score is
+            // simply not visible until the user restarts the job.
+            admin.alterTable(
+                            tablePath,
+                            Collections.singletonList(
+                                    TableChange.addColumn(
+                                            "risk_score",
+                                            org.apache.fluss.types.DataTypes.DOUBLE(),
+                                            null,
+                                            TableChange.ColumnPosition.last(),
+                                            groupName)),
+                            false)
+                    .get();
+
+            // Phase v2: write 5 more base + 5 more enrichment under the new schema.
+            try (Table table = conn.getTable(tablePath)) {
+                AppendWriter writer = table.newAppend().createWriter();
+                for (int i = 5; i < 10; i++) {
+                    writer.append(row(i, "p" + i, null, null)).get();
+                }
+                writer.flush();
+                for (int i = 5; i < 10; i++) {
+                    writer.appendColumns(
+                                    groupName,
+                                    bucket,
+                                    i,
+                                    GenericRow.of(
+                                            BinaryString.fromString("US-WEST-" + i), 0.5 + i * 0.1))
+                            .get();
+                }
+            }
+            retry(
+                    java.time.Duration.ofMinutes(1),
+                    () ->
+                            assertThat(
+                                            FLUSS_CLUSTER_EXTENSION
+                                                    .waitAndGetLeaderReplica(bucket)
+                                                    .getLogTablet()
+                                                    .getCommittedEnrichmentWatermark(groupName))
+                                    .isEqualTo(10L));
+
+            // Collect the next 5 rows. The streaming query continues without crashing; v2
+            // segments decode under the v1-shaped projection (Phase H per-(group, batchSchemaId)
+            // dispatch). risk_score is not in projection, so it's not in the output rows.
+            List<String> postAlter = collectRowsWithTimeout(rowIter, 5, false);
+            assertThat(postAlter)
+                    .containsExactly(
+                            "+I[5, US-WEST-5]",
+                            "+I[6, US-WEST-6]",
+                            "+I[7, US-WEST-7]",
+                            "+I[8, US-WEST-8]",
+                            "+I[9, US-WEST-9]");
+        }
     }
 
     @ParameterizedTest
