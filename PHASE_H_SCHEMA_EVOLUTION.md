@@ -1,8 +1,6 @@
 # Phase H — Schema evolution for column groups
 
-**Status:** H.1, H.2, H.3 landed. H.4 ITCase checked in `@Disabled` —
-blocked by a pre-existing gap (`Replica.tableInfo` is `final`, no
-refresh-on-alter path). See §5.1.
+**Status:** H.1 → H.4 landed and verified. H.5 not started.
 **Authors:** option02-lateMaterialized branch.
 **Depends on:** Phase B (column-group schema), Phase E (per-(group, batchSchemaId) decoder dispatch — commit `63e5a12f`).
 
@@ -162,8 +160,8 @@ H.2  TableChange.AddColumn.groupName +
      SchemaUpdate group-aware                        ✓ 87d24f85
 H.3  Wire format: PbAddColumn.column_group
      + client/server util plumbing                   ✓ 87d24f85
-H.4  Schema-evolution ITCase                         BLOCKED — see §5.1
-     (drives v1 → v2 dispatch end-to-end)
+H.4  Schema-evolution ITCase                         ✓ green
+     (drives v1 → v2 dispatch end-to-end)               (after the §5.2 fix landed)
 H.5  Negative tests                                  not started
 ```
 
@@ -213,25 +211,35 @@ The H.4 test method is checked in but `@Disabled` with this
 explanation. It will become a green check once the Replica refresh is
 landed (a separate phase — see §6.5).
 
-### 5.2 The fix is out of scope of H
+### 5.2 The fix — narrow, in `Replica.readRecords` only
 
-The Replica refresh is its own piece of infrastructure work — not a
-schema-evolution concern per se. Scope creep risk if folded into H.
+After tracing the read path it became clear the gap is **specific to
+the merger**, not to base-log reads:
 
-Two plausible shapes for the fix:
+- `FileLogProjection.setCurrentProjection(tableId, schemaGetter, ...)`
+  is per-batch schema-aware: it reads each batch's own schemaId from
+  the batch header and resolves the projection against the schema
+  cached in `schemaGetter` (which holds every version). It never
+  consults `Replica.tableInfo`. Base-log reads with a projection that
+  references a newly-added base column work correctly even with stale
+  `Replica.tableInfo`.
+- The `EnrichmentMerger`, by contrast, was constructed from
+  `tableInfo.getSchema()` and `tableInfo.getSchemaId()` to determine
+  the *output* RowType for the projected response. Those are the only
+  callers of stale `tableInfo` on the read path.
 
-- **(a) Push notification.** Coordinator notifies leader Replicas when
-  ZK records a schema change; each leader Replica refreshes its local
-  `tableInfo` (drop `final`, add a setter, take a write lock during the
-  swap). Cleanest for steady-state but needs a new RPC verb / Notify
-  message.
-- **(b) Per-fetch refresh.** `Replica.readRecords` re-fetches `tableInfo`
-  from the metadata cache on every fetch. Avoids the notification path
-  but adds a metadata cache hit per fetch — measurable cost on hot
-  reads.
+So the fix is two lines of logic and ~10 lines of supporting code:
+look up `schemaGetter.getLatestSchemaInfo()` at the top of
+`Replica.readRecords` and use its schema/schemaId for both
+`projectionTouchesEnrichment(...)` and `new EnrichmentMerger(...)`.
+`SchemaInfo` carries both the latest `Schema` and its `schemaId`; the
+`serverSchemaCache` is already updated on every cluster-metadata
+broadcast (`TabletServerMetadataCache:209`), so the latest schema is
+current there even when `Replica.tableInfo` lags.
 
-Either fix is roughly the size of E.5b (a few hundred lines including
-tests). Out of scope for this ADR; tracked as the next phase below.
+`Replica.tableInfo` stays `final` — there is no general-purpose
+"refresh on alter" path. Only the column-group merger needed the live
+schema, and now it gets it.
 
 ## 6. Open questions
 
@@ -270,12 +278,14 @@ never exercised. Plausible mechanisms:
 when EWM advances; expose a test-only helper if no public path exists.
 Resolve in H.4.
 
-### 6.5 Replica.tableInfo refresh on alter (NEW open question — discovered during H.4)
+### 6.5 Replica.tableInfo refresh on alter — RESOLVED
 
-See §5.1. Without this, the projection-with-merger read path returns
-stale-schema data after any `alterTable`. Tracked as the immediate
-follow-up phase. Either push-notification or per-fetch refresh; pick
-based on metadata-cache hit cost vs. notification-channel complexity.
+Originally raised as an open question after H.4 surfaced the gap.
+Resolved by §5.2: the merger now uses `schemaGetter.getLatestSchemaInfo()`
+instead of `Replica.tableInfo`. `Replica.tableInfo` stays `final` —
+no general refresh path is needed because `FileLogProjection` was
+already per-batch schema-aware, so base-log reads never depended on
+the table-level cached schema.
 
 ### 6.4 Producer rejection on row arity mismatch
 

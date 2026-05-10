@@ -37,6 +37,7 @@ import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.SchemaGetter;
+import org.apache.fluss.metadata.SchemaInfo;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
@@ -1715,9 +1716,21 @@ public final class Replica {
         // byte-level path and let LogTablet read raw base batches. The merger below decodes
         // the base rows, overlays per-row enrichment values, and re-encodes with the projected
         // row type. Projections that touch only base columns still use the zero-copy path.
+        //
+        // Phase H §5.2 (Option B): use schemaGetter.getLatestSchemaInfo() rather than
+        // tableInfo.getSchema()/getSchemaId(). tableInfo is captured at Replica construction
+        // and not refreshed when alterTable bumps the schema; using it here means a column
+        // added to an existing group post-alter is invisible to the touch-check, and the
+        // merger output RowType lags behind the projection the client actually sent. The
+        // base-log FileLogProjection path is already per-batch schema-aware via schemaGetter,
+        // so it tolerates a stale Replica.tableInfo — only the merger path needs this.
+        SchemaInfo latestSchemaInfo = schemaGetter.getLatestSchemaInfo();
+        Schema latestSchema = latestSchemaInfo.getSchema();
+        int latestSchemaId = latestSchemaInfo.getSchemaId();
+
         boolean enrichmentTouched =
                 EnrichmentMerger.projectionTouchesEnrichment(
-                        tableInfo.getSchema(), fetchParams.currentProjectedFields());
+                        latestSchema, fetchParams.currentProjectedFields());
         FileLogProjection projection = enrichmentTouched ? null : fetchParams.projection();
 
         FetchDataInfo fetchDataInfo;
@@ -1742,11 +1755,11 @@ public final class Replica {
         if (enrichmentTouched && fetchDataInfo.getRecords().sizeInBytes() > 0) {
             try (EnrichmentMerger merger =
                     new EnrichmentMerger(
-                            tableInfo.getSchema(),
-                            tableInfo.getSchemaId(),
+                            latestSchema,
+                            latestSchemaId,
                             tableInfo.getTableId(),
                             fetchParams.currentProjectedFields(),
-                            tableInfo.getTableConfig().getArrowCompressionInfo(),
+                            arrowCompressionInfo,
                             schemaGetter)) {
                 LogRecords merged =
                         merger.merge(

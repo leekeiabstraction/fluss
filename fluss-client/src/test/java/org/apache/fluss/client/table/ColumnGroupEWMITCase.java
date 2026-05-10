@@ -37,7 +37,6 @@ import org.apache.fluss.server.replica.ReplicaManager;
 import org.apache.fluss.server.tablet.TabletServer;
 import org.apache.fluss.types.DataTypes;
 
-import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
@@ -392,19 +391,6 @@ public class ColumnGroupEWMITCase extends ClientToServerITCaseBase {
     }
 
     @Test
-    @Disabled(
-            "Phase H.4: blocked by a pre-existing gap discovered while wiring this test up — "
-                    + "Replica.tableInfo is `final` and is not refreshed when alterTable bumps the "
-                    + "schema. After v1 -> v2 alter, the leader Replica's read path still uses v1 "
-                    + "schema (server-side diagnostic confirmed: merger throws "
-                    + "IndexOutOfBoundsException because projection [0,1,2,3] exceeds v1's 3-col "
-                    + "row type). Existing alterTable tests don't expose this because they don't "
-                    + "exercise the projection-with-merger path post-alter. Fixing the test "
-                    + "requires either (a) wiring a leader Replica refresh on the alter "
-                    + "notification path, or (b) re-fetching tableInfo per-fetch on the read path. "
-                    + "See PHASE_H_SCHEMA_EVOLUTION.md §6 for the open question. The unit test "
-                    + "SchemaUpdateTest still proves the H.2/H.3 metadata path is correct; this "
-                    + "test enables once the Replica refresh lands.")
     void testSchemaEvolutionDispatch() throws Exception {
         // Phase H.4: drive a real v1 -> v2 schema bump on a column-group table and verify the
         // per-(group, batchSchemaId) decoder dispatch (commit 63e5a12f) handles a mix of v1 and
