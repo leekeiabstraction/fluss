@@ -986,6 +986,47 @@ final class ReplicaTest extends ReplicaTestBase {
         assertThat(logTablet.getCommittedEnrichmentWatermark(groupName)).isEqualTo(9L);
     }
 
+    @Test
+    void testNewLeaderSeedsCewFromLocalEwm() throws Exception {
+        // E.5a: when a replica is promoted to leader, its local EWM is by definition committed
+        // across the surviving ISR (otherwise the coordinator wouldn't have picked it). Without
+        // this seeding, CEW would still be the startup value (0) and the read-side gate would
+        // briefly hide enrichment that's actually durable.
+        Replica replica =
+                makeLogReplica(DATA1_PHYSICAL_TABLE_PATH, new TableBucket(DATA1_TABLE_ID, 1));
+
+        // Simulate the replica having on-disk enrichment from a previous role/leader, before
+        // this make-leader fires. Use the LogTablet API directly so we bypass Replica's
+        // leader-role check — the storage layer doesn't care about role, which is exactly the
+        // recovery path on a freshly promoted leader.
+        LogTablet logTablet = replica.getLogTablet();
+        for (int i = 0; i < 3; i++) {
+            logTablet.appendAsLeader(
+                    genMemoryLogRecordsByObject(
+                            Collections.singletonList(new Object[] {i, "v" + i})));
+        }
+        String groupName = "enriched";
+        logTablet.registerColumnGroupIfAbsent(groupName);
+        for (int i = 0; i < 3; i++) {
+            logTablet.appendColumnsAsLeader(
+                    groupName, cewBuildSingleRowEnrichment("US-WEST-" + i), new long[] {(long) i});
+        }
+        assertThat(logTablet.getEnrichmentWatermark(groupName)).isEqualTo(3L);
+        // CEW is still at the startup default (0) — no makeLeader yet, so no seeding.
+        assertThat(logTablet.getCommittedEnrichmentWatermark(groupName)).isEqualTo(0L);
+
+        // Promote: triggers onBecomeNewLeader, which seeds CEW := local EWM for every group.
+        makeLeaderWithIsr(
+                replica,
+                DATA1_TABLE_PATH,
+                new TableBucket(DATA1_TABLE_ID, 1),
+                Arrays.asList(TABLET_SERVER_ID, 2),
+                Arrays.asList(TABLET_SERVER_ID, 2),
+                INITIAL_LEADER_EPOCH);
+
+        assertThat(logTablet.getCommittedEnrichmentWatermark(groupName)).isEqualTo(3L);
+    }
+
     private void makeLeaderWithIsr(
             Replica replica,
             TablePath tablePath,

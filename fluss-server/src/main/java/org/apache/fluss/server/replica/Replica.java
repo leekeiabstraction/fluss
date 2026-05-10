@@ -428,8 +428,9 @@ public final class Replica {
 
                             int requestLeaderEpoch = data.getLeaderEpoch();
                             if (requestLeaderEpoch > leaderEpoch) {
+                                boolean wasLeader = isLeader();
                                 leaderEpoch = requestLeaderEpoch;
-                                onBecomeNewLeader();
+                                onBecomeNewLeader(wasLeader);
                                 leaderReplicaIdOpt.set(localTabletServerId);
                                 LOG.info(
                                         "TabletServer {} becomes leader for bucket {}",
@@ -544,8 +545,22 @@ public final class Replica {
 
     // -------------------------------------------------------------------------------------------
 
-    private void onBecomeNewLeader() {
+    private void onBecomeNewLeader(boolean wasLeader) {
         updateLeaderEndOffsetSnapshot();
+
+        // E.5a: when a follower is promoted to leader, its local EWM is by definition committed
+        // across the surviving ISR (the previous leader's CEW = min(EWM across ISR) was ≤ this
+        // replica's local EWM, so seeding CEW := local EWM doesn't regress). Without this, CEW
+        // would still be the startup value (0) and the read-side gate would briefly hide
+        // enrichment that's actually durable. Skip when this server was already the leader —
+        // the only way to reach here in that case is an epoch bump with no role change, which
+        // means CEW is already being maintained by maybeAdvanceCEW and reseeding to local EWM
+        // would over-claim relative to the current ISR's actual reported EWMs.
+        if (!wasLeader) {
+            for (Map.Entry<String, Long> e : logTablet.getAllEnrichmentWatermarks().entrySet()) {
+                logTablet.updateCommittedEnrichmentWatermark(e.getKey(), e.getValue());
+            }
+        }
 
         if (isDataLakeEnabled()) {
             registerLakeTieringMetrics();
