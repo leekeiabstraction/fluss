@@ -57,7 +57,9 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
@@ -145,9 +147,13 @@ final class ReplicaFetcherThread extends ShutdownableThread {
                         () -> {
                             Optional<FetchLogContext> fetchLogContext = Optional.empty();
                             try {
+                                Map<TableBucket, BucketFetchStatus> bucketStatusMap =
+                                        fairBucketStatusMap.bucketStatusMap();
+                                Map<TableBucket, Map<String, Long>> followerEwmCursors =
+                                        collectFollowerEwmCursors(bucketStatusMap);
                                 fetchLogContext =
                                         leader.buildFetchLogContext(
-                                                fairBucketStatusMap.bucketStatusMap());
+                                                bucketStatusMap, followerEwmCursors);
                                 if (!fetchLogContext.isPresent()) {
                                     LOG.trace(
                                             "There are no active buckets. Back off for {} ms before "
@@ -163,6 +169,40 @@ final class ReplicaFetcherThread extends ShutdownableThread {
                         });
 
         fetchLogContextOpt.ifPresent(this::processFetchLogRequest);
+    }
+
+    /**
+     * Build the per-bucket per-group EWM cursor map advertised to the leader (E.3c). For each
+     * bucket whose table has column groups, we advertise one entry per group with cursor =
+     * "next-expected source offset" (i.e. local EWM, or 0 if the group is not yet locally
+     * registered — that's the bootstrap case for a fresh follower). Buckets without column groups
+     * are absent from the map. Tolerates missing replicas (returns no cursors for that bucket) so a
+     * transient race during replica delete cannot stall the fetcher.
+     */
+    private Map<TableBucket, Map<String, Long>> collectFollowerEwmCursors(
+            Map<TableBucket, BucketFetchStatus> bucketStatusMap) {
+        Map<TableBucket, Map<String, Long>> cursorsPerBucket = new HashMap<>();
+        for (TableBucket tb : bucketStatusMap.keySet()) {
+            Replica replica;
+            try {
+                replica = replicaManager.getReplicaOrException(tb);
+            } catch (Exception e) {
+                continue;
+            }
+            Map<String, List<Integer>> groups =
+                    replica.getTableInfo().getSchema().getColumnGroups();
+            if (groups.isEmpty()) {
+                continue;
+            }
+            LogTablet logTablet = replica.getLogTablet();
+            Map<String, Long> cursors = new HashMap<>(groups.size());
+            for (String groupName : groups.keySet()) {
+                long ewm = logTablet.getEnrichmentWatermark(groupName);
+                cursors.put(groupName, Math.max(0L, ewm));
+            }
+            cursorsPerBucket.put(tb, cursors);
+        }
+        return cursorsPerBucket;
     }
 
     void removeBuckets(Set<TableBucket> tableBuckets) throws InterruptedException {
@@ -572,6 +612,25 @@ final class ReplicaFetcherThread extends ShutdownableThread {
                 logTablet.localLogEndOffset(),
                 records.sizeInBytes(),
                 tableBucket);
+
+        // E.3c: persist replicated enrichment payload + propagate CEW from the leader. Order:
+        // base log first (above), then enrichment, then CEW. Base-first matches the truncation
+        // ordering in PHASE_E_REPLICATION §4.4 — if we crash between the base append and the
+        // enrichment append, recovery's discoverEnrichmentSegments clamp will reconcile by
+        // either rolling back the dangling enrichment or accepting an EWM up to localLogEnd.
+        for (FetchLogResultForBucket.EnrichmentPayload payload :
+                replicaData.getEnrichmentPayloadPerGroup()) {
+            if (payload.getSourceOffsets().length == 0) {
+                continue; // CEW-only updates ride along below; nothing to persist for this group.
+            }
+            logTablet.appendColumnsAsFollower(
+                    payload.getGroupName(),
+                    (MemoryLogRecords) payload.getRecords(),
+                    payload.getSourceOffsets());
+        }
+        for (Map.Entry<String, Long> cew : replicaData.getCommittedEwms().entrySet()) {
+            logTablet.updateCommittedEnrichmentWatermark(cew.getKey(), cew.getValue());
+        }
 
         // For the follower replica, we do not need to keep its segment base offset and physical
         // position. These values will be computed upon becoming leader or handling a preferred read

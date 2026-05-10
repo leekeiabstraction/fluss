@@ -21,6 +21,7 @@ import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.rpc.entity.FetchLogResultForBucket;
 import org.apache.fluss.rpc.messages.FetchLogResponse;
 
+import java.util.Collections;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
@@ -49,12 +50,29 @@ interface LeaderEndpoint {
     CompletableFuture<FetchData> fetchLog(FetchLogContext fetchLogContext);
 
     /**
-     * Builds a fetch request, given a bucket map.
+     * Builds a fetch request without follower EWM cursors. Used by tests and any caller that
+     * doesn't need to drive enrichment replication; production callers should use the overload
+     * below so per-group cursors land on the wire (E.3c).
+     */
+    default Optional<FetchLogContext> buildFetchLogContext(
+            Map<TableBucket, BucketFetchStatus> replicas) {
+        return buildFetchLogContext(replicas, Collections.emptyMap());
+    }
+
+    /**
+     * Builds a fetch request, given a bucket map and per-bucket follower EWM cursors. Each entry in
+     * {@code followerEwmCursors} is the next-expected source-offset per column group on that
+     * bucket. The leader uses these cursors to return enrichment past each follower's EWM and to
+     * propagate its CEW snapshot back. Pass an empty map for any bucket that has no column groups;
+     * pass an empty outer map to opt out of enrichment replication entirely.
      *
      * @param replicas A map of table replicas to their respective bucket fetch state.
+     * @param followerEwmCursors Per-bucket per-group EWM cursors for enrichment replication.
      * @return fetchLogContext.
      */
-    Optional<FetchLogContext> buildFetchLogContext(Map<TableBucket, BucketFetchStatus> replicas);
+    Optional<FetchLogContext> buildFetchLogContext(
+            Map<TableBucket, BucketFetchStatus> replicas,
+            Map<TableBucket, Map<String, Long>> followerEwmCursors);
 
     /** Closes access to fetch from leader. */
     void close();

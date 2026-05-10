@@ -127,9 +127,11 @@ final class RemoteLeaderEndpoint implements LeaderEndpoint {
 
     @Override
     public Optional<FetchLogContext> buildFetchLogContext(
-            Map<TableBucket, BucketFetchStatus> replicas) {
+            Map<TableBucket, BucketFetchStatus> replicas,
+            Map<TableBucket, Map<String, Long>> followerEwmCursors) {
         return buildFetchLogContext(
                 replicas,
+                followerEwmCursors,
                 followerServerId,
                 maxFetchSize,
                 maxFetchSizeForBucket,
@@ -144,6 +146,7 @@ final class RemoteLeaderEndpoint implements LeaderEndpoint {
 
     static Optional<FetchLogContext> buildFetchLogContext(
             Map<TableBucket, BucketFetchStatus> replicas,
+            Map<TableBucket, Map<String, Long>> followerEwmCursors,
             int followerServerId,
             int maxFetchSize,
             int maxFetchSizeForBucket,
@@ -169,6 +172,15 @@ final class RemoteLeaderEndpoint implements LeaderEndpoint {
                                 .setMaxFetchBytes(maxFetchSizeForBucket);
                 if (tb.getPartitionId() != null) {
                     fetchLogReqForBucket.setPartitionId(tb.getPartitionId());
+                }
+                Map<String, Long> bucketCursors = followerEwmCursors.get(tb);
+                if (bucketCursors != null) {
+                    for (Map.Entry<String, Long> cursor : bucketCursors.entrySet()) {
+                        fetchLogReqForBucket
+                                .addFollowerEwmRequest()
+                                .setGroupName(cursor.getKey())
+                                .setCurrentEwm(cursor.getValue());
+                    }
                 }
                 fetchLogReqForBuckets
                         .computeIfAbsent(tb.getTableId(), key -> new ArrayList<>())

@@ -164,9 +164,16 @@ public class TestingLeaderEndpoint implements LeaderEndpoint {
 
     @Override
     public Optional<FetchLogContext> buildFetchLogContext(
-            Map<TableBucket, BucketFetchStatus> replicas) {
+            Map<TableBucket, BucketFetchStatus> replicas,
+            Map<TableBucket, Map<String, Long>> followerEwmCursors) {
         return RemoteLeaderEndpoint.buildFetchLogContext(
-                replicas, localNode.id(), maxFetchSize, maxFetchSizeForBucket, -1, -1);
+                replicas,
+                followerEwmCursors,
+                localNode.id(),
+                maxFetchSize,
+                maxFetchSizeForBucket,
+                -1,
+                -1);
     }
 
     @Override
