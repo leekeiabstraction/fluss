@@ -1,6 +1,6 @@
 # Phase K — Flink DDL for column groups
 
-**Status:** ADR — K.1 (this doc).
+**Status:** K.1 → K.3 landed and verified.
 **Authors:** option02-lateMaterialized branch.
 **Depends on:** Phase H (column-group schema mutation API), Phase I
 (Flink connector read path).
@@ -152,11 +152,15 @@ piece (extending Flink's `ALTER TABLE ADD COLUMN` parser to accept a
 ## 5. Phasing
 
 ```
-K.1  ADR (this doc)
-K.2  Catalog: parse + apply `column-groups.<g>` properties on
-     createTable; emit them on getTable; validation suite.
-K.3  ITCase: end-to-end Flink DDL → query → SHOW CREATE TABLE
-     round-trip on a column-group table.
+K.1  ADR (this doc)                                  ✓ 7668ee2c
+K.2  Catalog: parse + apply column-groups.<g> on    ✓ landed alongside K.3
+     createTable; emit on getTable; validation
+     (FlinkConversions.parseColumnGroups +
+      addColumnToSchema + toFlinkTable round-trip).
+K.3  ITCase: end-to-end Flink DDL → query →          ✓ landed alongside K.2
+     SHOW CREATE TABLE round-trip + 5 negative cases
+     (testColumnGroupTableViaFlinkDdl +
+      testColumnGroupTableViaFlinkDdlRejectsMalformed).
 ```
 
 K.2 and K.3 are tightly coupled (the ITCase exercises the new

@@ -37,6 +37,7 @@ import org.apache.fluss.utils.StringUtils;
 import org.apache.fluss.utils.TimeUtils;
 
 import org.apache.flink.configuration.Configuration;
+import org.apache.flink.table.api.ValidationException;
 import org.apache.flink.table.catalog.CatalogBaseTable;
 import org.apache.flink.table.catalog.CatalogDatabase;
 import org.apache.flink.table.catalog.CatalogMaterializedTable;
@@ -59,10 +60,12 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.stream.Collectors;
 
 import static org.apache.flink.table.factories.FactoryUtil.CONNECTOR;
@@ -139,6 +142,21 @@ public class FlinkConversions {
                         column.getName(), column.getAggFunction().get(), newOptions);
             }
         }
+
+        // Phase K: re-synthesize `column-groups.<groupName> = col1, col2, ...` options so that
+        // SHOW CREATE TABLE round-trips a Flink DDL that originally declared these groups
+        // (PHASE_K §3.3, §4.3). The Schema's column-group metadata is the source of truth.
+        Map<String, List<Integer>> columnGroups = schema.getColumnGroups();
+        if (!columnGroups.isEmpty()) {
+            List<Schema.Column> columns = schema.getColumns();
+            for (Map.Entry<String, List<Integer>> entry : columnGroups.entrySet()) {
+                String columnList =
+                        entry.getValue().stream()
+                                .map(idx -> columns.get(idx).getName())
+                                .collect(Collectors.joining(", "));
+                newOptions.put(COLUMN_GROUPS_PREFIX + entry.getKey(), columnList);
+            }
+        }
         List<String> physicalColumns = schema.getColumnNames();
         int columnCount =
                 physicalColumns.size()
@@ -212,13 +230,31 @@ public class FlinkConversions {
         // Check if aggregation merge engine is enabled to optimize parsing
         boolean isAggregationEngine = isAggregationMergeEngine(flinkTableConf);
 
+        // Phase K: parse `column-groups.<groupName>` DDL properties up-front so each column
+        // can be tagged to its group as it's added below. Validation errors throw
+        // ValidationException at create time (PHASE_K §4.4).
+        Set<String> physicalColumnNames =
+                resolvedSchema.getColumns().stream()
+                        .filter(Column::isPhysical)
+                        .map(Column::getName)
+                        .collect(Collectors.toSet());
+        Map<String, String> columnToGroup =
+                parseColumnGroups(
+                        flinkTableConf,
+                        physicalColumnNames,
+                        resolvedSchema.getPrimaryKey().isPresent());
+
         // Build schema with physical columns
         resolvedSchema.getColumns().stream()
                 .filter(Column::isPhysical)
                 .forEachOrdered(
                         column ->
                                 addColumnToSchema(
-                                        schemBuilder, column, flinkTableConf, isAggregationEngine));
+                                        schemBuilder,
+                                        column,
+                                        flinkTableConf,
+                                        isAggregationEngine,
+                                        columnToGroup));
 
         // Configure auto-increment columns based on the 'auto-increment.fields' option.
         if (flinkTableConf.containsKey(AUTO_INCREMENT_FIELDS.key())) {
@@ -684,7 +720,8 @@ public class FlinkConversions {
             Schema.Builder schemaBuilder,
             Column column,
             Configuration tableConf,
-            boolean parseAggFunction) {
+            boolean parseAggFunction,
+            Map<String, String> columnToGroup) {
         String columnName = column.getName();
         DataType flussDataType = toFlussType(column.getDataType());
 
@@ -703,6 +740,14 @@ public class FlinkConversions {
 
         // Add comment if present
         column.getComment().ifPresent(schemaBuilder::withComment);
+
+        // Phase K: tag column to its column group if declared via the
+        // 'column-groups.<groupName>' DDL property (parsed up-front into columnToGroup).
+        // No-op for columns not in any group.
+        String groupName = columnToGroup.get(columnName);
+        if (groupName != null) {
+            schemaBuilder.columnGroup(groupName);
+        }
     }
 
     private static Map<String, String> extractCustomProperties(
@@ -713,6 +758,87 @@ public class FlinkConversions {
         // properties.
         customProperties.remove(BUCKET_KEY.key());
         customProperties.remove(BUCKET_NUMBER.key());
+        // Phase K: column-groups.<groupName> keys are internalized into the schema's column
+        // group metadata; they should not be persisted as custom properties on the descriptor
+        // (PHASE_K §4.3).
+        customProperties.keySet().removeIf(key -> key.startsWith(COLUMN_GROUPS_PREFIX));
         return customProperties;
     }
+
+    /**
+     * Phase K: parses {@code column-groups.<groupName> = col1, col2, ...} DDL properties into a map
+     * from column name to group name. Returns an empty map when no such properties are present.
+     * Throws {@link ValidationException} on malformed input — unknown column, duplicate membership,
+     * empty group name, group name containing a dot, or use together with a primary key (PHASE_K
+     * §3.2, §6.4).
+     */
+    private static Map<String, String> parseColumnGroups(
+            Configuration flinkTableConf, Set<String> physicalColumnNames, boolean hasPrimaryKey) {
+        Map<String, String> columnToGroup = new HashMap<>();
+        for (Map.Entry<String, String> entry : flinkTableConf.toMap().entrySet()) {
+            String key = entry.getKey();
+            if (!key.startsWith(COLUMN_GROUPS_PREFIX)) {
+                continue;
+            }
+            String groupName = key.substring(COLUMN_GROUPS_PREFIX.length());
+            if (groupName.isEmpty()) {
+                throw new ValidationException(
+                        "Column group name in '" + key + "' must not be empty.");
+            }
+            if (groupName.contains(".")) {
+                throw new ValidationException(
+                        "Column group name '"
+                                + groupName
+                                + "' must not contain '.' (collides with the '"
+                                + COLUMN_GROUPS_PREFIX
+                                + "' prefix parser).");
+            }
+            if (hasPrimaryKey) {
+                throw new ValidationException(
+                        "Column groups are not supported on tables with a primary key. Found '"
+                                + key
+                                + "' on a table with a PRIMARY KEY.");
+            }
+            String value = entry.getValue();
+            if (value == null || value.trim().isEmpty()) {
+                throw new ValidationException(
+                        "Column group '" + groupName + "' must list at least one column.");
+            }
+            Set<String> columnsInThisGroup = new HashSet<>();
+            for (String token : value.split(",")) {
+                String columnName = token.trim();
+                if (columnName.isEmpty()) {
+                    throw new ValidationException(
+                            "Empty column name in '" + key + "' = '" + value + "'.");
+                }
+                if (!physicalColumnNames.contains(columnName)) {
+                    throw new ValidationException(
+                            "Column '"
+                                    + columnName
+                                    + "' referenced in '"
+                                    + key
+                                    + "' does not exist in the table schema.");
+                }
+                if (!columnsInThisGroup.add(columnName)) {
+                    throw new ValidationException(
+                            "Column '" + columnName + "' listed twice in '" + key + "'.");
+                }
+                String prevGroup = columnToGroup.putIfAbsent(columnName, groupName);
+                if (prevGroup != null && !prevGroup.equals(groupName)) {
+                    throw new ValidationException(
+                            "Column '"
+                                    + columnName
+                                    + "' assigned to multiple column groups: '"
+                                    + prevGroup
+                                    + "' and '"
+                                    + groupName
+                                    + "'.");
+                }
+            }
+        }
+        return columnToGroup;
+    }
+
+    /** Phase K: property-key prefix for declaring column groups in {@code CREATE TABLE WITH}. */
+    private static final String COLUMN_GROUPS_PREFIX = "column-groups.";
 }

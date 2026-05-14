@@ -216,6 +216,129 @@ abstract class FlinkTableSourceITCase extends AbstractTestBase {
     }
 
     @Test
+    void testColumnGroupTableViaFlinkDdl() throws Exception {
+        // Phase K.3: column groups declared via Flink CREATE TABLE WITH (...) DDL produce a
+        // server-side schema identical to one declared via the Java admin API. Verifies the
+        // round-trip: parse `column-groups.<g>` on createTable, internalize into the schema,
+        // re-synthesize the property on getTable so SHOW CREATE TABLE preserves the DDL.
+        tEnv.executeSql(
+                "create table cg_ddl ("
+                        + "  device_id int, "
+                        + "  payload string, "
+                        + "  geo_region string, "
+                        + "  risk_score double"
+                        + ") with ('column-groups.enriched' = 'geo_region, risk_score',"
+                        + " 'bucket.key' = 'device_id', 'bucket.num' = '1')");
+        TablePath tablePath = TablePath.of(DEFAULT_DB, "cg_ddl");
+        long tableId = admin.getTableInfo(tablePath).get().getTableId();
+        FLUSS_CLUSTER_EXTENSION.waitUntilTableReady(tableId);
+        TableBucket bucket = new TableBucket(tableId, 0);
+
+        // The Fluss schema should now have an "enriched" group with both columns.
+        Map<String, List<Integer>> groups =
+                admin.getTableInfo(tablePath).get().getSchema().getColumnGroups();
+        assertThat(groups).containsOnlyKeys("enriched");
+        assertThat(groups.get("enriched")).containsExactly(2, 3);
+
+        // Write 10 base + enrich first 5 — same setup as Phase I.2.
+        try (Table table = conn.getTable(tablePath)) {
+            AppendWriter writer = table.newAppend().createWriter();
+            for (int i = 0; i < 10; i++) {
+                writer.append(row(i, "p" + i, null, null)).get();
+            }
+            writer.flush();
+            for (int i = 0; i < 5; i++) {
+                writer.appendColumns(
+                                "enriched",
+                                bucket,
+                                i,
+                                GenericRow.of(
+                                        BinaryString.fromString("US-WEST-" + i), 0.5 + i * 0.1))
+                        .get();
+            }
+        }
+        retry(
+                java.time.Duration.ofMinutes(1),
+                () ->
+                        assertThat(
+                                        FLUSS_CLUSTER_EXTENSION
+                                                .waitAndGetLeaderReplica(bucket)
+                                                .getLogTablet()
+                                                .getCommittedEnrichmentWatermark("enriched"))
+                                .isEqualTo(5L));
+
+        // Explicit enrichment projection: gated at CEW = 5, merged values present.
+        assertQueryResultExactOrder(
+                tEnv,
+                "select device_id, geo_region from cg_ddl",
+                Arrays.asList(
+                        "+I[0, US-WEST-0]",
+                        "+I[1, US-WEST-1]",
+                        "+I[2, US-WEST-2]",
+                        "+I[3, US-WEST-3]",
+                        "+I[4, US-WEST-4]"));
+
+        // Round-trip: SHOW CREATE TABLE re-emits the column-groups.<g> property.
+        try (CloseableIterator<Row> showIter =
+                tEnv.executeSql("show create table cg_ddl").collect()) {
+            assertThat(showIter.hasNext()).isTrue();
+            String ddl = (String) showIter.next().getField(0);
+            assertThat(ddl)
+                    .as("SHOW CREATE TABLE output: %s", ddl)
+                    .contains("'column-groups.enriched'")
+                    .containsAnyOf("geo_region, risk_score", "geo_region,risk_score");
+        }
+    }
+
+    @Test
+    void testColumnGroupTableViaFlinkDdlRejectsMalformed() {
+        // Phase K.3 negative cases — every malformed CREATE TABLE must throw at create time,
+        // not later at write/read time. The ValidationException is wrapped by the Flink
+        // catalog layer; assert against the root-cause message rather than the top one.
+        assertThatThrownBy(
+                        () ->
+                                tEnv.executeSql(
+                                        "create table cg_bad_empty_value (a int, b string)"
+                                                + " with ('column-groups.x' = '')"))
+                .getRootCause()
+                .hasMessageContaining("must list at least one column");
+
+        assertThatThrownBy(
+                        () ->
+                                tEnv.executeSql(
+                                        "create table cg_bad_unknown_col (a int, b string)"
+                                                + " with ('column-groups.x' = 'no_such_col')"))
+                .getRootCause()
+                .hasMessageContaining("does not exist");
+
+        assertThatThrownBy(
+                        () ->
+                                tEnv.executeSql(
+                                        "create table cg_bad_dup (a int, b string)"
+                                                + " with ('column-groups.x' = 'a, a')"))
+                .getRootCause()
+                .hasMessageContaining("listed twice");
+
+        assertThatThrownBy(
+                        () ->
+                                tEnv.executeSql(
+                                        "create table cg_bad_two_groups (a int, b string)"
+                                                + " with ('column-groups.x' = 'a',"
+                                                + " 'column-groups.y' = 'a')"))
+                .getRootCause()
+                .hasMessageContaining("multiple column groups");
+
+        assertThatThrownBy(
+                        () ->
+                                tEnv.executeSql(
+                                        "create table cg_bad_pk (a int, b string,"
+                                                + " primary key (a) not enforced)"
+                                                + " with ('column-groups.x' = 'b')"))
+                .getRootCause()
+                .hasMessageContaining("not supported on tables with a primary key");
+    }
+
+    @Test
     void testColumnGroupTableSqlRead() throws Exception {
         // Phase I.2: verify Flink SQL reads of a column-group table mirror direct Java-client
         // semantics — projection touching enrichment columns is gated at CEW; base-only
