@@ -20,6 +20,7 @@ package org.apache.fluss.client.write;
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.client.table.writer.AppendColumnsResult;
 import org.apache.fluss.compression.ArrowCompressionInfo;
+import org.apache.fluss.memory.MemorySegmentPool;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.row.arrow.ArrowWriter;
 import org.apache.fluss.row.arrow.ArrowWriterPool;
@@ -68,6 +69,7 @@ public final class EnrichmentAccumulator {
 
     private final ArrowWriterPool arrowWriterPool;
     private final BufferAllocator bufferAllocator;
+    private final MemorySegmentPool memorySegmentPool;
     private final BatchEncoderInfo encoderInfo;
     private final int batchSizeLimit;
     private final long lingerMs;
@@ -78,15 +80,25 @@ public final class EnrichmentAccumulator {
     @GuardedBy("perKeyAppendLock")
     private boolean flushRequested;
 
+    /**
+     * @param arrowWriterPool shared with the base-append writer for Arrow-encoder reuse.
+     * @param bufferAllocator shared with the base-append writer.
+     * @param memorySegmentPool shared with the base-append writer ({@code LazyMemorySegmentPool})
+     *     so enrichment writes draw against the same bounded budget.
+     * @param encoderInfo per-(table, group) encoder details. The accumulator is scoped to one such
+     *     pair; callers create one accumulator per group.
+     */
     public EnrichmentAccumulator(
             ArrowWriterPool arrowWriterPool,
             BufferAllocator bufferAllocator,
+            MemorySegmentPool memorySegmentPool,
             BatchEncoderInfo encoderInfo,
             int batchSizeLimit,
             long lingerMs,
             int initialBufferBytes) {
         this.arrowWriterPool = arrowWriterPool;
         this.bufferAllocator = bufferAllocator;
+        this.memorySegmentPool = memorySegmentPool;
         this.encoderInfo = encoderInfo;
         this.batchSizeLimit = batchSizeLimit;
         this.lingerMs = lingerMs;
@@ -140,8 +152,18 @@ public final class EnrichmentAccumulator {
                         initialBufferBytes,
                         encoderInfo.groupRowType,
                         encoderInfo.compression);
-        return new EnrichmentWriteBatch(
-                key, batchSizeLimit, nowMs, writer, initialBufferBytes, encoderInfo.writerSchemaId);
+        try {
+            return new EnrichmentWriteBatch(
+                    key,
+                    batchSizeLimit,
+                    nowMs,
+                    writer,
+                    memorySegmentPool,
+                    encoderInfo.writerSchemaId);
+        } catch (java.io.IOException e) {
+            throw new RuntimeException(
+                    "Failed to allocate a memory segment for enrichment batch on key " + key, e);
+        }
     }
 
     /**

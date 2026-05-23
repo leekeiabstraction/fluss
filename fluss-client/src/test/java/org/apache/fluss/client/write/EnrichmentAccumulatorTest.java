@@ -18,6 +18,7 @@
 package org.apache.fluss.client.write;
 
 import org.apache.fluss.client.table.writer.AppendColumnsResult;
+import org.apache.fluss.memory.TestingMemorySegmentPool;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.row.GenericRow;
 import org.apache.fluss.row.arrow.ArrowWriterPool;
@@ -53,16 +54,19 @@ public class EnrichmentAccumulatorTest {
 
     private BufferAllocator allocator;
     private ArrowWriterPool writerPool;
+    private TestingMemorySegmentPool memorySegmentPool;
     private EnrichmentAccumulator accumulator;
 
     @BeforeEach
     void setup() {
         allocator = new RootAllocator(Long.MAX_VALUE);
         writerPool = new ArrowWriterPool(allocator);
+        memorySegmentPool = new TestingMemorySegmentPool(BUFFER_BYTES);
         accumulator =
                 new EnrichmentAccumulator(
                         writerPool,
                         allocator,
+                        memorySegmentPool,
                         new EnrichmentAccumulator.BatchEncoderInfo(
                                 GROUP_ROW_TYPE, SCHEMA_ID, DEFAULT_COMPRESSION),
                         BATCH_SIZE,

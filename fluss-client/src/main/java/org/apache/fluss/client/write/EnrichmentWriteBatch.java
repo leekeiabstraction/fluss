@@ -20,6 +20,7 @@ package org.apache.fluss.client.write;
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.client.table.writer.AppendColumnsResult;
 import org.apache.fluss.memory.MemorySegment;
+import org.apache.fluss.memory.MemorySegmentPool;
 import org.apache.fluss.memory.PreAllocatedPagedOutputView;
 import org.apache.fluss.record.ChangeType;
 import org.apache.fluss.record.MemoryLogRecordsArrowBuilder;
@@ -27,6 +28,7 @@ import org.apache.fluss.record.bytesview.BytesView;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.row.arrow.ArrowWriter;
 
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
@@ -50,6 +52,7 @@ public final class EnrichmentWriteBatch {
     private final long createdMs;
     private final MemoryLogRecordsArrowBuilder builder;
     private final List<MemorySegment> bufferSegments;
+    private final MemorySegmentPool memorySegmentPool;
     private final List<Entry> entries = new ArrayList<>();
 
     private boolean sealed;
@@ -59,17 +62,26 @@ public final class EnrichmentWriteBatch {
             int batchSizeLimit,
             long createdMs,
             ArrowWriter arrowWriter,
-            int initialBufferBytes,
-            int writerSchemaId) {
+            MemorySegmentPool memorySegmentPool,
+            int writerSchemaId)
+            throws IOException {
         this.key = key;
         this.batchSizeLimit = batchSizeLimit;
         this.createdMs = createdMs;
+        this.memorySegmentPool = memorySegmentPool;
+        // Share the writer's memory pool — enrichment writes go through the same bounded buffer
+        // pool as base appends so the WriterClient's memory budget caps both.
         this.bufferSegments = new ArrayList<>();
-        this.bufferSegments.add(MemorySegment.allocateHeapMemory(initialBufferBytes));
+        this.bufferSegments.add(memorySegmentPool.nextSegment());
         PreAllocatedPagedOutputView outputView = new PreAllocatedPagedOutputView(bufferSegments);
         this.builder =
                 MemoryLogRecordsArrowBuilder.builder(
                         writerSchemaId, arrowWriter, outputView, true, null);
+    }
+
+    /** Memory segments held by this batch — caller returns them to the pool after ack. */
+    public synchronized List<MemorySegment> pooledMemorySegments() {
+        return new ArrayList<>(bufferSegments);
     }
 
     public EnrichmentBatchKey getKey() {
@@ -127,7 +139,15 @@ public final class EnrichmentWriteBatch {
         sealed = true;
         if (entries.isEmpty()) {
             builder.close();
-            return new SealedBatch(key, /* records */ null, new long[0], new ArrayList<>());
+            memorySegmentPool.returnAll(bufferSegments);
+            bufferSegments.clear();
+            return new SealedBatch(
+                    key, /* records */
+                    null,
+                    new long[0],
+                    new ArrayList<>(),
+                    null,
+                    new ArrayList<>());
         }
         BytesView records;
         try {
@@ -141,7 +161,13 @@ public final class EnrichmentWriteBatch {
             sourceOffsets[i] = entries.get(i).sourceOffset;
             futures.add(entries.get(i).future);
         }
-        return new SealedBatch(key, records, sourceOffsets, futures);
+        return new SealedBatch(
+                key,
+                records,
+                sourceOffsets,
+                futures,
+                memorySegmentPool,
+                new ArrayList<>(bufferSegments));
     }
 
     /** Complete all pending per-row futures with the same outcome. */
@@ -153,6 +179,8 @@ public final class EnrichmentWriteBatch {
             } catch (Exception ignored) {
                 // best-effort
             }
+            memorySegmentPool.returnAll(bufferSegments);
+            bufferSegments.clear();
         }
         for (Entry entry : entries) {
             if (!entry.future.isDone()) {
@@ -167,16 +195,22 @@ public final class EnrichmentWriteBatch {
         public final BytesView records; // nullable when entries.isEmpty()
         public final long[] sourceOffsets;
         public final List<CompletableFuture<AppendColumnsResult>> futures;
+        private final MemorySegmentPool memorySegmentPool;
+        private final List<MemorySegment> pooledSegments;
 
         SealedBatch(
                 EnrichmentBatchKey key,
                 BytesView records,
                 long[] sourceOffsets,
-                List<CompletableFuture<AppendColumnsResult>> futures) {
+                List<CompletableFuture<AppendColumnsResult>> futures,
+                MemorySegmentPool memorySegmentPool,
+                List<MemorySegment> pooledSegments) {
             this.key = key;
             this.records = records;
             this.sourceOffsets = sourceOffsets;
             this.futures = futures;
+            this.memorySegmentPool = memorySegmentPool;
+            this.pooledSegments = pooledSegments;
         }
 
         public boolean isEmpty() {
@@ -189,6 +223,7 @@ public final class EnrichmentWriteBatch {
                     future.complete(new AppendColumnsResult(enrichmentWatermark));
                 }
             }
+            releaseSegments();
         }
 
         public void completeAllExceptionally(Throwable t) {
@@ -196,6 +231,14 @@ public final class EnrichmentWriteBatch {
                 if (!future.isDone()) {
                     future.completeExceptionally(t);
                 }
+            }
+            releaseSegments();
+        }
+
+        private void releaseSegments() {
+            if (memorySegmentPool != null && !pooledSegments.isEmpty()) {
+                memorySegmentPool.returnAll(pooledSegments);
+                pooledSegments.clear();
             }
         }
     }
