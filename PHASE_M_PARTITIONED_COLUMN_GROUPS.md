@@ -269,10 +269,18 @@ M.5  Flink sink: partition column in write-only row  TBD
        partitioned targets.
      - EnrichmentSinkWriter partition-name → ID cache.
      - ITCase: end-to-end SQL across two partitions.
-M.6  Schema evolution interaction                    TBD
-     - TableChange.addColumn(... groupName) rejects
-       if column is a partition key.
-     - Validation tests.
+M.6  Schema evolution interaction                    ✓ no-op given current Fluss
+     - The M.1 invariant is preserved transitively by
+       the existing "column already exists" rejection
+       in SchemaUpdate.addColumn — partition keys are
+       fixed at table-create time and cannot be
+       promoted from a non-partition column via any
+       TableChange, so a new column with a groupName
+       can never become a partition key. Test
+       cannotAddColumnWithSameNameAsExistingColumn
+       in SchemaUpdateTest documents this.
+     - If a future "add partition key" alter is
+       added, it must enforce M.1 at that point.
 M.7  Lake tiering audit                              TBD
      - Verify F.4-style enrichment-write paths in
        Paimon/Iceberg/Lance carry partition through.

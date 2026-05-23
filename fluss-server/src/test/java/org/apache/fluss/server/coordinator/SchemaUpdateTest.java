@@ -135,6 +135,34 @@ class SchemaUpdateTest {
     }
 
     @Test
+    void cannotAddColumnWithSameNameAsExistingColumn() {
+        // Phase M.6: a new column being added cannot share a name with an existing column.
+        // This is the only practical way M.1 (partition keys ⊂ default group) could be violated
+        // via schema evolution — by re-adding the partition-key column with a group tag — and the
+        // existing "Column already exists" check transitively prevents it. Partition keys
+        // themselves are fixed at table-create time and cannot be added or removed via
+        // TableChange today (M.6 §3.2 future-work note).
+        Schema initial =
+                Schema.newBuilder()
+                        .column("dt", DataTypes.STRING())
+                        .column("device_id", DataTypes.INT())
+                        .build();
+        assertThatThrownBy(
+                        () ->
+                                SchemaUpdate.applySchemaChanges(
+                                        initial,
+                                        Collections.singletonList(
+                                                TableChange.addColumn(
+                                                        "dt",
+                                                        DataTypes.STRING(),
+                                                        null,
+                                                        TableChange.ColumnPosition.last(),
+                                                        "enriched"))))
+                .isInstanceOf(InvalidAlterTableException.class)
+                .hasMessageContaining("already exists");
+    }
+
+    @Test
     void preservesPreExistingGroupsWhenAddingDefaultGroupColumn() {
         Schema initial =
                 Schema.newBuilder()
