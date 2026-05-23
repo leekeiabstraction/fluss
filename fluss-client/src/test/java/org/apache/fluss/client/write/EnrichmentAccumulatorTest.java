@@ -20,6 +20,7 @@ package org.apache.fluss.client.write;
 import org.apache.fluss.client.table.writer.AppendColumnsResult;
 import org.apache.fluss.memory.TestingMemorySegmentPool;
 import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.row.GenericRow;
 import org.apache.fluss.row.arrow.ArrowWriterPool;
 import org.apache.fluss.shaded.arrow.org.apache.arrow.memory.BufferAllocator;
@@ -64,9 +65,11 @@ public class EnrichmentAccumulatorTest {
         memorySegmentPool = new TestingMemorySegmentPool(BUFFER_BYTES);
         accumulator =
                 new EnrichmentAccumulator(
+                        TablePath.of("test_db", "test_table"),
                         writerPool,
                         allocator,
                         memorySegmentPool,
+                        /* batchSizeEstimator */ null,
                         new EnrichmentAccumulator.BatchEncoderInfo(
                                 GROUP_ROW_TYPE, SCHEMA_ID, DEFAULT_COMPRESSION),
                         BATCH_SIZE,

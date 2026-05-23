@@ -137,6 +137,7 @@ public final class EnrichmentWriteBatch {
             throw new IllegalStateException("Batch is already sealed");
         }
         sealed = true;
+        int observedSize = builder.estimatedSizeInBytes();
         if (entries.isEmpty()) {
             builder.close();
             memorySegmentPool.returnAll(bufferSegments);
@@ -147,7 +148,8 @@ public final class EnrichmentWriteBatch {
                     new long[0],
                     new ArrayList<>(),
                     null,
-                    new ArrayList<>());
+                    new ArrayList<>(),
+                    observedSize);
         }
         BytesView records;
         try {
@@ -167,7 +169,8 @@ public final class EnrichmentWriteBatch {
                 sourceOffsets,
                 futures,
                 memorySegmentPool,
-                new ArrayList<>(bufferSegments));
+                new ArrayList<>(bufferSegments),
+                observedSize);
     }
 
     /** Complete all pending per-row futures with the same outcome. */
@@ -195,6 +198,7 @@ public final class EnrichmentWriteBatch {
         public final BytesView records; // nullable when entries.isEmpty()
         public final long[] sourceOffsets;
         public final List<CompletableFuture<AppendColumnsResult>> futures;
+        public final int observedSizeInBytes;
         private final MemorySegmentPool memorySegmentPool;
         private final List<MemorySegment> pooledSegments;
 
@@ -204,13 +208,15 @@ public final class EnrichmentWriteBatch {
                 long[] sourceOffsets,
                 List<CompletableFuture<AppendColumnsResult>> futures,
                 MemorySegmentPool memorySegmentPool,
-                List<MemorySegment> pooledSegments) {
+                List<MemorySegment> pooledSegments,
+                int observedSizeInBytes) {
             this.key = key;
             this.records = records;
             this.sourceOffsets = sourceOffsets;
             this.futures = futures;
             this.memorySegmentPool = memorySegmentPool;
             this.pooledSegments = pooledSegments;
+            this.observedSizeInBytes = observedSizeInBytes;
         }
 
         public boolean isEmpty() {

@@ -21,6 +21,8 @@ import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.client.table.writer.AppendColumnsResult;
 import org.apache.fluss.compression.ArrowCompressionInfo;
 import org.apache.fluss.memory.MemorySegmentPool;
+import org.apache.fluss.metadata.PhysicalTablePath;
+import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.row.arrow.ArrowWriter;
 import org.apache.fluss.row.arrow.ArrowWriterPool;
@@ -28,6 +30,7 @@ import org.apache.fluss.shaded.arrow.org.apache.arrow.memory.BufferAllocator;
 import org.apache.fluss.types.RowType;
 import org.apache.fluss.utils.MapUtils;
 
+import javax.annotation.Nullable;
 import javax.annotation.concurrent.GuardedBy;
 
 import java.util.ArrayDeque;
@@ -74,6 +77,8 @@ public final class EnrichmentAccumulator {
     private final int batchSizeLimit;
     private final long lingerMs;
     private final int initialBufferBytes;
+    private final TablePath tablePath;
+    @Nullable private final DynamicWriteBatchSizeEstimator batchSizeEstimator;
 
     private volatile boolean closed;
 
@@ -81,24 +86,33 @@ public final class EnrichmentAccumulator {
     private boolean flushRequested;
 
     /**
+     * @param tablePath the logical table path this accumulator writes to; used as the estimator key
+     *     (per-partition keying is intentionally avoided to keep the accumulator unaware of
+     *     partition catalog state).
      * @param arrowWriterPool shared with the base-append writer for Arrow-encoder reuse.
      * @param bufferAllocator shared with the base-append writer.
      * @param memorySegmentPool shared with the base-append writer ({@code LazyMemorySegmentPool})
      *     so enrichment writes draw against the same bounded budget.
+     * @param batchSizeEstimator shared with the base-append writer; when non-null, batches use the
+     *     dynamically-adjusted size for this table. Pass null to disable.
      * @param encoderInfo per-(table, group) encoder details. The accumulator is scoped to one such
      *     pair; callers create one accumulator per group.
      */
     public EnrichmentAccumulator(
+            TablePath tablePath,
             ArrowWriterPool arrowWriterPool,
             BufferAllocator bufferAllocator,
             MemorySegmentPool memorySegmentPool,
+            @Nullable DynamicWriteBatchSizeEstimator batchSizeEstimator,
             BatchEncoderInfo encoderInfo,
             int batchSizeLimit,
             long lingerMs,
             int initialBufferBytes) {
+        this.tablePath = tablePath;
         this.arrowWriterPool = arrowWriterPool;
         this.bufferAllocator = bufferAllocator;
         this.memorySegmentPool = memorySegmentPool;
+        this.batchSizeEstimator = batchSizeEstimator;
         this.encoderInfo = encoderInfo;
         this.batchSizeLimit = batchSizeLimit;
         this.lingerMs = lingerMs;
@@ -152,18 +166,24 @@ public final class EnrichmentAccumulator {
                         initialBufferBytes,
                         encoderInfo.groupRowType,
                         encoderInfo.compression);
+        int sizeLimit =
+                batchSizeEstimator != null
+                        ? batchSizeEstimator.getEstimatedBatchSize(estimatorKey())
+                        : batchSizeLimit;
         try {
             return new EnrichmentWriteBatch(
-                    key,
-                    batchSizeLimit,
-                    nowMs,
-                    writer,
-                    memorySegmentPool,
-                    encoderInfo.writerSchemaId);
+                    key, sizeLimit, nowMs, writer, memorySegmentPool, encoderInfo.writerSchemaId);
         } catch (java.io.IOException e) {
             throw new RuntimeException(
                     "Failed to allocate a memory segment for enrichment batch on key " + key, e);
         }
+    }
+
+    private PhysicalTablePath estimatorKey() {
+        // Per-table (not per-partition) — enrichment accumulator is scoped per-(table, group) and
+        // the estimator's job is informational. Per-partition estimation would require partition
+        // catalog access that the accumulator doesn't have.
+        return PhysicalTablePath.of(tablePath);
     }
 
     /**
@@ -215,7 +235,12 @@ public final class EnrichmentAccumulator {
                         break;
                     }
                     queue.batches.pollFirst();
-                    sealed.add(first.sealAndBuild());
+                    EnrichmentWriteBatch.SealedBatch built = first.sealAndBuild();
+                    if (batchSizeEstimator != null && !built.isEmpty()) {
+                        batchSizeEstimator.updateEstimation(
+                                estimatorKey(), built.observedSizeInBytes);
+                    }
+                    sealed.add(built);
                 }
             } finally {
                 perKeyAppendLock.unlock();
