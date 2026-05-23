@@ -107,6 +107,12 @@ public final class EnrichmentWriteBatch {
     /**
      * Try to add a row. Returns the row's future on success, or null if the batch is full / sealed
      * and the caller should start a new batch.
+     *
+     * <p>"Full" is the disjunction of two signals: the cumulative estimated size has hit {@code
+     * batchSizeLimit}, OR the underlying {@link MemoryLogRecordsArrowBuilder#isFull()} (i.e. the
+     * Arrow writer's buffer fill) reports full. The Arrow check is critical because {@code
+     * arrowWriter.writeRow} throws when called past its write limit — the same fix that {@link
+     * ArrowLogWriteBatch} applies on the base-append path.
      */
     public synchronized CompletableFuture<AppendColumnsResult> tryAppend(
             long sourceOffset, InternalRow enrichmentRow) {
@@ -115,7 +121,8 @@ public final class EnrichmentWriteBatch {
         }
         // Accept the first row unconditionally so we always make progress even when one row
         // exceeds the batch size limit.
-        if (!entries.isEmpty() && builder.estimatedSizeInBytes() >= batchSizeLimit) {
+        if (!entries.isEmpty()
+                && (builder.estimatedSizeInBytes() >= batchSizeLimit || builder.isFull())) {
             return null;
         }
         try {
@@ -132,7 +139,8 @@ public final class EnrichmentWriteBatch {
 
     /** Returns true if the batch is at or above its size limit and should be drained. */
     public synchronized boolean isFull() {
-        return !entries.isEmpty() && builder.estimatedSizeInBytes() >= batchSizeLimit;
+        return !entries.isEmpty()
+                && (builder.estimatedSizeInBytes() >= batchSizeLimit || builder.isFull());
     }
 
     public synchronized boolean isSealed() {

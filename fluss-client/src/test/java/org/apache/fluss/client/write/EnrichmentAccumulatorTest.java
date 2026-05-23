@@ -32,6 +32,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
@@ -180,6 +181,72 @@ public class EnrichmentAccumulatorTest {
                 accumulator.append(key(0), 0, row("US", 0.1), 0L);
         assertThat(failed).isCompletedExceptionally();
         assertThatThrownBy(failed::get).hasMessageContaining("Accumulator is closed");
+    }
+
+    @Test
+    void manySmallRowsMergeIntoFewBatches() throws Exception {
+        // Phase N.5: prove the batching pipeline actually batches. 50 small rows whose total Arrow
+        // payload comfortably fits in BATCH_SIZE (4 KB) must NOT produce 50 separate RPCs.
+        EnrichmentBatchKey key = key(0);
+        long now = 5000L;
+        int rowCount = 50;
+        List<CompletableFuture<AppendColumnsResult>> futures = new ArrayList<>(rowCount);
+        for (int i = 0; i < rowCount; i++) {
+            futures.add(accumulator.append(key, i, row("US-" + i, 0.01 * i), now));
+        }
+        accumulator.flushAll();
+        Map<EnrichmentBatchKey, List<EnrichmentWriteBatch.SealedBatch>> drained =
+                accumulator.drainReady(now);
+
+        List<EnrichmentWriteBatch.SealedBatch> batches = drained.get(key);
+        assertThat(batches).isNotNull();
+
+        int totalRows = batches.stream().mapToInt(b -> b.sourceOffsets.length).sum();
+        assertThat(totalRows).isEqualTo(rowCount);
+        // Central claim of Phase N: many appendColumns calls produce FAR fewer batches than rows.
+        // Small string+double rows + 4 KB BATCH_SIZE should fit in 1–2 sealed batches.
+        assertThat(batches.size()).isLessThanOrEqualTo(2);
+
+        // Source offsets across the sealed batches must form a contiguous run from 0 (preserving
+        // the contiguous-from-EWM contract the server's appendColumnsAsLeader enforces).
+        long expectedNext = 0L;
+        for (EnrichmentWriteBatch.SealedBatch b : batches) {
+            for (long off : b.sourceOffsets) {
+                assertThat(off).isEqualTo(expectedNext);
+                expectedNext++;
+            }
+        }
+    }
+
+    @Test
+    void sizeBasedSealStartsNewBatch() throws Exception {
+        // Phase N.5: once a batch's Arrow size reaches BATCH_SIZE, the head batch must seal and a
+        // new one start. With BATCH_SIZE=4 KB and the test row width (~25 bytes encoded), 1000
+        // rows generate enough Arrow payload to require at least 2 sealed batches.
+        EnrichmentBatchKey key = key(0);
+        long now = 6000L;
+        int rowCount = 1000;
+        for (int i = 0; i < rowCount; i++) {
+            accumulator.append(key, i, row("R-" + i, (double) i), now);
+        }
+        accumulator.flushAll();
+        Map<EnrichmentBatchKey, List<EnrichmentWriteBatch.SealedBatch>> drained =
+                accumulator.drainReady(now);
+        List<EnrichmentWriteBatch.SealedBatch> batches = drained.get(key);
+        assertThat(batches).isNotNull();
+
+        int totalRows = batches.stream().mapToInt(b -> b.sourceOffsets.length).sum();
+        assertThat(totalRows).isEqualTo(rowCount);
+        // Multiple batches expected because the cumulative size exceeds BATCH_SIZE.
+        assertThat(batches.size()).isGreaterThan(1);
+        // But still WAY fewer than rowCount — we're batching, not single-RPC-per-row.
+        assertThat(batches.size()).isLessThan(rowCount / 10);
+
+        // Each sealed batch should be roughly at the size limit (allowing slack for Arrow's
+        // growth-then-trip-the-threshold pattern). The last batch may be smaller.
+        for (int i = 0; i < batches.size() - 1; i++) {
+            assertThat(batches.get(i).observedSizeInBytes).isGreaterThan(BATCH_SIZE / 2);
+        }
     }
 
     private static EnrichmentBatchKey key(int bucketId) {

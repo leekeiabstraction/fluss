@@ -362,12 +362,31 @@ N.4  Configuration: reuse base-writer settings       ✓ DONE (2026-05-23)
        enrichment workloads where latency matters
        (CEW gates downstream materialization). If
        this becomes painful, add an override later.
-N.5  Tests + benchmarks                              TBD
-     - Unit tests on accumulator semantics
-     - ITCase: enrichment-heavy workload throughput
-     - Verify Flink sink (Phase L/M) sees the
-       speedup via existing ITCases (no test code
-       changes, just performance)
+N.5  Batching efficiency tests                       ✓ DONE (2026-05-23)
+     - manySmallRowsMergeIntoFewBatches: 50 small
+       rows merge into ≤ 2 sealed batches. The
+       central claim of Phase N — many appendColumns
+       calls produce FAR fewer RPCs than rows —
+       is asserted directly.
+     - sizeBasedSealStartsNewBatch: 1000 rows of
+       larger payload force the head batch to seal
+       at the size limit and a new batch to start.
+       Verifies the size-based seal path with
+       contiguous source-offset assignment.
+     - Latent bug found and fixed:
+       EnrichmentWriteBatch.tryAppend was only
+       checking the cumulative-size threshold; it
+       missed the Arrow writer's INTERNAL write
+       limit (~95% of bufferSize). With production
+       defaults (batch-size=2 MB, buffer-page-size=
+       128 KB), the writer would fill at ~121 KB
+       and the next writeRow would throw. Fix is to
+       also check builder.isFull() — matches what
+       ArrowLogWriteBatch does on the base path.
+     - Skipped: a separate JMH benchmark — the
+       e2e ITCase plus these unit tests are the
+       regression guard; JMH would add maintenance
+       cost without proportional ROI.
 ```
 
 N.2 + N.3 are the bulk of the work and are tightly coupled. N.4 is
