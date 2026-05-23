@@ -42,18 +42,21 @@ public class EnrichmentSink extends SinkAdapter<RowData> {
     private final long tableId;
     private final String groupName;
     private final RowType enrichmentValueRowType;
+    private final boolean partitioned;
 
     public EnrichmentSink(
             TablePath tablePath,
             Configuration flussConfig,
             long tableId,
             String groupName,
-            RowType enrichmentValueRowType) {
+            RowType enrichmentValueRowType,
+            boolean partitioned) {
         this.tablePath = tablePath;
         this.flussConfig = flussConfig;
         this.tableId = tableId;
         this.groupName = groupName;
         this.enrichmentValueRowType = enrichmentValueRowType;
+        this.partitioned = partitioned;
     }
 
     @Override
@@ -61,7 +64,12 @@ public class EnrichmentSink extends SinkAdapter<RowData> {
             MailboxExecutor mailboxExecutor, SinkWriterMetricGroup metricGroup) {
         EnrichmentSinkWriter writer =
                 new EnrichmentSinkWriter(
-                        tablePath, flussConfig, tableId, groupName, enrichmentValueRowType);
+                        tablePath,
+                        flussConfig,
+                        tableId,
+                        groupName,
+                        enrichmentValueRowType,
+                        partitioned);
         writer.initialize();
         return writer;
     }

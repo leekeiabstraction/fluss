@@ -369,6 +369,104 @@ abstract class FlinkTableSourceITCase extends AbstractTestBase {
     }
 
     @Test
+    void testEnrichmentSinkPartitionedTarget() throws Exception {
+        // Phase M.5: end-to-end enrichment writes against a partitioned column-group target.
+        // Sink row layout grows by one leading STRING column (partition name). The writer
+        // resolves partition name → partition ID via cached Admin lookup.
+        tEnv.executeSql(
+                "create table cg_m5_base ("
+                        + "  dt string, device_id int, payload string,"
+                        + "  geo_region string, risk_score double,"
+                        + "  _partition string metadata from 'partition' virtual,"
+                        + "  _bucket bigint metadata from 'bucket' virtual,"
+                        + "  _offset bigint metadata from 'offset' virtual"
+                        + ") partitioned by (dt) with ("
+                        + " 'column-groups.enriched' = 'geo_region, risk_score',"
+                        + " 'bucket.key' = 'device_id', 'bucket.num' = '1')");
+        TablePath basePath = TablePath.of(DEFAULT_DB, "cg_m5_base");
+        long tableId = admin.getTableInfo(basePath).get().getTableId();
+
+        tEnv.executeSql("alter table cg_m5_base add partition (dt='2025-02-01')");
+        tEnv.executeSql("alter table cg_m5_base add partition (dt='2025-02-02')");
+
+        // Write 2 base rows into each partition via the Java client.
+        try (Table table = conn.getTable(basePath)) {
+            AppendWriter writer = table.newAppend().createWriter();
+            for (int i = 0; i < 2; i++) {
+                writer.append(row("2025-02-01", i, "p" + i, null, null)).get();
+            }
+            for (int i = 0; i < 2; i++) {
+                writer.append(row("2025-02-02", i, "q" + i, null, null)).get();
+            }
+            writer.flush();
+        }
+
+        // Declare a partitioned write-only enrichment table: leading STRING for partition.
+        tEnv.executeSql(
+                "create table cg_m5_writes ("
+                        + "  src_partition string, src_bucket bigint, src_offset bigint,"
+                        + "  geo_region string, risk_score double"
+                        + ") with ('enrichment.target' = 'cg_m5_base',"
+                        + " 'enrichment.group' = 'enriched')");
+
+        org.apache.flink.table.api.TableResult insertResult =
+                tEnv.executeSql(
+                        "insert into cg_m5_writes "
+                                + "select _partition, _bucket, _offset,"
+                                + "       _partition || '/' || cast(device_id as string),"
+                                + "       cast(device_id as double) / 10.0 "
+                                + "from cg_m5_base");
+
+        try {
+            // Wait for CEW=2 on each partition's bucket.
+            long partitionId1 = lookupPartitionId(basePath, "2025-02-01");
+            long partitionId2 = lookupPartitionId(basePath, "2025-02-02");
+            TableBucket bucket1 = new TableBucket(tableId, partitionId1, 0);
+            TableBucket bucket2 = new TableBucket(tableId, partitionId2, 0);
+            retry(
+                    java.time.Duration.ofMinutes(1),
+                    () -> {
+                        assertThat(
+                                        FLUSS_CLUSTER_EXTENSION
+                                                .waitAndGetLeaderReplica(bucket1)
+                                                .getLogTablet()
+                                                .getCommittedEnrichmentWatermark("enriched"))
+                                .isEqualTo(2L);
+                        assertThat(
+                                        FLUSS_CLUSTER_EXTENSION
+                                                .waitAndGetLeaderReplica(bucket2)
+                                                .getLogTablet()
+                                                .getCommittedEnrichmentWatermark("enriched"))
+                                .isEqualTo(2L);
+                    });
+        } finally {
+            insertResult.getJobClient().ifPresent(jc -> jc.cancel());
+        }
+
+        // Verify enrichment values present across both partitions via SQL read.
+        List<String> expected =
+                Arrays.asList(
+                        "+I[2025-02-01, 0, 2025-02-01/0, 0.0]",
+                        "+I[2025-02-01, 1, 2025-02-01/1, 0.1]",
+                        "+I[2025-02-02, 0, 2025-02-02/0, 0.0]",
+                        "+I[2025-02-02, 1, 2025-02-02/1, 0.1]");
+        try (org.apache.flink.util.CloseableIterator<Row> iter =
+                tEnv.executeSql("select dt, device_id, geo_region, risk_score from cg_m5_base")
+                        .collect()) {
+            assertResultsIgnoreOrder(iter, expected, true);
+        }
+    }
+
+    private long lookupPartitionId(TablePath path, String partitionName) throws Exception {
+        for (org.apache.fluss.metadata.PartitionInfo info : admin.listPartitionInfos(path).get()) {
+            if (info.getPartitionName().equals(partitionName)) {
+                return info.getPartitionId();
+            }
+        }
+        throw new IllegalStateException("Partition '" + partitionName + "' not found on " + path);
+    }
+
+    @Test
     void testPartitionedColumnGroupTableMetadataColumns() throws Exception {
         // Phase M.4: bucket/offset/partition METADATA columns on a partitioned column-group
         // table. Source-side splice reads the partition name from the LogSplit (no per-record

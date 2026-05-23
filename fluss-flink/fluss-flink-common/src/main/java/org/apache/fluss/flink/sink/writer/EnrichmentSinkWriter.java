@@ -19,13 +19,16 @@ package org.apache.fluss.flink.sink.writer;
 
 import org.apache.fluss.client.Connection;
 import org.apache.fluss.client.ConnectionFactory;
+import org.apache.fluss.client.admin.Admin;
 import org.apache.fluss.client.table.Table;
 import org.apache.fluss.client.table.writer.AppendWriter;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.flink.utils.FlinkRowToFlussRowConverter;
+import org.apache.fluss.metadata.PartitionInfo;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.row.InternalRow;
+import org.apache.fluss.utils.MapUtils;
 
 import org.apache.flink.api.connector.sink2.SinkWriter;
 import org.apache.flink.table.data.RowData;
@@ -35,17 +38,20 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 
 /**
- * Phase L.3: Flink Sink V2 writer that translates {@code (src_bucket, src_offset,
- * <enrichment-values...>)} rows into {@link AppendWriter#appendColumns} calls on the target
- * column-group table.
+ * Phase L.3 / M.5: Flink Sink V2 writer that translates {@code (src_bucket, src_offset,
+ * <enrichment-values...>)} (non-partitioned target) or {@code (src_partition, src_bucket,
+ * src_offset, <enrichment-values...>)} (partitioned target) rows into {@link
+ * AppendWriter#appendColumns} calls on the target column-group table.
  *
- * <p>The sink-side row schema is fixed: positions {@code 0} and {@code 1} carry the {@code BIGINT}
- * bucket and offset respectively; positions {@code 2..N-1} carry the enrichment group's columns in
- * declared order. Plan-time validation in {@link org.apache.fluss.flink.sink.EnrichmentTableSink}
- * ensures the sink schema matches the target group before this writer ever runs.
+ * <p>When the target table is partitioned, the leading column carries the partition name as a
+ * {@code STRING}; the writer resolves the name to the internal partition ID via a cached {@link
+ * Admin#listPartitionInfos} lookup. Plan-time validation in {@link
+ * org.apache.fluss.flink.sink.EnrichmentTableSink} ensures the sink row layout matches the target's
+ * partitioning + group shape before this writer ever runs.
  */
 public class EnrichmentSinkWriter implements SinkWriter<RowData> {
 
@@ -56,12 +62,15 @@ public class EnrichmentSinkWriter implements SinkWriter<RowData> {
     private final long tableId;
     private final String groupName;
     private final RowType enrichmentValueRowType;
+    private final boolean partitioned;
 
     private transient Connection connection;
+    private transient Admin admin;
     private transient Table table;
     private transient AppendWriter appendWriter;
     private transient FlinkRowToFlussRowConverter valuesConverter;
     private transient ProjectedRowData valuesView;
+    private transient Map<String, Long> partitionIdCache;
 
     private volatile Throwable asyncError;
 
@@ -70,12 +79,14 @@ public class EnrichmentSinkWriter implements SinkWriter<RowData> {
             Configuration flussConfig,
             long tableId,
             String groupName,
-            RowType enrichmentValueRowType) {
+            RowType enrichmentValueRowType,
+            boolean partitioned) {
         this.tablePath = tablePath;
         this.flussConfig = flussConfig;
         this.tableId = tableId;
         this.groupName = groupName;
         this.enrichmentValueRowType = enrichmentValueRowType;
+        this.partitioned = partitioned;
     }
 
     public void initialize() {
@@ -83,28 +94,50 @@ public class EnrichmentSinkWriter implements SinkWriter<RowData> {
         table = connection.getTable(tablePath);
         appendWriter = table.newAppend().createWriter();
         valuesConverter = FlinkRowToFlussRowConverter.create(enrichmentValueRowType);
-        // Sink-side row layout: [src_bucket BIGINT, src_offset BIGINT, <values...>].
-        int totalFields = enrichmentValueRowType.getFieldCount() + 2;
+
+        // Sink-side row layout:
+        //   non-partitioned: [src_bucket BIGINT, src_offset BIGINT, <values...>]
+        //   partitioned:     [src_partition STRING, src_bucket BIGINT, src_offset BIGINT,
+        //                     <values...>]
+        int addressingArity = partitioned ? 3 : 2;
         int[] valuesProjection = new int[enrichmentValueRowType.getFieldCount()];
         for (int i = 0; i < valuesProjection.length; i++) {
-            valuesProjection[i] = i + 2;
+            valuesProjection[i] = i + addressingArity;
         }
         valuesView = ProjectedRowData.from(valuesProjection);
+
+        if (partitioned) {
+            admin = connection.getAdmin();
+            partitionIdCache = MapUtils.newConcurrentHashMap();
+        }
+
         LOG.info(
-                "Opened enrichment sink writer for table {} group '{}' (tableId={}, fields={}).",
+                "Opened enrichment sink writer for table {} group '{}' "
+                        + "(tableId={}, partitioned={}, addressingArity={}).",
                 tablePath,
                 groupName,
                 tableId,
-                totalFields);
+                partitioned,
+                addressingArity);
     }
 
     @Override
     public void write(RowData row, Context context) throws IOException {
         rethrowIfAsyncError();
-        int bucketId = (int) row.getLong(0);
-        long sourceOffset = row.getLong(1);
+        TableBucket bucket;
+        long sourceOffset;
+        if (partitioned) {
+            String partitionName = row.getString(0).toString();
+            int bucketId = (int) row.getLong(1);
+            sourceOffset = row.getLong(2);
+            long partitionId = resolvePartitionId(partitionName);
+            bucket = new TableBucket(tableId, partitionId, bucketId);
+        } else {
+            int bucketId = (int) row.getLong(0);
+            sourceOffset = row.getLong(1);
+            bucket = new TableBucket(tableId, bucketId);
+        }
         InternalRow valuesRow = valuesConverter.toInternalRow(valuesView.replaceRow(row));
-        TableBucket bucket = new TableBucket(tableId, bucketId);
         CompletableFuture<?> future =
                 appendWriter.appendColumns(groupName, bucket, sourceOffset, valuesRow);
         future.whenComplete(
@@ -113,6 +146,42 @@ public class EnrichmentSinkWriter implements SinkWriter<RowData> {
                         asyncError = throwable;
                     }
                 });
+    }
+
+    /**
+     * Resolves a partition name to its internal numeric ID. Misses fall back to a fresh {@link
+     * Admin#listPartitionInfos} call; if the name still doesn't resolve the partition doesn't exist
+     * (or was dropped between scan and write).
+     */
+    private long resolvePartitionId(String partitionName) throws IOException {
+        Long cached = partitionIdCache.get(partitionName);
+        if (cached != null) {
+            return cached;
+        }
+        try {
+            for (PartitionInfo info : admin.listPartitionInfos(tablePath).get()) {
+                partitionIdCache.put(info.getPartitionName(), info.getPartitionId());
+            }
+        } catch (Exception e) {
+            throw new IOException(
+                    "Failed to list partitions of enrichment target "
+                            + tablePath
+                            + " while resolving partition '"
+                            + partitionName
+                            + "': "
+                            + e.getMessage(),
+                    e);
+        }
+        cached = partitionIdCache.get(partitionName);
+        if (cached == null) {
+            throw new IOException(
+                    "Partition '"
+                            + partitionName
+                            + "' does not exist on enrichment target "
+                            + tablePath
+                            + ". The partition may have been dropped or never created.");
+        }
+        return cached;
     }
 
     @Override
@@ -125,6 +194,15 @@ public class EnrichmentSinkWriter implements SinkWriter<RowData> {
 
     @Override
     public void close() throws Exception {
+        try {
+            if (admin != null) {
+                admin.close();
+            }
+        } catch (Exception e) {
+            LOG.warn("Exception closing Fluss Admin for enrichment sink.", e);
+        } finally {
+            admin = null;
+        }
         try {
             if (table != null) {
                 table.close();

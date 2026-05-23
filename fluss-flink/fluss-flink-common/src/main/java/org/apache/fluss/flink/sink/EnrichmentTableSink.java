@@ -85,7 +85,8 @@ public class EnrichmentTableSink implements DynamicTableSink {
                         flussConfig,
                         resolved.tableId,
                         groupName,
-                        resolved.enrichmentValueRowType);
+                        resolved.enrichmentValueRowType,
+                        resolved.partitioned);
         return new DataStreamSinkProvider() {
             @Override
             public DataStreamSink<?> consumeDataStream(
@@ -151,26 +152,36 @@ public class EnrichmentTableSink implements DynamicTableSink {
                             + groups.keySet());
         }
 
-        validateSinkLayout(targetSchema, groupIndexes);
+        boolean partitioned = !targetInfo.getPartitionKeys().isEmpty();
+        int addressingArity = partitioned ? 3 : 2;
+        validateSinkLayout(targetSchema, groupIndexes, partitioned, addressingArity);
 
-        // Build value-only Flink RowType from the sink row's trailing fields (positions 2..N-1).
+        // Build value-only Flink RowType from the sink row's trailing fields.
         List<RowType.RowField> sinkFields = sinkRowType.getFields();
-        List<RowType.RowField> valueFields = sinkFields.subList(2, sinkFields.size());
+        List<RowType.RowField> valueFields = sinkFields.subList(addressingArity, sinkFields.size());
         RowType valueRowType = new RowType(false, valueFields);
-        return new ResolvedTarget(targetInfo.getTableId(), valueRowType);
+        return new ResolvedTarget(targetInfo.getTableId(), valueRowType, partitioned);
     }
 
-    private void validateSinkLayout(Schema targetSchema, List<Integer> groupIndexes) {
+    private void validateSinkLayout(
+            Schema targetSchema,
+            List<Integer> groupIndexes,
+            boolean partitioned,
+            int addressingArity) {
         List<RowType.RowField> sinkFields = sinkRowType.getFields();
-        if (sinkFields.size() != groupIndexes.size() + 2) {
+        if (sinkFields.size() != groupIndexes.size() + addressingArity) {
             throw new ValidationException(
                     "Enrichment sink "
                             + sinkTablePath
                             + " expects "
-                            + (groupIndexes.size() + 2)
-                            + " columns (2 addressing + "
+                            + (groupIndexes.size() + addressingArity)
+                            + " columns ("
+                            + addressingArity
+                            + " addressing + "
                             + groupIndexes.size()
-                            + " enrichment) for target group '"
+                            + " enrichment) for "
+                            + (partitioned ? "partitioned " : "")
+                            + "target group '"
                             + groupName
                             + "' on "
                             + targetTablePath
@@ -179,22 +190,28 @@ public class EnrichmentTableSink implements DynamicTableSink {
                             + ".");
         }
 
-        // Leading two fields must be BIGINT (src_bucket, src_offset).
-        for (int i = 0; i < 2; i++) {
-            LogicalType t = sinkFields.get(i).getType();
-            if (t.getTypeRoot() != LogicalTypeRoot.BIGINT) {
+        if (partitioned) {
+            // Leading column must be STRING (src_partition).
+            LogicalType partitionType = sinkFields.get(0).getType();
+            if (partitionType.getTypeRoot() != LogicalTypeRoot.VARCHAR
+                    && partitionType.getTypeRoot() != LogicalTypeRoot.CHAR) {
                 throw new ValidationException(
                         "Enrichment sink "
                                 + sinkTablePath
-                                + " column at position "
-                                + i
-                                + " ('"
-                                + sinkFields.get(i).getName()
-                                + "') must be BIGINT (positions 0 and 1 carry the bucket and "
-                                + "offset respectively); got "
-                                + t.asSummaryString());
+                                + " column at position 0 ('"
+                                + sinkFields.get(0).getName()
+                                + "') must be STRING (partition name) for partitioned target "
+                                + targetTablePath
+                                + "; got "
+                                + partitionType.asSummaryString());
             }
         }
+
+        // Next two fields must be BIGINT (src_bucket, src_offset).
+        int bucketPos = partitioned ? 1 : 0;
+        int offsetPos = partitioned ? 2 : 1;
+        checkBigInt(sinkFields, bucketPos, "bucket");
+        checkBigInt(sinkFields, offsetPos, "offset");
 
         // Trailing fields must match the target group's column types in order, by Flink-mapped
         // type — names are user-chosen and not required to match.
@@ -202,7 +219,7 @@ public class EnrichmentTableSink implements DynamicTableSink {
         for (int i = 0; i < groupIndexes.size(); i++) {
             int targetIdx = groupIndexes.get(i);
             Schema.Column targetCol = targetColumns.get(targetIdx);
-            RowType.RowField sinkField = sinkFields.get(i + 2);
+            RowType.RowField sinkField = sinkFields.get(i + addressingArity);
             LogicalType expected =
                     FlinkConversions.toFlinkType(targetCol.getDataType()).getLogicalType();
             if (!sameType(sinkField.getType(), expected)) {
@@ -210,7 +227,7 @@ public class EnrichmentTableSink implements DynamicTableSink {
                         "Enrichment sink "
                                 + sinkTablePath
                                 + " column at position "
-                                + (i + 2)
+                                + (i + addressingArity)
                                 + " ('"
                                 + sinkField.getName()
                                 + "', "
@@ -223,6 +240,23 @@ public class EnrichmentTableSink implements DynamicTableSink {
                                 + expected.asSummaryString()
                                 + ").");
             }
+        }
+    }
+
+    private void checkBigInt(List<RowType.RowField> sinkFields, int pos, String role) {
+        LogicalType t = sinkFields.get(pos).getType();
+        if (t.getTypeRoot() != LogicalTypeRoot.BIGINT) {
+            throw new ValidationException(
+                    "Enrichment sink "
+                            + sinkTablePath
+                            + " column at position "
+                            + pos
+                            + " ('"
+                            + sinkFields.get(pos).getName()
+                            + "') must be BIGINT ("
+                            + role
+                            + " addressing primitive); got "
+                            + t.asSummaryString());
         }
     }
 
@@ -243,10 +277,12 @@ public class EnrichmentTableSink implements DynamicTableSink {
     private static final class ResolvedTarget {
         final long tableId;
         final RowType enrichmentValueRowType;
+        final boolean partitioned;
 
-        ResolvedTarget(long tableId, RowType enrichmentValueRowType) {
+        ResolvedTarget(long tableId, RowType enrichmentValueRowType, boolean partitioned) {
             this.tableId = tableId;
             this.enrichmentValueRowType = enrichmentValueRowType;
+            this.partitioned = partitioned;
         }
     }
 }
