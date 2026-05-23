@@ -30,9 +30,11 @@ import org.apache.fluss.exception.FlussRuntimeException;
 import org.apache.fluss.exception.IllegalConfigurationException;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.TableInfo;
+import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.rpc.gateway.TabletServerGateway;
 import org.apache.fluss.rpc.metrics.ClientMetricGroup;
 import org.apache.fluss.utils.CopyOnWriteMap;
+import org.apache.fluss.utils.MapUtils;
 import org.apache.fluss.utils.clock.SystemClock;
 import org.apache.fluss.utils.concurrent.ExecutorThreadFactory;
 
@@ -83,6 +85,8 @@ public class WriterClient {
     private final ExecutorService ioThreadPool;
     private final MetadataUpdater metadataUpdater;
     private final Map<PhysicalTablePath, BucketAssigner> bucketAssignerMap = new CopyOnWriteMap<>();
+    private final Map<TablePath, EnrichmentRouter> enrichmentRouters =
+            MapUtils.newConcurrentHashMap();
     private final IdempotenceManager idempotenceManager;
     private final WriterMetricGroup writerMetricGroup;
     private final DynamicPartitionCreator dynamicPartitionCreator;
@@ -146,6 +150,50 @@ public class WriterClient {
      */
     public MetadataUpdater getMetadataUpdater() {
         return metadataUpdater;
+    }
+
+    /**
+     * Phase N.3: build an {@link EnrichmentAccumulator} that shares this writer's bounded memory
+     * pool, Arrow encoder pool, buffer allocator, and dynamic batch-size estimator.
+     *
+     * <p>Phase N.4: batch sizing and linger derive from the same writer config used by base appends
+     * ({@link ConfigOptions#CLIENT_WRITER_BATCH_SIZE}, {@link
+     * ConfigOptions#CLIENT_WRITER_BATCH_TIMEOUT}, {@link
+     * ConfigOptions#CLIENT_WRITER_BUFFER_PAGE_SIZE}). The enrichment path shares the underlying
+     * pools with base appends, so it shares their tuning too.
+     */
+    public EnrichmentAccumulator newEnrichmentAccumulator(
+            TablePath tablePath, EnrichmentAccumulator.BatchEncoderInfo encoderInfo) {
+        int batchSizeLimit =
+                Math.toIntExact(
+                        Math.min(
+                                conf.get(ConfigOptions.CLIENT_WRITER_BATCH_SIZE).getBytes(),
+                                Integer.MAX_VALUE));
+        long lingerMs = conf.get(ConfigOptions.CLIENT_WRITER_BATCH_TIMEOUT).toMillis();
+        int initialBufferBytes =
+                Math.toIntExact(
+                        Math.min(
+                                conf.get(ConfigOptions.CLIENT_WRITER_BUFFER_PAGE_SIZE).getBytes(),
+                                Integer.MAX_VALUE));
+        return new EnrichmentAccumulator(
+                tablePath,
+                accumulator.getArrowWriterPool(),
+                accumulator.getBufferAllocator(),
+                accumulator.getWriterBufferPool(),
+                accumulator.getBatchSizeEstimator(),
+                encoderInfo,
+                batchSizeLimit,
+                lingerMs,
+                initialBufferBytes);
+    }
+
+    /**
+     * Phase N.3a: get-or-create the per-(tablePath) enrichment routing context. The router owns a
+     * single daemon {@link EnrichmentSender} that drains all the table's per-group accumulators.
+     */
+    public EnrichmentRouter getOrCreateEnrichmentRouter(TablePath tablePath) {
+        return enrichmentRouters.computeIfAbsent(
+                tablePath, tp -> new EnrichmentRouter(tp, this, metadataUpdater));
     }
 
     /**
@@ -321,6 +369,17 @@ public class WriterClient {
         LOG.info("Closing writer.");
 
         writerMetricGroup.close();
+
+        // Drain and stop enrichment senders BEFORE the base sender so any sender-thread leader
+        // lookups still see the live MetadataUpdater.
+        for (EnrichmentRouter router : enrichmentRouters.values()) {
+            try {
+                router.close(timeout);
+            } catch (Exception e) {
+                LOG.warn("Failed to close enrichment router for {}", router.getTablePath(), e);
+            }
+        }
+        enrichmentRouters.clear();
 
         if (sender != null) {
             sender.initiateClose();

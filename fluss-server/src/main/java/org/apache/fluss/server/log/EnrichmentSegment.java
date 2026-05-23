@@ -18,6 +18,7 @@
 package org.apache.fluss.server.log;
 
 import org.apache.fluss.record.FileLogRecords;
+import org.apache.fluss.record.LogRecordBatch;
 import org.apache.fluss.record.MemoryLogRecords;
 import org.apache.fluss.utils.FlussPaths;
 
@@ -91,14 +92,20 @@ final class EnrichmentSegment implements Closeable {
     }
 
     /**
-     * Append a batch of records covering the given source offsets (one entry per offset, all mapped
-     * to the same file position — the start of this batch). The {@code OffsetIndex} enforces strict
+     * Append records covering the given source offsets. The wire format may carry either one Arrow
+     * batch per source offset (option-a, concatenated single-row batches) or one Arrow batch with N
+     * rows (option-b, multi-row batches) — both produce dense per-row index entries where rows in
+     * the same batch share the batch's file position. {@link OffsetIndex} enforces strict
      * monotonicity across consecutive {@code append} calls.
      *
-     * @return the byte position at which the batch was written
+     * <p>For multi-row batches, {@link #lookupBatch} recovers the intra-batch row index by walking
+     * backward in the index while {@code position} stays equal. The merger then advances the batch
+     * iterator to that row when extracting an enrichment value.
+     *
+     * @return the byte position at which the first batch was written
      */
     int append(MemoryLogRecords records, long[] sourceOffsets) throws IOException {
-        int position = fileLogRecords.sizeInBytes();
+        int basePosition = fileLogRecords.sizeInBytes();
         int written = fileLogRecords.append(records);
         if (written == 0 && records.sizeInBytes() > 0) {
             throw new IOException(
@@ -107,16 +114,42 @@ final class EnrichmentSegment implements Closeable {
                             + " bytes pending) in enrichment segment "
                             + fileLogRecords.file().getAbsolutePath());
         }
-        for (long sourceOffset : sourceOffsets) {
-            offsetIndex.append(sourceOffset, position);
+        int rowIdx = 0;
+        int relativeOffset = 0;
+        for (LogRecordBatch batch : records.batches()) {
+            int batchPosition = basePosition + relativeOffset;
+            int recordCount = batch.getRecordCount();
+            for (int i = 0; i < recordCount; i++) {
+                if (rowIdx >= sourceOffsets.length) {
+                    throw new IOException(
+                            "Enrichment records contain more rows than sourceOffsets ("
+                                    + sourceOffsets.length
+                                    + ") for group "
+                                    + groupName);
+                }
+                offsetIndex.append(sourceOffsets[rowIdx], batchPosition);
+                rowIdx++;
+            }
+            relativeOffset += batch.sizeInBytes();
         }
-        return position;
+        if (rowIdx != sourceOffsets.length) {
+            throw new IOException(
+                    "Enrichment records contain "
+                            + rowIdx
+                            + " total rows but sourceOffsets has "
+                            + sourceOffsets.length
+                            + " entries for group "
+                            + groupName);
+        }
+        return basePosition;
     }
 
     /**
      * Look up the file position of the batch containing the given source offset. Returns null if
      * the segment has no entry for it. Caller is responsible for verifying the offset matches —
-     * {@code OffsetPosition.getOffset()} will equal {@code sourceOffset} on a hit.
+     * {@code OffsetPosition.getOffset()} will equal {@code sourceOffset} on a hit. The position
+     * points at the START of the containing batch; for multi-row batches use {@link #lookupBatch}
+     * to recover the intra-batch row index.
      */
     OffsetPosition lookup(long sourceOffset) {
         if (offsetIndex.entries() == 0) {
@@ -126,6 +159,48 @@ final class EnrichmentSegment implements Closeable {
         return pos.getOffset() == sourceOffset ? pos : null;
     }
 
+    /**
+     * Look up the file position AND intra-batch row index of the given source offset. The
+     * intra-batch index is recovered by walking backward in {@link OffsetIndex} while {@code
+     * position} stays equal — rows in the same Arrow batch all share the batch's file position (see
+     * {@link #append}). Returns null if the offset is not indexed.
+     *
+     * <p>Cost: O(intraIndex) entry reads from the mmap'd index. For batches with many rows accessed
+     * in sequential order, this is proportional to the position within the batch.
+     */
+    BatchSlot lookupBatch(long sourceOffset) {
+        if (offsetIndex.entries() == 0) {
+            return null;
+        }
+        OffsetPosition pos = offsetIndex.lookup(sourceOffset);
+        if (pos.getOffset() != sourceOffset) {
+            return null;
+        }
+        int slot = Math.toIntExact(sourceOffset);
+        int position = pos.getPosition();
+        int intraIndex = 0;
+        while (slot > 0) {
+            OffsetPosition prev = offsetIndex.entry(slot - 1);
+            if (prev.getPosition() != position) {
+                break;
+            }
+            intraIndex++;
+            slot--;
+        }
+        return new BatchSlot(position, intraIndex);
+    }
+
+    /** Position + intra-batch row index pair returned by {@link #lookupBatch}. */
+    static final class BatchSlot {
+        final int position;
+        final int intraIndex;
+
+        BatchSlot(int position, int intraIndex) {
+            this.position = position;
+            this.intraIndex = intraIndex;
+        }
+    }
+
     /** Read access to the underlying records (used by merge-on-read in Phase D). */
     FileLogRecords records() {
         return fileLogRecords;
@@ -133,13 +208,17 @@ final class EnrichmentSegment implements Closeable {
 
     /**
      * Return the enrichment entries in the half-open interval {@code [fromInclusive, toExclusive)},
-     * subject to {@code maxBytes} on the underlying file slice (always returns at least one entry
+     * subject to {@code maxBytes} on the underlying file slice (always returns at least one batch
      * if the from-bound is in range, to guarantee forward progress under tiny budgets).
      *
-     * <p>Used by E.3b to ship enrichment to followers in fetch responses. Under the Phase C
-     * dense-index invariant (one entry per source offset, contiguous from 0, baseOffset=0), the
-     * slot in {@link OffsetIndex} for offset {@code N} is just {@code (int) N}, so the lookups here
-     * are O(1) array accesses.
+     * <p>Used by E.3b to ship enrichment to followers in fetch responses. Under the dense-index
+     * invariant (one entry per source offset, contiguous from 0, baseOffset=0), the slot in {@link
+     * OffsetIndex} for offset {@code N} is just {@code (int) N}, so the lookups here are O(1) array
+     * accesses. Rows in the same Arrow batch share the batch's file position, so the slice is
+     * rounded to whole-batch boundaries: if {@code fromInclusive} or {@code toExclusive} falls
+     * mid-batch, the slice includes the full containing batch(es). Followers always start fetches
+     * at their EWM, which aligns with a batch boundary by construction (EWM advances by {@code
+     * batch.recordCount} on apply), so the rounding is a defensive no-op in practice.
      *
      * @return an {@link EnrichmentReadResult} carrying the file-backed records slice (zero-copy)
      *     and the parallel array of source offsets it covers; or {@link EnrichmentReadResult#EMPTY}
@@ -166,45 +245,48 @@ final class EnrichmentSegment implements Closeable {
             return EnrichmentReadResult.EMPTY;
         }
 
-        int startPos = offsetIndex.entry(fromSlot).getPosition();
-        int endPos = positionForEndSlot(toSlot, totalEntries);
+        // Round fromSlot DOWN to its batch's start (defensive: callers should already be at a
+        // batch boundary).
+        int fromBatchPosition = offsetIndex.entry(fromSlot).getPosition();
+        int batchStartSlot = fromSlot;
+        while (batchStartSlot > 0
+                && offsetIndex.entry(batchStartSlot - 1).getPosition() == fromBatchPosition) {
+            batchStartSlot--;
+        }
+        int startPos = fromBatchPosition;
 
-        // Greedy trim to maxBytes: always include at least one entry so callers make progress
-        // even when a single batch is larger than the budget.
-        int includedEndSlot;
-        if (endPos - startPos <= maxBytes) {
-            includedEndSlot = toSlot;
-        } else {
-            includedEndSlot = fromSlot + 1;
-            for (int k = fromSlot + 2; k <= toSlot; k++) {
-                int kEnd = positionForEndSlot(k, totalEntries);
-                if (kEnd - startPos > maxBytes) {
-                    break;
-                }
-                includedEndSlot = k;
+        // Walk batches forward. Include each in turn while we haven't hit toSlot and budget
+        // allows; always include the first batch even if it busts the budget (forward progress).
+        int includedEndSlot = batchStartSlot;
+        int currentPos = startPos;
+        boolean isFirstBatch = true;
+        while (includedEndSlot < totalEntries && includedEndSlot < toSlot) {
+            int batchEndSlot = includedEndSlot + 1;
+            while (batchEndSlot < totalEntries
+                    && offsetIndex.entry(batchEndSlot).getPosition() == currentPos) {
+                batchEndSlot++;
             }
-            endPos = positionForEndSlot(includedEndSlot, totalEntries);
+            int nextBatchPos =
+                    batchEndSlot < totalEntries
+                            ? offsetIndex.entry(batchEndSlot).getPosition()
+                            : fileLogRecords.sizeInBytes();
+            if (!isFirstBatch && nextBatchPos - startPos > maxBytes) {
+                break;
+            }
+            includedEndSlot = batchEndSlot;
+            currentPos = nextBatchPos;
+            isFirstBatch = false;
         }
 
+        int endPos = currentPos;
         int sliceSize = endPos - startPos;
         FileLogRecords slice = fileLogRecords.slice(startPos, sliceSize);
-        int count = includedEndSlot - fromSlot;
+        int count = includedEndSlot - batchStartSlot;
         long[] sourceOffsets = new long[count];
         for (int i = 0; i < count; i++) {
-            sourceOffsets[i] = fromInclusive + i;
+            sourceOffsets[i] = batchStartSlot + i;
         }
         return new EnrichmentReadResult(slice, sourceOffsets);
-    }
-
-    /**
-     * File position immediately past the last byte of the entry at {@code slot - 1}. When {@code
-     * slot} is past the last index entry, that's the file's current end.
-     */
-    private int positionForEndSlot(int slot, int totalEntries) {
-        if (slot >= totalEntries) {
-            return fileLogRecords.sizeInBytes();
-        }
-        return offsetIndex.entry(slot).getPosition();
     }
 
     /**

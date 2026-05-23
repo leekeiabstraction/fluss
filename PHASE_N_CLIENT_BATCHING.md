@@ -288,18 +288,80 @@ N.2  EnrichmentWriteBatch + EnrichmentAccumulator    TBD
      (skeleton, no networking, unit tests)
      - append/drain/ready/flushAll/close
      - Unit tests for batch full / linger / drain
-N.3  EnrichmentSender + WriterClient integration     TBD
-     - Daemon thread, leader resolution, drain →
-       request → response fan-out
-     - Replace AppendWriterImpl.appendColumns inline
-       RPC build with delegate to writerClient
-     - ITCase: 1000 single-row calls produce ≪ 1000
-       RPCs (assert at server-side metric or via
-       a counted gateway wrapper)
-N.4  Configuration + defaults                        TBD
-     - Add CLIENT_ENRICHMENT_WRITER_BATCH_SIZE,
-       CLIENT_ENRICHMENT_WRITER_LINGER_MS
-     - Defaults; doc strings
+N.3  EnrichmentSender + WriterClient integration     ⚠ → N.3a (see below)
+     - EnrichmentSender daemon thread implemented:
+       leader resolution, drain → request → response
+       fan-out, sealed-batch future completion.
+     - WriterClient.newEnrichmentAccumulator factory
+       wires the shared MemorySegmentPool,
+       ArrowWriterPool, BufferAllocator, and
+       DynamicWriteBatchSizeEstimator into a new
+       accumulator scoped per (table, group).
+     - RecordAccumulator exposes package-private
+       getters for these shared resources.
+N.3a Pivot to concatenated single-row batches       ✓ DONE (2026-05-23, superseded by N.3b)
+     First fix: ship N single-row Arrow batches per
+     RPC, server walks records.batches() and indexes
+     each one's distinct position. Wire/disk footprint
+     ~50%-3x larger than necessary for narrow rows;
+     Arrow compression effectively disabled per batch.
+     testEnrichmentSinkViaSql passed (21.2s).
+N.3b True multi-row decode in the merger             ✓ DONE (2026-05-23)
+     Replaces N.3a's wire shape with one multi-row
+     Arrow batch per RPC. Storage layer reverts to
+     one Arrow batch per call; index gains
+     intra-batch row addressing.
+     - EnrichmentSegment.append: per-ROW dense
+       indexing where rows in the same Arrow batch
+       share the batch's file position. Handles
+       BOTH wire formats (N single-row batches OR
+       1 N-row batch) uniformly.
+     - EnrichmentSegment.lookupBatch(sourceOffset)
+       returns (position, intraIndex). intraIndex is
+       recovered by walking backward in OffsetIndex
+       while position stays equal. O(intraIndex)
+       mmap reads — proportional to the row's
+       position within its batch.
+     - EnrichmentMerger.lookupEnrichment uses the
+       intraIndex; the "Multi-row enrichment batches
+       are not yet supported (Phase D)" guard is
+       gone. GroupDecoder.readColumnByName accepts
+       a rowIndex parameter and advances the batch
+       iterator to that row.
+     - EnrichmentSegment.range rounds slices to
+       whole-batch boundaries (defensive — followers
+       always start at EWM which is batch-aligned).
+     - EnrichmentWriteBatch reverts to a single
+       Arrow builder accumulating N rows; seal
+       produces ONE multi-row batch.
+     - Outcome: wire size minimized (1 header per
+       batch, not per row), Arrow compression
+       effective again, encoding CPU lower (1
+       writer borrow per batch, not per row).
+     - testEnrichmentSinkViaSql passes (23.2s);
+       new LogTabletTest case asserts per-row
+       lookup correctness on a single multi-row
+       batch (5 rows, shared file position,
+       distinct intra-indices).
+N.4  Configuration: reuse base-writer settings       ✓ DONE (2026-05-23)
+     Decision: no new enrichment-specific keys. The
+     accumulator already shares the underlying
+     MemorySegmentPool, ArrowWriterPool, and
+     DynamicWriteBatchSizeEstimator with base
+     appends, so it shares the tuning too.
+     - WriterClient.newEnrichmentAccumulator reads
+       client.writer.batch-size,
+       client.writer.batch-timeout, and
+       client.writer.buffer-page-size from its
+       Configuration.
+     - The 16 KB / 5 ms / 16 KB hardcoded constants
+       in AppendWriterImpl are gone; defaults now
+       come from base-writer settings (2 MB / 100 ms
+       / 64 KB).
+     - Tradeoff: 100 ms linger is generous for
+       enrichment workloads where latency matters
+       (CEW gates downstream materialization). If
+       this becomes painful, add an override later.
 N.5  Tests + benchmarks                              TBD
      - Unit tests on accumulator semantics
      - ITCase: enrichment-heavy workload throughput

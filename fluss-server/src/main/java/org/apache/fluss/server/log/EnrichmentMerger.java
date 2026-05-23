@@ -244,32 +244,37 @@ public final class EnrichmentMerger implements AutoCloseable {
 
     private Object lookupEnrichment(
             EnrichmentSegment seg, EnrichmentColumnRef ref, long sourceOffset) throws IOException {
-        OffsetPosition pos = seg.lookup(sourceOffset);
-        if (pos == null) {
+        EnrichmentSegment.BatchSlot slot = seg.lookupBatch(sourceOffset);
+        if (slot == null) {
             // Reaching here means the EWM gate let an unenriched offset through, which would be
             // an invariant violation. Rather than crash the fetch, surface a null and let the
             // caller decide — Phase B's EWM cap is the trusted gate.
             return null;
         }
         AbstractIterator<FileLogInputStream.FileChannelLogRecordBatch> iter =
-                seg.records().batchIterator(pos.getPosition(), seg.records().sizeInBytes());
+                seg.records().batchIterator(slot.position, seg.records().sizeInBytes());
         if (!iter.hasNext()) {
             return null;
         }
         FileLogInputStream.FileChannelLogRecordBatch batch = iter.next();
-        if (batch.getRecordCount() != 1) {
+        if (slot.intraIndex >= batch.getRecordCount()) {
             throw new IllegalStateException(
-                    "Multi-row enrichment batches are not yet supported (Phase D); "
-                            + "batch at position "
-                            + pos.getPosition()
-                            + " has "
+                    "Intra-batch index "
+                            + slot.intraIndex
+                            + " is out of range for batch at position "
+                            + slot.position
+                            + " with "
                             + batch.getRecordCount()
-                            + " rows.");
+                            + " rows (group "
+                            + ref.groupName
+                            + ", sourceOffset "
+                            + sourceOffset
+                            + ").");
         }
         // E.7: dispatch on the batch's schemaId so a segment that spans a schema evolution
         // decodes correctly. The cache holds a decoder per (group, schemaId) pair.
         GroupDecoder decoder = getOrBuildDecoder(ref.groupName, batch.schemaId());
-        return decoder.readColumnByName(batch, ref.columnName);
+        return decoder.readColumnByName(batch, ref.columnName, slot.intraIndex);
     }
 
     private GroupDecoder getOrBuildDecoder(String groupName, int batchSchemaId) {
@@ -400,7 +405,7 @@ public final class EnrichmentMerger implements AutoCloseable {
         }
 
         Object readColumnByName(
-                FileLogInputStream.FileChannelLogRecordBatch batch, String columnName)
+                FileLogInputStream.FileChannelLogRecordBatch batch, String columnName, int rowIndex)
                 throws IOException {
             int idx = groupRowType.getFieldNames().indexOf(columnName);
             if (idx < 0) {
@@ -409,6 +414,12 @@ public final class EnrichmentMerger implements AutoCloseable {
                 return null;
             }
             try (CloseableIterator<LogRecord> rowIter = batch.records(readContext)) {
+                for (int skipped = 0; skipped < rowIndex; skipped++) {
+                    if (!rowIter.hasNext()) {
+                        return null;
+                    }
+                    rowIter.next();
+                }
                 if (!rowIter.hasNext()) {
                     return null;
                 }

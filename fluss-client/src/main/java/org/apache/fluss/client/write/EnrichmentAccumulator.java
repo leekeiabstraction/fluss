@@ -24,7 +24,6 @@ import org.apache.fluss.memory.MemorySegmentPool;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.row.InternalRow;
-import org.apache.fluss.row.arrow.ArrowWriter;
 import org.apache.fluss.row.arrow.ArrowWriterPool;
 import org.apache.fluss.shaded.arrow.org.apache.arrow.memory.BufferAllocator;
 import org.apache.fluss.types.RowType;
@@ -156,27 +155,18 @@ public final class EnrichmentAccumulator {
     }
 
     private EnrichmentWriteBatch newBatch(EnrichmentBatchKey key, long nowMs) {
-        // ArrowWriter pool keyed by tableId+group hash to avoid collisions with the base writer
-        // which keys on tableId+schemaId.
-        int poolSchemaId = encoderInfo.writerSchemaId ^ key.getColumnGroup().hashCode();
-        ArrowWriter writer =
-                arrowWriterPool.getOrCreateWriter(
-                        key.getTableId(),
-                        poolSchemaId,
-                        initialBufferBytes,
-                        encoderInfo.groupRowType,
-                        encoderInfo.compression);
         int sizeLimit =
                 batchSizeEstimator != null
                         ? batchSizeEstimator.getEstimatedBatchSize(estimatorKey())
                         : batchSizeLimit;
-        try {
-            return new EnrichmentWriteBatch(
-                    key, sizeLimit, nowMs, writer, memorySegmentPool, encoderInfo.writerSchemaId);
-        } catch (java.io.IOException e) {
-            throw new RuntimeException(
-                    "Failed to allocate a memory segment for enrichment batch on key " + key, e);
-        }
+        return new EnrichmentWriteBatch(
+                key,
+                sizeLimit,
+                nowMs,
+                arrowWriterPool,
+                memorySegmentPool,
+                encoderInfo,
+                initialBufferBytes);
     }
 
     private PhysicalTablePath estimatorKey() {

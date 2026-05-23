@@ -148,6 +148,27 @@ public final class RecordAccumulator {
         registerMetrics(writerMetricGroup);
     }
 
+    /**
+     * Phase N.3: exposed so the EnrichmentAccumulator (created via WriterClient) can share the same
+     * bounded memory pool, Arrow encoder pool, allocator, and dynamic-size estimator as the
+     * base-append accumulator.
+     */
+    LazyMemorySegmentPool getWriterBufferPool() {
+        return writerBufferPool;
+    }
+
+    BufferAllocator getBufferAllocator() {
+        return bufferAllocator;
+    }
+
+    ArrowWriterPool getArrowWriterPool() {
+        return arrowWriterPool;
+    }
+
+    DynamicWriteBatchSizeEstimator getBatchSizeEstimator() {
+        return batchSizeEstimator;
+    }
+
     private void registerMetrics(WriterMetricGroup writerMetricGroup) {
         // memory segment pool related metrics.
         writerMetricGroup.gauge(MetricNames.WRITER_BUFFER_TOTAL_BYTES, writerBufferPool::totalSize);

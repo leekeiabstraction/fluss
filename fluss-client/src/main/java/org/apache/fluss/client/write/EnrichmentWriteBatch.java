@@ -27,6 +27,7 @@ import org.apache.fluss.record.MemoryLogRecordsArrowBuilder;
 import org.apache.fluss.record.bytesview.BytesView;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.row.arrow.ArrowWriter;
+import org.apache.fluss.row.arrow.ArrowWriterPool;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -34,12 +35,14 @@ import java.util.List;
 import java.util.concurrent.CompletableFuture;
 
 /**
- * Phase N.2: one batch of enrichment writes destined for a single {@link EnrichmentBatchKey} (table
- * + column group + table bucket).
+ * Phase N.3b: one batch of enrichment writes destined for a single {@link EnrichmentBatchKey}
+ * (table + column group + table bucket).
  *
- * <p>Batches encode rows lazily into a single Arrow {@link MemoryLogRecordsArrowBuilder}; the batch
- * can be appended to until it is sealed (size threshold reached, linger expired, or explicit
- * flush). After {@link #sealAndBuild()} the batch is immutable and its bytes are ready to ship.
+ * <p>Rows accumulate into a single Arrow {@link MemoryLogRecordsArrowBuilder}; on seal the builder
+ * produces ONE multi-row Arrow batch. The server side stores the batch as one entry and indexes
+ * each row's source offset at the batch's file position (dense, duplicated-position semantics);
+ * {@code EnrichmentMerger} recovers the intra-batch row index via a backward walk in the index and
+ * advances the batch iterator to extract the requested row.
  *
  * <p>Thread-safety: all mutating methods are {@code synchronized(this)}; appenders may race
  * concurrently against the batch head, but only one wins the {@link #tryAppend} call per row.
@@ -61,9 +64,10 @@ public final class EnrichmentWriteBatch {
             EnrichmentBatchKey key,
             int batchSizeLimit,
             long createdMs,
-            ArrowWriter arrowWriter,
+            ArrowWriterPool arrowWriterPool,
             MemorySegmentPool memorySegmentPool,
-            int writerSchemaId)
+            EnrichmentAccumulator.BatchEncoderInfo encoderInfo,
+            int initialBufferBytes)
             throws IOException {
         this.key = key;
         this.batchSizeLimit = batchSizeLimit;
@@ -74,9 +78,17 @@ public final class EnrichmentWriteBatch {
         this.bufferSegments = new ArrayList<>();
         this.bufferSegments.add(memorySegmentPool.nextSegment());
         PreAllocatedPagedOutputView outputView = new PreAllocatedPagedOutputView(bufferSegments);
+        int poolSchemaId = encoderInfo.writerSchemaId ^ key.getColumnGroup().hashCode();
+        ArrowWriter writer =
+                arrowWriterPool.getOrCreateWriter(
+                        key.getTableId(),
+                        poolSchemaId,
+                        initialBufferBytes,
+                        encoderInfo.groupRowType,
+                        encoderInfo.compression);
         this.builder =
                 MemoryLogRecordsArrowBuilder.builder(
-                        writerSchemaId, arrowWriter, outputView, true, null);
+                        encoderInfo.writerSchemaId, writer, outputView, true, null);
     }
 
     /** Memory segments held by this batch — caller returns them to the pool after ack. */
@@ -143,8 +155,8 @@ public final class EnrichmentWriteBatch {
             memorySegmentPool.returnAll(bufferSegments);
             bufferSegments.clear();
             return new SealedBatch(
-                    key, /* records */
-                    null,
+                    key,
+                    /* records */ null,
                     new long[0],
                     new ArrayList<>(),
                     null,

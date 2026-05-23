@@ -857,6 +857,60 @@ final class LogTabletTest extends LogTestBase {
                 .hasMessageContaining("got 3");
     }
 
+    @Test
+    void testAppendColumnsAsLeaderAcceptsMultiRowBatch() throws Exception {
+        // Phase N.3b: a single appendColumnsAsLeader call may carry a multi-row Arrow batch (one
+        // batch with N rows + parallel sourceOffsets). Per-row lookups must work and EWM must
+        // advance by the batch's row count.
+        for (int i = 0; i < 5; i++) {
+            logTablet.appendAsLeader(
+                    genMemoryLogRecordsByObject(
+                            Collections.singletonList(new Object[] {i, "v" + i})));
+        }
+        String groupName = "geo";
+        logTablet.registerColumnGroupIfAbsent(groupName);
+
+        MemoryLogRecords multiRow =
+                buildMultiRowEnrichment(
+                        "US-WEST-0", "US-WEST-1", "US-WEST-2", "US-WEST-3", "US-WEST-4");
+        logTablet.appendColumnsAsLeader(groupName, multiRow, new long[] {0L, 1L, 2L, 3L, 4L});
+
+        assertThat(logTablet.getEnrichmentWatermark(groupName)).isEqualTo(5L);
+
+        EnrichmentSegment seg = logTablet.getEnrichmentSegment(groupName);
+        assertThat(seg).isNotNull();
+        assertThat(seg.lastEnrichedOffset()).isEqualTo(4L);
+
+        // All five rows live in ONE batch, so all five lookups return the SAME file position.
+        int sharedPosition = seg.lookup(0L).getPosition();
+        for (long off = 0L; off <= 4L; off++) {
+            OffsetPosition op = seg.lookup(off);
+            assertThat(op).isNotNull();
+            assertThat(op.getOffset()).isEqualTo(off);
+            assertThat(op.getPosition()).isEqualTo(sharedPosition);
+        }
+
+        // lookupBatch additionally recovers the intra-batch row index.
+        for (int i = 0; i <= 4; i++) {
+            EnrichmentSegment.BatchSlot slot = seg.lookupBatch((long) i);
+            assertThat(slot).isNotNull();
+            assertThat(slot.position).isEqualTo(sharedPosition);
+            assertThat(slot.intraIndex).isEqualTo(i);
+        }
+
+        // Range for the full multi-row batch returns the whole slice.
+        EnrichmentReadResult full =
+                logTablet.readEnrichmentForFollower(groupName, 0L, 5L, Integer.MAX_VALUE);
+        assertThat(full.sourceOffsets()).containsExactly(0L, 1L, 2L, 3L, 4L);
+        assertThat(full.records().sizeInBytes()).isPositive();
+
+        // Mid-batch range is defensively rounded UP to whole batch — follower would never request
+        // mid-batch in practice (EWM advances batch-granularly) but the implementation handles it.
+        EnrichmentReadResult mid =
+                logTablet.readEnrichmentForFollower(groupName, 2L, 4L, Integer.MAX_VALUE);
+        assertThat(mid.sourceOffsets()).containsExactly(0L, 1L, 2L, 3L, 4L);
+    }
+
     private MemoryLogRecords buildSingleRowEnrichment(String value) throws Exception {
         RowType groupRowType =
                 RowType.of(
@@ -874,6 +928,34 @@ final class LogTabletTest extends LogTestBase {
                 org.apache.fluss.record.LogRecordBatchFormat.NO_BATCH_SEQUENCE,
                 Collections.singletonList(org.apache.fluss.record.ChangeType.APPEND_ONLY),
                 Collections.singletonList(new Object[] {value}),
+                LogFormat.ARROW,
+                org.apache.fluss.compression.ArrowCompressionInfo.NO_COMPRESSION);
+    }
+
+    /** Build a single multi-row Arrow enrichment batch (Phase N.3b option-b wire format). */
+    private MemoryLogRecords buildMultiRowEnrichment(String... values) throws Exception {
+        RowType groupRowType =
+                RowType.of(
+                        new org.apache.fluss.types.DataType[] {
+                            org.apache.fluss.types.DataTypes.STRING()
+                        },
+                        new String[] {"geo"});
+        List<org.apache.fluss.record.ChangeType> changeTypes = new ArrayList<>(values.length);
+        List<Object[]> rows = new ArrayList<>(values.length);
+        for (String v : values) {
+            changeTypes.add(org.apache.fluss.record.ChangeType.APPEND_ONLY);
+            rows.add(new Object[] {v});
+        }
+        return org.apache.fluss.testutils.DataTestUtils.createBasicMemoryLogRecords(
+                groupRowType,
+                DEFAULT_SCHEMA_ID,
+                0L,
+                System.currentTimeMillis(),
+                LogRecordBatch.CURRENT_LOG_MAGIC_VALUE,
+                org.apache.fluss.record.LogRecordBatchFormat.NO_WRITER_ID,
+                org.apache.fluss.record.LogRecordBatchFormat.NO_BATCH_SEQUENCE,
+                changeTypes,
+                rows,
                 LogFormat.ARROW,
                 org.apache.fluss.compression.ArrowCompressionInfo.NO_COMPRESSION);
     }
