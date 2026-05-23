@@ -90,6 +90,33 @@ CREATE TABLE my_log_table (
 );
 ```
 
+### Log Table with Column Groups
+
+A log table can declare one or more **column groups** — subsets of columns that can be written
+separately from the base row. Each group is named and listed as a comma-separated set of
+columns in a `column-groups.<groupName>` table property:
+
+```sql title="Flink SQL"
+CREATE TABLE cg_base (
+  device_id  INT,
+  payload    STRING,
+  geo_region STRING,
+  risk_score DOUBLE
+) WITH (
+  'column-groups.enriched' = 'geo_region, risk_score',
+  'bucket.key' = 'device_id',
+  'bucket.num' = '4'
+);
+```
+
+Columns not listed in any group belong to the implicit "base" group and are written via normal
+`INSERT INTO`. To write enrichment values into a named group, use the two-table pattern
+documented in [Enrichment Writes](writes.md#enrichment-writes-column-groups).
+
+Restrictions: column groups are supported only on log tables (no `PRIMARY KEY`) and are
+currently incompatible with partitioning. Group names must not contain `.`; column names must
+exist in the schema and may not appear in more than one group.
+
 ### Partitioned (Primary Key/Log) Table
 
 :::note

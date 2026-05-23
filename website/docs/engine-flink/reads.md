@@ -232,6 +232,26 @@ TableSourceScan(table=[[..., sensor_data, filter=[and(>(temperature, 30.0:DOUBLE
 
 The server evaluates these predicates against per-batch column statistics and skips entire record batches that cannot contain matching rows. Note that the filter also appears in a `Calc` node above the source — this is expected because Flink retains all filters for client-side verification as a safety net.
 
+### Column Group Read Semantics
+
+When a log table declares one or more
+[column groups](ddl.md#log-table-with-column-groups), queries that project columns in a group
+are gated at the per-bucket *Committed Enrichment Watermark* (CEW) for that group:
+
+- Projection touching **only base columns** is gated at the high watermark — visible as soon
+  as the base row is written.
+- Projection touching **any enrichment column** is gated at the CEW for the group that
+  contains those columns — a row is visible only after its enrichment values have been written
+  and the CEW has advanced past its offset.
+
+The CEW advances per-bucket as enrichment values arrive in contiguous-offset order
+(starting from offset 0). A partially-enriched offset range remains invisible to projections
+that touch its columns until the gap is filled — there is no torn read.
+
+Bucket and offset can be projected as opt-in `METADATA` columns for use in downstream
+enrichment writes; see
+[Enrichment Writes](writes.md#enrichment-writes-column-groups) for the recipe.
+
 ## Batch Read
 
 ### Limit Read

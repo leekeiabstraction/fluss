@@ -1,6 +1,6 @@
 # Phase L Option B — Implementation design
 
-**Status:** Design.
+**Status:** L.1–L.5 landed.
 **Authors:** option02-lateMaterialized branch.
 **Depends on:** [PHASE_L_FLINK_ENRICHMENT_WRITES.md](PHASE_L_FLINK_ENRICHMENT_WRITES.md)
 (option survey + decision).
@@ -366,10 +366,11 @@ L.4  Validation negatives                            TBD
      - SELECT on write-only table
      - enrichment.target without enrichment.group (and vice versa)
 
-L.5  Docs                                            TBD
-     - User recipe in connector README
-     - SQL examples: backfill, streaming-enrich
-     - How to handle schema evolution on the writes side
+L.5  Docs                                            ✓ landed in this commit
+     - Two-table recipe + end-to-end SQL example in
+       website/docs/engine-flink/writes.md
+     - Column-groups DDL section in ddl.md
+     - CEW read semantics in reads.md
 ```
 
 L.2 lands first (the sink ITCase needs metadata columns on the read
