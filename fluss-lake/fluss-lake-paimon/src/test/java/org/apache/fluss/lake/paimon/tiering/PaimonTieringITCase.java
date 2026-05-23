@@ -644,6 +644,142 @@ class PaimonTieringITCase extends FlinkPaimonTieringTestBase {
         }
     }
 
+    @Test
+    void testTieringForPartitionedColumnGroupLogTable() throws Exception {
+        // Phase M.7: tiering a partitioned column-group log table to Paimon. Confirms that
+        // the F.4 enrichment-tier path (base+enrichment merge-on-read + min(HW, CEW) cap)
+        // composes correctly with partitioning — each LogTablet (per partition+bucket) tiers
+        // independently and Paimon ends up with the merged rows under the correct partition.
+        TablePath tablePath = TablePath.of(DEFAULT_DB, "cgPartitionedTable");
+        String groupName = "enriched";
+        Schema schema =
+                Schema.newBuilder()
+                        .column("dt", DataTypes.STRING())
+                        .column("device_id", DataTypes.INT())
+                        .column("payload", DataTypes.STRING())
+                        .column("geo_region", DataTypes.STRING())
+                        .columnGroup(groupName)
+                        .column("risk_score", DataTypes.DOUBLE())
+                        .columnGroup(groupName)
+                        .build();
+        TableDescriptor descriptor =
+                TableDescriptor.builder()
+                        .schema(schema)
+                        .partitionedBy("dt")
+                        .distributedBy(1, "device_id")
+                        .property(ConfigOptions.TABLE_DATALAKE_ENABLED.key(), "true")
+                        .property(ConfigOptions.TABLE_DATALAKE_FRESHNESS, Duration.ofMillis(500))
+                        .build();
+        long tableId = createTable(tablePath, descriptor);
+
+        // Create two partitions manually.
+        String p1 = "2025-03-01";
+        String p2 = "2025-03-02";
+        admin.createPartition(
+                        tablePath,
+                        new org.apache.fluss.metadata.PartitionSpec(
+                                java.util.Collections.singletonMap("dt", p1)),
+                        false)
+                .get();
+        admin.createPartition(
+                        tablePath,
+                        new org.apache.fluss.metadata.PartitionSpec(
+                                java.util.Collections.singletonMap("dt", p2)),
+                        false)
+                .get();
+
+        // Resolve partition IDs and bucket handles per partition.
+        long pid1 = lookupPartitionId(tablePath, p1);
+        long pid2 = lookupPartitionId(tablePath, p2);
+        TableBucket bucket1 = new TableBucket(tableId, pid1, 0);
+        TableBucket bucket2 = new TableBucket(tableId, pid2, 0);
+
+        try (Table table = conn.getTable(tablePath)) {
+            AppendWriter writer = table.newAppend().createWriter();
+
+            // Write 3 base rows into each partition.
+            for (int i = 0; i < 3; i++) {
+                writer.append(row(p1, i, "p" + i, null, null)).get();
+            }
+            for (int i = 0; i < 3; i++) {
+                writer.append(row(p2, i, "q" + i, null, null)).get();
+            }
+            writer.flush();
+
+            // Enrich all 3 in each partition → CEW=3 per partition.
+            for (int i = 0; i < 3; i++) {
+                writer.appendColumns(
+                                groupName,
+                                bucket1,
+                                i,
+                                GenericRow.of(BinaryString.fromString("p1-" + i), 0.1 * i))
+                        .get();
+                writer.appendColumns(
+                                groupName,
+                                bucket2,
+                                i,
+                                GenericRow.of(BinaryString.fromString("p2-" + i), 0.5 + 0.1 * i))
+                        .get();
+            }
+            retry(
+                    Duration.ofMinutes(1),
+                    () -> {
+                        assertThat(
+                                        getLeaderReplica(bucket1)
+                                                .getLogTablet()
+                                                .getCommittedEnrichmentWatermark(groupName))
+                                .isEqualTo(3L);
+                        assertThat(
+                                        getLeaderReplica(bucket2)
+                                                .getLogTablet()
+                                                .getCommittedEnrichmentWatermark(groupName))
+                                .isEqualTo(3L);
+                    });
+
+            JobClient jobClient = buildTieringJob(execEnv);
+            try {
+                // Both partitions should reach offset 3 in Paimon.
+                assertReplicaStatus(bucket1, 3);
+                assertReplicaStatus(bucket2, 3);
+
+                // Per-partition Paimon assertion — read with a partition filter and confirm
+                // merged rows are present.
+                assertPaimonRowsForPartitionedColumnGroup(tablePath, p1, "p1-");
+                assertPaimonRowsForPartitionedColumnGroup(tablePath, p2, "p2-");
+            } finally {
+                jobClient.cancel().get();
+            }
+        }
+    }
+
+    private long lookupPartitionId(TablePath path, String partitionName) throws Exception {
+        for (org.apache.fluss.metadata.PartitionInfo info : admin.listPartitionInfos(path).get()) {
+            if (info.getPartitionName().equals(partitionName)) {
+                return info.getPartitionId();
+            }
+        }
+        throw new IllegalStateException("Partition '" + partitionName + "' not found on " + path);
+    }
+
+    private void assertPaimonRowsForPartitionedColumnGroup(
+            TablePath tablePath, String partitionValue, String geoPrefix) throws Exception {
+        try (CloseableIterator<org.apache.paimon.data.InternalRow> it =
+                getPaimonRowCloseableIterator(
+                        tablePath, java.util.Collections.singletonMap("dt", partitionValue))) {
+            int count = 0;
+            while (it.hasNext()) {
+                org.apache.paimon.data.InternalRow paimonRow = it.next();
+                // Layout: (dt, device_id, payload, geo_region, risk_score, __bucket, __offset,
+                //         __timestamp). Verify enrichment landed.
+                assertThat(paimonRow.getString(0).toString()).isEqualTo(partitionValue);
+                int deviceId = paimonRow.getInt(1);
+                assertThat(paimonRow.getString(3).toString()).isEqualTo(geoPrefix + deviceId);
+                count++;
+            }
+            assertThat(count).isEqualTo(3);
+        }
+    }
+
     private void assertPaimonRowsForColumnGroupTable(TablePath tablePath, int expectedRowCount)
             throws Exception {
         try (CloseableIterator<org.apache.paimon.data.InternalRow> it =
