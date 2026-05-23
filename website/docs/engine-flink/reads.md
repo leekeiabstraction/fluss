@@ -252,6 +252,17 @@ Bucket and offset can be projected as opt-in `METADATA` columns for use in downs
 enrichment writes; see
 [Enrichment Writes](writes.md#enrichment-writes-column-groups) for the recipe.
 
+On **partitioned** column-group tables, a `partition` `METADATA` column (`STRING NOT NULL`) is
+also available — it carries the user-visible partition name (e.g. `'2025-12-31'`):
+
+```sql title="Flink SQL"
+SELECT _partition, _bucket, _offset, device_id, geo_region
+FROM cg_partitioned;
+```
+
+The CEW is tracked per `(partition, bucket)`, so each partition gates its enrichment-touching
+projections independently of the others.
+
 ## Batch Read
 
 ### Limit Read

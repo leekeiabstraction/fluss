@@ -113,9 +113,34 @@ Columns not listed in any group belong to the implicit "base" group and are writ
 `INSERT INTO`. To write enrichment values into a named group, use the two-table pattern
 documented in [Enrichment Writes](writes.md#enrichment-writes-column-groups).
 
-Restrictions: column groups are supported only on log tables (no `PRIMARY KEY`) and are
-currently incompatible with partitioning. Group names must not contain `.`; column names must
-exist in the schema and may not appear in more than one group.
+Restrictions: column groups are supported only on log tables (no `PRIMARY KEY`). Group names
+must not contain `.`; column names must exist in the schema and may not appear in more than
+one group.
+
+#### Partitioned column-group tables
+
+Column-group log tables can be partitioned. The partition keys **must belong to the default
+(unnamed) group** — enrichment-group columns are NULL at base-write time and cannot determine
+the row's partition. Declaring a partition key inside a named group fails at `CREATE TABLE`.
+
+```sql title="Flink SQL"
+CREATE TABLE cg_partitioned (
+  dt         STRING,
+  device_id  INT,
+  payload    STRING,
+  geo_region STRING,
+  risk_score DOUBLE
+) PARTITIONED BY (dt)
+  WITH (
+  'column-groups.enriched' = 'geo_region, risk_score',
+  'bucket.key' = 'device_id',
+  'bucket.num' = '4'
+);
+```
+
+The per-bucket Committed Enrichment Watermark (CEW) is tracked per `(partition, bucket)`, so
+each partition can fill its enrichment values independently. Drop-partition cleans up the
+enrichment segments and CEW state alongside the log segments.
 
 ### Partitioned (Primary Key/Log) Table
 

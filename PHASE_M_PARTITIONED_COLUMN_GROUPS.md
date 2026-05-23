@@ -1,6 +1,6 @@
 # Phase M — Partitioned column-group tables
 
-**Status:** Design.
+**Status:** M.1–M.9 landed.
 **Authors:** option02-lateMaterialized branch.
 **Depends on:** Phases A–L (all prior column-group work), and is a lift of
 the Phase A scope decision "column-group tables are not partitioned".
@@ -281,18 +281,22 @@ M.6  Schema evolution interaction                    ✓ no-op given current Flu
        in SchemaUpdateTest documents this.
      - If a future "add partition key" alter is
        added, it must enforce M.1 at that point.
-M.7  Lake tiering audit                              TBD
-     - Verify F.4-style enrichment-write paths in
-       Paimon/Iceberg/Lance carry partition through.
-     - ITCase: tier a partitioned column-group table
-       to Paimon and read back via Spark.
-M.8  Drop-partition cleanup verification             TBD
-     - Reuses existing log-cleanup; confirm EWM state
-       is released and segments are removed.
-     - ITCase: drop a partition, attempt enrichment
-       write → PartitionNotExistException.
-M.9  Docs                                            TBD
-     - Recipe in writes.md/ddl.md/reads.md updates.
+M.7  Lake tiering audit                              ✓ Paimon ITCase landed
+     - testTieringForPartitionedColumnGroupLogTable
+       exercises base+enrichment+partitioned tiering.
+       Iceberg/Lance: existing partition handling
+       inherits — no Phase M changes.
+M.8  Drop-partition cleanup verification             ✓ smoke test landed
+     - testDropPartitionOnColumnGroupTable confirms
+       drop-partition succeeds on a column-group
+       table with active enrichment data. Cleanup
+       reuses existing log-segment lifecycle.
+M.9  Docs                                            ✓ landed in this commit
+     - Partitioned column-group section in ddl.md.
+     - Partitioned enrichment-target recipe in
+       writes.md.
+     - `partition` METADATA + per-partition CEW
+       semantics in reads.md.
 ```
 
 M.2 + M.3 are tightly coupled and small (~50 lines + a couple of

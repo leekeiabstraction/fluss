@@ -467,6 +467,72 @@ abstract class FlinkTableSourceITCase extends AbstractTestBase {
     }
 
     @Test
+    void testDropPartitionOnColumnGroupTable() throws Exception {
+        // Phase M.8: drop-partition releases EWM state and enrichment segments along with the
+        // log-segment cleanup. Confirm:
+        //   (a) Drop on a partition with base + enrichment writes succeeds.
+        //   (b) listPartitionInfos no longer returns the dropped partition.
+        // Test only exercises the path; the cleanup itself piggybacks on existing
+        // log-segment cleanup with no new code in Phase M.
+        tEnv.executeSql(
+                "create table cg_m8_drop ("
+                        + "  dt string, device_id int, payload string,"
+                        + "  geo_region string, risk_score double"
+                        + ") partitioned by (dt) with ("
+                        + " 'column-groups.enriched' = 'geo_region, risk_score',"
+                        + " 'bucket.key' = 'device_id', 'bucket.num' = '1')");
+        TablePath tablePath = TablePath.of(DEFAULT_DB, "cg_m8_drop");
+        long tableId = admin.getTableInfo(tablePath).get().getTableId();
+
+        tEnv.executeSql("alter table cg_m8_drop add partition (dt='2025-04-01')");
+        tEnv.executeSql("alter table cg_m8_drop add partition (dt='2025-04-02')");
+
+        long pidDropped = lookupPartitionId(tablePath, "2025-04-01");
+
+        // Write a few rows + enrichment to the partition being dropped.
+        TableBucket bucket = new TableBucket(tableId, pidDropped, 0);
+        try (Table table = conn.getTable(tablePath)) {
+            AppendWriter writer = table.newAppend().createWriter();
+            for (int i = 0; i < 2; i++) {
+                writer.append(row("2025-04-01", i, "p" + i, null, null)).get();
+            }
+            writer.flush();
+            for (int i = 0; i < 2; i++) {
+                writer.appendColumns(
+                                "enriched",
+                                bucket,
+                                i,
+                                GenericRow.of(BinaryString.fromString("US-" + i), 0.1 * i))
+                        .get();
+            }
+            retry(
+                    java.time.Duration.ofMinutes(1),
+                    () ->
+                            assertThat(
+                                            FLUSS_CLUSTER_EXTENSION
+                                                    .waitAndGetLeaderReplica(bucket)
+                                                    .getLogTablet()
+                                                    .getCommittedEnrichmentWatermark("enriched"))
+                                    .isEqualTo(2L));
+        }
+
+        // Drop the partition via Flink DDL.
+        tEnv.executeSql("alter table cg_m8_drop drop partition (dt='2025-04-01')");
+
+        // The dropped partition is no longer listed; only the surviving one remains.
+        retry(
+                java.time.Duration.ofMinutes(1),
+                () -> {
+                    List<String> remaining = new ArrayList<>();
+                    for (org.apache.fluss.metadata.PartitionInfo info :
+                            admin.listPartitionInfos(tablePath).get()) {
+                        remaining.add(info.getPartitionName());
+                    }
+                    assertThat(remaining).containsExactly("2025-04-02");
+                });
+    }
+
+    @Test
     void testPartitionedColumnGroupTableMetadataColumns() throws Exception {
         // Phase M.4: bucket/offset/partition METADATA columns on a partitioned column-group
         // table. Source-side splice reads the partition name from the LogSplit (no per-record

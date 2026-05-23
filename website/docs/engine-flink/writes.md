@@ -192,12 +192,54 @@ The write-only table's schema is fixed at create time — the catalog does **not
 mirror changes from the base table. If you forget step 2, subsequent `INSERT INTO` statements
 will fail at plan time with a clear error naming the missing column.
 
+### Partitioned enrichment targets
+
+When the target column-group table is partitioned, the write-only sibling's row layout gains a
+leading `STRING` column carrying the partition name:
+
+```sql title="Flink SQL"
+CREATE TABLE cg_partitioned_base (
+  dt         STRING,
+  device_id  INT,
+  payload    STRING,
+  geo_region STRING,
+  risk_score DOUBLE,
+  _partition STRING METADATA FROM 'partition' VIRTUAL,
+  _bucket    BIGINT METADATA FROM 'bucket' VIRTUAL,
+  _offset    BIGINT METADATA FROM 'offset' VIRTUAL
+) PARTITIONED BY (dt) WITH (
+  'column-groups.enriched' = 'geo_region, risk_score'
+);
+
+CREATE TABLE cg_partitioned_writes (
+  src_partition STRING,         -- partition name (e.g. '2025-12-31')
+  src_bucket    BIGINT,
+  src_offset    BIGINT,
+  geo_region    STRING,
+  risk_score    DOUBLE
+) WITH (
+  'enrichment.target' = 'cg_partitioned_base',
+  'enrichment.group'  = 'enriched'
+);
+
+INSERT INTO cg_partitioned_writes
+SELECT b._partition, b._bucket, b._offset,
+       lookup_geo(b.payload), score_risk(b.payload)
+FROM cg_partitioned_base AS b
+WHERE b.geo_region IS NULL;
+```
+
+The sink writer resolves the partition name to its internal numeric ID on each write via a
+cached `Admin.listPartitionInfos` lookup. If the named partition doesn't exist (e.g. was
+dropped between scan and write), the write fails with a clear error.
+
 ### Restrictions
 
 - `SELECT * FROM cg_enriched_writes` — rejected at plan time. Query the base table instead.
 - Declaring `PRIMARY KEY` on an enrichment-target table — rejected at `CREATE TABLE` time.
   Column-group tables are log-only by design.
-- Column-group tables cannot be partitioned (current scope).
+- For partitioned column-group tables, partition keys must belong to the default group.
+  Declaring a partition key inside a named group fails at `CREATE TABLE`.
 - The `enrichment.target` property must point at a Fluss table that has the named column group;
   the catalog validates this at the first `INSERT INTO` against the table.
 
