@@ -336,6 +336,36 @@ abstract class FlinkTableSourceITCase extends AbstractTestBase {
                                                 + " with ('column-groups.x' = 'b')"))
                 .getRootCause()
                 .hasMessageContaining("not supported on tables with a primary key");
+
+        // Phase M.3: partition key inside a non-default group is rejected at CREATE TABLE.
+        assertThatThrownBy(
+                        () ->
+                                tEnv.executeSql(
+                                        "create table cg_bad_pkey_in_group ("
+                                                + "  dt string, device_id int, geo_region string"
+                                                + ") partitioned by (dt) "
+                                                + "with ('column-groups.enriched' = 'dt')"))
+                .getRootCause()
+                .hasMessageContaining("Partition keys must belong to the default group");
+    }
+
+    @Test
+    void testPartitionedColumnGroupTableCreate() throws Exception {
+        // Phase M.3: declaring a partitioned table whose partition key stays in the default
+        // group and whose enrichment group covers other columns succeeds. (Read/write paths
+        // are exercised in later M phases.)
+        tEnv.executeSql(
+                "create table cg_partitioned ("
+                        + "  dt string, device_id int, payload string,"
+                        + "  geo_region string, risk_score double"
+                        + ") partitioned by (dt) with ("
+                        + " 'column-groups.enriched' = 'geo_region, risk_score',"
+                        + " 'bucket.key' = 'device_id', 'bucket.num' = '1')");
+        TablePath tablePath = TablePath.of(DEFAULT_DB, "cg_partitioned");
+        org.apache.fluss.metadata.TableInfo info = admin.getTableInfo(tablePath).get();
+        assertThat(info.getPartitionKeys()).containsExactly("dt");
+        assertThat(info.getSchema().getColumnGroups()).containsOnlyKeys("enriched");
+        assertThat(info.getSchema().getColumnGroups().get("enriched")).containsExactly(3, 4);
     }
 
     @Test

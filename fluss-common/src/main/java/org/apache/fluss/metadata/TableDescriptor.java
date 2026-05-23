@@ -117,6 +117,28 @@ public final class TableDescriptor implements Serializable {
                                     f));
         }
 
+        // Phase M.2: partition keys must belong to the default column group. Enrichment-group
+        // columns are NULL at base-write time and cannot determine the row's partition.
+        Map<String, List<Integer>> columnGroups = schema.getColumnGroups();
+        if (!columnGroups.isEmpty() && !partitionKeys.isEmpty()) {
+            Set<String> groupedColumnNames =
+                    columnGroups.values().stream()
+                            .flatMap(List::stream)
+                            .map(idx -> schema.getColumns().get(idx).getName())
+                            .collect(Collectors.toSet());
+            List<String> illegal =
+                    partitionKeys.stream()
+                            .filter(groupedColumnNames::contains)
+                            .collect(Collectors.toList());
+            checkArgument(
+                    illegal.isEmpty(),
+                    "Partition keys must belong to the default column group "
+                            + "(enrichment-group columns are NULL at base-write time and "
+                            + "cannot determine the partition). Offending partition keys "
+                            + "declared in non-default groups: %s",
+                    illegal);
+        }
+
         if (this.tableDistribution != null) {
             this.tableDistribution
                     .getBucketKeys()

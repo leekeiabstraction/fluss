@@ -320,6 +320,51 @@ class TableDescriptorTest {
     }
 
     @Test
+    void testPartitionKeyMustBelongToDefaultGroup() {
+        // Phase M.2: partition keys must live in the default group, not in a named
+        // column group — enrichment-group columns are NULL at base-write time and can't
+        // determine the row's partition.
+        Schema logSchema =
+                Schema.newBuilder()
+                        .column("dt", DataTypes.STRING())
+                        .column("device_id", DataTypes.INT())
+                        .column("payload", DataTypes.STRING())
+                        .column("geo_region", DataTypes.STRING())
+                        .columnGroup("enriched")
+                        .column("risk_score", DataTypes.DOUBLE())
+                        .columnGroup("enriched")
+                        .build();
+
+        // Allowed: partition key (dt) is in the default group; enriched group has other cols.
+        TableDescriptor ok =
+                TableDescriptor.builder()
+                        .schema(logSchema)
+                        .partitionedBy("dt")
+                        .distributedBy(1, "device_id")
+                        .build();
+        assertThat(ok.getPartitionKeys()).containsExactly("dt");
+
+        // Rejected: partition key (geo_region) is declared in the 'enriched' group.
+        Schema bad =
+                Schema.newBuilder()
+                        .column("dt", DataTypes.STRING())
+                        .column("device_id", DataTypes.INT())
+                        .column("geo_region", DataTypes.STRING())
+                        .columnGroup("enriched")
+                        .build();
+        assertThatThrownBy(
+                        () ->
+                                TableDescriptor.builder()
+                                        .schema(bad)
+                                        .partitionedBy("geo_region")
+                                        .distributedBy(1, "device_id")
+                                        .build())
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Partition keys must belong to the default column group")
+                .hasMessageContaining("geo_region");
+    }
+
+    @Test
     void testInvalidListaggParameterEmptyDelimiter() {
         // LISTAGG with empty delimiter - should fail
         assertThatThrownBy(() -> AggFunctions.LISTAGG("").validateParameters())

@@ -245,11 +245,18 @@ public class FlinkConversions {
                         .filter(Column::isPhysical)
                         .map(Column::getName)
                         .collect(Collectors.toSet());
+        // Phase M.3: parseColumnGroups needs to know the partition keys to enforce that
+        // partition keys belong to the default group.
+        List<String> earlyPartitionKeys =
+                CatalogBaseTable.TableKind.TABLE == catalogBaseTable.getTableKind()
+                        ? ((ResolvedCatalogTable) catalogBaseTable).getPartitionKeys()
+                        : ((ResolvedCatalogMaterializedTable) catalogBaseTable).getPartitionKeys();
         Map<String, String> columnToGroup =
                 parseColumnGroups(
                         flinkTableConf,
                         physicalColumnNames,
-                        resolvedSchema.getPrimaryKey().isPresent());
+                        resolvedSchema.getPrimaryKey().isPresent(),
+                        earlyPartitionKeys);
 
         // Build schema with physical columns
         resolvedSchema.getColumns().stream()
@@ -301,10 +308,7 @@ public class FlinkConversions {
                         });
 
         CatalogBaseTable.TableKind tableKind = catalogBaseTable.getTableKind();
-        List<String> partitionKeys =
-                CatalogBaseTable.TableKind.TABLE == tableKind
-                        ? ((ResolvedCatalogTable) catalogBaseTable).getPartitionKeys()
-                        : ((ResolvedCatalogMaterializedTable) catalogBaseTable).getPartitionKeys();
+        List<String> partitionKeys = earlyPartitionKeys;
 
         // Set materialized table flags to fluss table custom properties
         if (CatalogTableAdapter.isMaterializedTable(tableKind)) {
@@ -786,7 +790,11 @@ public class FlinkConversions {
      * §3.2, §6.4).
      */
     private static Map<String, String> parseColumnGroups(
-            Configuration flinkTableConf, Set<String> physicalColumnNames, boolean hasPrimaryKey) {
+            Configuration flinkTableConf,
+            Set<String> physicalColumnNames,
+            boolean hasPrimaryKey,
+            List<String> partitionKeys) {
+        Set<String> partitionKeySet = new HashSet<>(partitionKeys);
         Map<String, String> columnToGroup = new HashMap<>();
         for (Map.Entry<String, String> entry : flinkTableConf.toMap().entrySet()) {
             String key = entry.getKey();
@@ -831,6 +839,17 @@ public class FlinkConversions {
                                     + "' referenced in '"
                                     + key
                                     + "' does not exist in the table schema.");
+                }
+                if (partitionKeySet.contains(columnName)) {
+                    // Phase M.3: partition keys must remain in the default group; enrichment
+                    // values are NULL at base-write time and cannot determine the partition.
+                    throw new ValidationException(
+                            "Column '"
+                                    + columnName
+                                    + "' is a partition key and cannot be added to column "
+                                    + "group '"
+                                    + groupName
+                                    + "'. Partition keys must belong to the default group.");
                 }
                 if (!columnsInThisGroup.add(columnName)) {
                     throw new ValidationException(
