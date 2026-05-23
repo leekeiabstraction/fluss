@@ -33,6 +33,16 @@ public abstract class SourceSplitState {
         return split.getTableBucket();
     }
 
+    /**
+     * Returns the partition name (e.g. {@code "2025-12-31"}) if the underlying split is bound to a
+     * partition, or {@code null} for a non-partitioned table. Phase M.4 surfaces this to the record
+     * emitter so the {@code partition} METADATA column can be populated.
+     */
+    @javax.annotation.Nullable
+    public final String getPartitionName() {
+        return split.getPartitionName();
+    }
+
     /** Checks whether this split state is a hybrid snapshot log split state. */
     public final boolean isHybridSnapshotLogSplitState() {
         return getClass() == HybridSnapshotLogSplitState.class;

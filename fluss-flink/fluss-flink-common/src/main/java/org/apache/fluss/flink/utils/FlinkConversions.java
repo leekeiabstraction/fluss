@@ -881,7 +881,9 @@ public class FlinkConversions {
      */
     private static boolean isSupportedMetadataColumn(Column.MetadataColumn col) {
         String key = col.getMetadataKey().orElse(col.getName());
-        return MetadataAppender.BUCKET_KEY.equals(key) || MetadataAppender.OFFSET_KEY.equals(key);
+        return MetadataAppender.BUCKET_KEY.equals(key)
+                || MetadataAppender.OFFSET_KEY.equals(key)
+                || MetadataAppender.PARTITION_KEY.equals(key);
     }
 
     /**

@@ -369,6 +369,59 @@ abstract class FlinkTableSourceITCase extends AbstractTestBase {
     }
 
     @Test
+    void testPartitionedColumnGroupTableMetadataColumns() throws Exception {
+        // Phase M.4: bucket/offset/partition METADATA columns on a partitioned column-group
+        // table. Source-side splice reads the partition name from the LogSplit (no per-record
+        // catalog lookup needed) and emits it as a STRING METADATA column.
+        tEnv.executeSql(
+                "create table cg_partitioned_meta ("
+                        + "  dt string, device_id int, payload string,"
+                        + "  geo_region string, risk_score double,"
+                        + "  _partition string metadata from 'partition' virtual,"
+                        + "  _bucket bigint metadata from 'bucket' virtual,"
+                        + "  _offset bigint metadata from 'offset' virtual"
+                        + ") partitioned by (dt) with ("
+                        + " 'column-groups.enriched' = 'geo_region, risk_score',"
+                        + " 'bucket.key' = 'device_id', 'bucket.num' = '1')");
+        TablePath tablePath = TablePath.of(DEFAULT_DB, "cg_partitioned_meta");
+        long tableId = admin.getTableInfo(tablePath).get().getTableId();
+
+        // Add two partitions and wait for them to be ready.
+        tEnv.executeSql("alter table cg_partitioned_meta add partition (dt='2025-01-01')");
+        tEnv.executeSql("alter table cg_partitioned_meta add partition (dt='2025-01-02')");
+
+        // Write rows into both partitions via the Java client.
+        try (Table table = conn.getTable(tablePath)) {
+            AppendWriter writer = table.newAppend().createWriter();
+            for (int i = 0; i < 3; i++) {
+                writer.append(row("2025-01-01", i, "p" + i, null, null)).get();
+            }
+            for (int i = 0; i < 2; i++) {
+                writer.append(row("2025-01-02", i, "q" + i, null, null)).get();
+            }
+            writer.flush();
+        }
+
+        // Project (partition, bucket, offset, device_id) — assert each row carries the
+        // partition name it was written to and offsets are 0-based per partition.
+        // Order across partitions is not guaranteed; use ignore-order assertion.
+        List<String> expected = new ArrayList<>();
+        for (int i = 0; i < 3; i++) {
+            expected.add(String.format("+I[2025-01-01, 0, %d, %d]", i, i));
+        }
+        for (int i = 0; i < 2; i++) {
+            expected.add(String.format("+I[2025-01-02, 0, %d, %d]", i, i));
+        }
+        try (org.apache.flink.util.CloseableIterator<Row> iter =
+                tEnv.executeSql(
+                                "select _partition, _bucket, _offset, device_id "
+                                        + "from cg_partitioned_meta")
+                        .collect()) {
+            assertResultsIgnoreOrder(iter, expected, true);
+        }
+    }
+
+    @Test
     void testColumnGroupTableMetadataColumns() throws Exception {
         // Phase L.2: bucket/offset exposed as Flink METADATA columns. Opt-in via the user's
         // CREATE TABLE — if no METADATA columns are declared, the existing read path is

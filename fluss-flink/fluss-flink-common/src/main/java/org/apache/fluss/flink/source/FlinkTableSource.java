@@ -526,6 +526,13 @@ public class FlinkTableSource
         Map<String, DataType> m = new LinkedHashMap<>();
         m.put(MetadataAppender.BUCKET_KEY, DataTypes.BIGINT().notNull());
         m.put(MetadataAppender.OFFSET_KEY, DataTypes.BIGINT().notNull());
+        // Phase M.4: partition exposed only on partitioned tables. The value is the
+        // user-visible partition name (e.g. "2025-12-31"), not the internal numeric ID;
+        // it can be NULL only for non-partitioned splits, which don't exist on a
+        // partitioned table — declared NOT NULL.
+        if (isPartitioned()) {
+            m.put(MetadataAppender.PARTITION_KEY, DataTypes.STRING().notNull());
+        }
         return m;
     }
 

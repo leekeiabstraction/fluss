@@ -136,8 +136,12 @@ public class FlinkRecordEmitter<OUT> implements RecordEmitter<RecordAndPos, OUT,
             if (metadataAppender != null) {
                 int bucket = currentSplitState.getTableBucket().getBucket();
                 long offset = scanRecord.logOffset();
+                String partitionName = currentSplitState.getPartitionName();
                 @SuppressWarnings("unchecked")
-                OUT spliced = (OUT) metadataAppender.splice((RowData) record, bucket, offset);
+                OUT spliced =
+                        (OUT)
+                                metadataAppender.splice(
+                                        (RowData) record, bucket, offset, partitionName);
                 record = spliced;
             }
             long timestamp = scanRecord.timestamp();

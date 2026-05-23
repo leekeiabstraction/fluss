@@ -19,6 +19,9 @@ package org.apache.fluss.flink.source.metadata;
 
 import org.apache.flink.table.data.GenericRowData;
 import org.apache.flink.table.data.RowData;
+import org.apache.flink.table.data.StringData;
+
+import javax.annotation.Nullable;
 
 import java.io.Serializable;
 import java.util.List;
@@ -36,11 +39,14 @@ public class MetadataAppender implements Serializable {
 
     public static final String BUCKET_KEY = "bucket";
     public static final String OFFSET_KEY = "offset";
+    public static final String PARTITION_KEY = "partition";
 
     /** Sentinel values for the output plan. Physical row indices are non-negative. */
     private static final int BUCKET_SLOT = -1;
 
     private static final int OFFSET_SLOT = -2;
+
+    private static final int PARTITION_SLOT = -3;
 
     /**
      * For each position in the produced row: a non-negative value is an index into the physical row
@@ -57,18 +63,23 @@ public class MetadataAppender implements Serializable {
         return outputPlan.length;
     }
 
-    public RowData splice(RowData physicalRow, int bucket, long offset) {
+    public RowData splice(
+            RowData physicalRow, int bucket, long offset, @Nullable String partitionName) {
         GenericRowData out = new GenericRowData(outputPlan.length);
         out.setRowKind(physicalRow.getRowKind());
         GenericRowData phys = (GenericRowData) physicalRow;
+        StringData partitionStringData =
+                partitionName == null ? null : StringData.fromString(partitionName);
         for (int i = 0; i < outputPlan.length; i++) {
             int slot = outputPlan[i];
             if (slot >= 0) {
                 out.setField(i, phys.getField(slot));
             } else if (slot == BUCKET_SLOT) {
                 out.setField(i, (long) bucket);
-            } else {
+            } else if (slot == OFFSET_SLOT) {
                 out.setField(i, offset);
+            } else if (slot == PARTITION_SLOT) {
+                out.setField(i, partitionStringData);
             }
         }
         return out;
@@ -108,6 +119,8 @@ public class MetadataAppender implements Serializable {
             return BUCKET_SLOT;
         } else if (OFFSET_KEY.equals(key)) {
             return OFFSET_SLOT;
+        } else if (PARTITION_KEY.equals(key)) {
+            return PARTITION_SLOT;
         } else {
             throw new IllegalArgumentException("Unknown metadata key: " + key);
         }
