@@ -27,6 +27,7 @@ import org.apache.fluss.flink.source.deserializer.RowDataDeserializationSchema;
 import org.apache.fluss.flink.source.lookup.FlinkAsyncLookupFunction;
 import org.apache.fluss.flink.source.lookup.FlinkLookupFunction;
 import org.apache.fluss.flink.source.lookup.LookupNormalizer;
+import org.apache.fluss.flink.source.metadata.MetadataAppender;
 import org.apache.fluss.flink.source.reader.LeaseContext;
 import org.apache.fluss.flink.utils.FlinkConnectorOptionsUtils;
 import org.apache.fluss.flink.utils.FlinkConversions;
@@ -52,6 +53,7 @@ import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.api.connector.source.Source;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.table.api.DataTypes;
 import org.apache.flink.table.connector.ChangelogMode;
 import org.apache.flink.table.connector.ProviderContext;
 import org.apache.flink.table.connector.RowLevelModificationScanContext;
@@ -64,6 +66,7 @@ import org.apache.flink.table.connector.source.abilities.SupportsAggregatePushDo
 import org.apache.flink.table.connector.source.abilities.SupportsFilterPushDown;
 import org.apache.flink.table.connector.source.abilities.SupportsLimitPushDown;
 import org.apache.flink.table.connector.source.abilities.SupportsProjectionPushDown;
+import org.apache.flink.table.connector.source.abilities.SupportsReadingMetadata;
 import org.apache.flink.table.connector.source.abilities.SupportsRowLevelModificationScan;
 import org.apache.flink.table.connector.source.lookup.AsyncLookupFunctionProvider;
 import org.apache.flink.table.connector.source.lookup.LookupFunctionProvider;
@@ -77,6 +80,7 @@ import org.apache.flink.table.expressions.ResolvedExpression;
 import org.apache.flink.table.functions.AsyncLookupFunction;
 import org.apache.flink.table.functions.FunctionDefinition;
 import org.apache.flink.table.functions.LookupFunction;
+import org.apache.flink.table.runtime.typeutils.InternalTypeInfo;
 import org.apache.flink.table.types.DataType;
 import org.apache.flink.table.types.logical.LogicalType;
 import org.apache.flink.types.RowKind;
@@ -91,6 +95,7 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -108,6 +113,7 @@ public class FlinkTableSource
         implements ScanTableSource,
                 SupportsProjectionPushDown,
                 SupportsFilterPushDown,
+                SupportsReadingMetadata,
                 LookupTableSource,
                 SupportsRowLevelModificationScan,
                 SupportsLimitPushDown,
@@ -167,6 +173,9 @@ public class FlinkTableSource
 
     @Nullable private LakeSource<LakeSplit> lakeSource;
     @Nullable private Predicate logRecordBatchFilter;
+
+    /** Metadata keys applied by Flink in declared order. Empty means no metadata splice. */
+    private List<String> appliedMetadataKeys = Collections.emptyList();
 
     public FlinkTableSource(
             TablePath tablePath,
@@ -323,9 +332,22 @@ public class FlinkTableSource
         }
 
         // handle normal scan
+        // Plan the metadata splice (a no-op when no METADATA columns are applied).
+        int physicalArity = tableOutputType.getFieldCount();
+        MetadataAppender.Result metadataPlan =
+                MetadataAppender.plan(projectedFields, physicalArity, appliedMetadataKeys);
+        int[] physicalProjection = metadataPlan.physicalProjection;
+        MetadataAppender appender = appliedMetadataKeys.isEmpty() ? null : metadataPlan.appender;
+        TypeInformation<RowData> producedTypeInfoOverride = null;
+        if (appender != null) {
+            producedTypeInfoOverride =
+                    InternalTypeInfo.of(
+                            (org.apache.flink.table.types.logical.RowType) producedDataType);
+        }
+
         RowType flussRowType = FlinkConversions.toFlussRowType(tableOutputType);
-        if (projectedFields != null) {
-            flussRowType = flussRowType.project(projectedFields);
+        if (physicalProjection != null) {
+            flussRowType = flussRowType.project(physicalProjection);
         }
         OffsetsInitializer offsetsInitializer;
         boolean enableLakeSource = false;
@@ -358,7 +380,7 @@ public class FlinkTableSource
                         hasPrimaryKey(),
                         isPartitioned(),
                         flussRowType,
-                        projectedFields,
+                        physicalProjection,
                         logRecordBatchFilter,
                         offsetsInitializer,
                         scanPartitionDiscoveryIntervalMs,
@@ -366,7 +388,9 @@ public class FlinkTableSource
                         streaming,
                         partitionFilters,
                         enableLakeSource ? lakeSource : null,
-                        leaseContext);
+                        leaseContext,
+                        appender,
+                        producedTypeInfoOverride);
 
         if (!streaming) {
             // return a bounded source provide to make planner happy,
@@ -466,6 +490,7 @@ public class FlinkTableSource
         source.partitionFilters = partitionFilters;
         source.lakeSource = lakeSource;
         source.logRecordBatchFilter = logRecordBatchFilter;
+        source.appliedMetadataKeys = new ArrayList<>(appliedMetadataKeys);
         // Note: availableStatsColumns is already computed in the constructor
         return source;
     }
@@ -485,8 +510,29 @@ public class FlinkTableSource
         this.projectedFields = Arrays.stream(projectedFields).mapToInt(value -> value[0]).toArray();
         this.producedDataType = producedDataType.getLogicalType();
         if (lakeSource != null) {
-            lakeSource.withProject(projectedFields);
+            // Lake source only understands physical (non-metadata) columns. When metadata cols
+            // are projected, strip them before passing to lakeSource.
+            int physicalArity = tableOutputType.getFieldCount();
+            int[][] physicalProjection =
+                    Arrays.stream(projectedFields)
+                            .filter(p -> p[0] < physicalArity)
+                            .toArray(int[][]::new);
+            lakeSource.withProject(physicalProjection);
         }
+    }
+
+    @Override
+    public Map<String, DataType> listReadableMetadata() {
+        Map<String, DataType> m = new LinkedHashMap<>();
+        m.put(MetadataAppender.BUCKET_KEY, DataTypes.BIGINT().notNull());
+        m.put(MetadataAppender.OFFSET_KEY, DataTypes.BIGINT().notNull());
+        return m;
+    }
+
+    @Override
+    public void applyReadableMetadata(List<String> metadataKeys, DataType producedDataType) {
+        this.appliedMetadataKeys = new ArrayList<>(metadataKeys);
+        this.producedDataType = producedDataType.getLogicalType();
     }
 
     @Override

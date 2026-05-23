@@ -339,6 +339,256 @@ abstract class FlinkTableSourceITCase extends AbstractTestBase {
     }
 
     @Test
+    void testColumnGroupTableMetadataColumns() throws Exception {
+        // Phase L.2: bucket/offset exposed as Flink METADATA columns. Opt-in via the user's
+        // CREATE TABLE — if no METADATA columns are declared, the existing read path is
+        // unchanged.
+        tEnv.executeSql(
+                "create table cg_metadata ("
+                        + "  device_id int, "
+                        + "  payload string, "
+                        + "  geo_region string, "
+                        + "  risk_score double,"
+                        + "  _bucket bigint metadata from 'bucket' virtual,"
+                        + "  _offset bigint metadata from 'offset' virtual"
+                        + ") with ('column-groups.enriched' = 'geo_region, risk_score',"
+                        + " 'bucket.key' = 'device_id', 'bucket.num' = '1')");
+        TablePath tablePath = TablePath.of(DEFAULT_DB, "cg_metadata");
+        long tableId = admin.getTableInfo(tablePath).get().getTableId();
+        FLUSS_CLUSTER_EXTENSION.waitUntilTableReady(tableId);
+
+        // Write 10 base rows. Single bucket → bucket id is always 0; offsets 0..9.
+        try (Table table = conn.getTable(tablePath)) {
+            AppendWriter writer = table.newAppend().createWriter();
+            for (int i = 0; i < 10; i++) {
+                writer.append(row(i, "p" + i, null, null)).get();
+            }
+            writer.flush();
+        }
+
+        // Metadata projection in arbitrary position — outputs (_bucket, _offset, device_id).
+        List<String> withMetadata = new ArrayList<>();
+        for (int i = 0; i < 10; i++) {
+            withMetadata.add(String.format("+I[0, %d, %d]", i, i));
+        }
+        assertQueryResultExactOrder(
+                tEnv, "select _bucket, _offset, device_id from cg_metadata", withMetadata);
+
+        // Regression: a query that does not request any metadata column behaves as before.
+        List<String> noMetadata = new ArrayList<>();
+        for (int i = 0; i < 10; i++) {
+            noMetadata.add(String.format("+I[%d, p%d]", i, i));
+        }
+        assertQueryResultExactOrder(tEnv, "select device_id, payload from cg_metadata", noMetadata);
+    }
+
+    @Test
+    void testEnrichmentSinkViaSql() throws Exception {
+        // Phase L.3: end-to-end SQL enrichment pipeline (Option B). User reads base rows from
+        // cg_l3_base, projects bucket/offset + computed enrichment values, and writes them to a
+        // write-only enrichment-target table; the CEW on the base table advances.
+        tEnv.executeSql(
+                "create table cg_l3_base ("
+                        + "  device_id int, "
+                        + "  payload string, "
+                        + "  geo_region string, "
+                        + "  risk_score double,"
+                        + "  _bucket bigint metadata from 'bucket' virtual,"
+                        + "  _offset bigint metadata from 'offset' virtual"
+                        + ") with ('column-groups.enriched' = 'geo_region, risk_score',"
+                        + " 'bucket.key' = 'device_id', 'bucket.num' = '1')");
+        TablePath basePath = TablePath.of(DEFAULT_DB, "cg_l3_base");
+        long tableId = admin.getTableInfo(basePath).get().getTableId();
+        FLUSS_CLUSTER_EXTENSION.waitUntilTableReady(tableId);
+        TableBucket bucket = new TableBucket(tableId, 0);
+
+        // Write 5 base rows.
+        try (Table table = conn.getTable(basePath)) {
+            AppendWriter writer = table.newAppend().createWriter();
+            for (int i = 0; i < 5; i++) {
+                writer.append(row(i, "p" + i, null, null)).get();
+            }
+            writer.flush();
+        }
+
+        // Declare the write-only enrichment sink.
+        tEnv.executeSql(
+                "create table cg_l3_writes ("
+                        + "  src_bucket bigint, "
+                        + "  src_offset bigint, "
+                        + "  geo_region string, "
+                        + "  risk_score double"
+                        + ") with ('enrichment.target' = 'cg_l3_base',"
+                        + " 'enrichment.group' = 'enriched')");
+
+        // SELECT from a write-only enrichment table must be rejected at plan time.
+        assertThatThrownBy(() -> tEnv.executeSql("select * from cg_l3_writes"))
+                .getRootCause()
+                .hasMessageContaining("write-only enrichment target");
+
+        // Run the streaming INSERT (it will write rows then keep running).
+        org.apache.flink.table.api.TableResult insertResult =
+                tEnv.executeSql(
+                        "insert into cg_l3_writes "
+                                + "select _bucket, _offset, "
+                                + "       'US-' || cast(device_id as string), "
+                                + "       cast(device_id as double) / 10.0 "
+                                + "from cg_l3_base");
+
+        try {
+            retry(
+                    java.time.Duration.ofMinutes(1),
+                    () ->
+                            assertThat(
+                                            FLUSS_CLUSTER_EXTENSION
+                                                    .waitAndGetLeaderReplica(bucket)
+                                                    .getLogTablet()
+                                                    .getCommittedEnrichmentWatermark("enriched"))
+                                    .isEqualTo(5L));
+        } finally {
+            insertResult.getJobClient().ifPresent(jc -> jc.cancel());
+        }
+
+        // Verify via SELECT: enrichment cols filled on base read.
+        assertQueryResultExactOrder(
+                tEnv,
+                "select device_id, geo_region, risk_score from cg_l3_base",
+                Arrays.asList(
+                        "+I[0, US-0, 0.0]",
+                        "+I[1, US-1, 0.1]",
+                        "+I[2, US-2, 0.2]",
+                        "+I[3, US-3, 0.3]",
+                        "+I[4, US-4, 0.4]"));
+    }
+
+    @Test
+    void testEnrichmentSinkRejectsMalformed() throws Exception {
+        // Phase L.4: validation negatives. CREATE-TABLE-time rejections (pairing, PK) come from
+        // FlinkConversions.validateEnrichmentPairing; INSERT-time rejections (target/group/schema
+        // mismatch) come from EnrichmentTableSink.resolveTarget.
+
+        // Catalog-time rejections — these don't need a target table to exist.
+
+        // (a) enrichment.target without enrichment.group.
+        assertThatThrownBy(
+                        () ->
+                                tEnv.executeSql(
+                                        "create table cg_bad_no_group ("
+                                                + "src_bucket bigint, src_offset bigint, c string"
+                                                + ") with ('enrichment.target' = 'cg_l4_base')"))
+                .getRootCause()
+                .hasMessageContaining("'enrichment.target' requires 'enrichment.group'");
+
+        // (b) enrichment.group without enrichment.target.
+        assertThatThrownBy(
+                        () ->
+                                tEnv.executeSql(
+                                        "create table cg_bad_no_target ("
+                                                + "src_bucket bigint, src_offset bigint, c string"
+                                                + ") with ('enrichment.group' = 'enriched')"))
+                .getRootCause()
+                .hasMessageContaining("'enrichment.group' requires 'enrichment.target'");
+
+        // (c) PRIMARY KEY on enrichment sink table.
+        assertThatThrownBy(
+                        () ->
+                                tEnv.executeSql(
+                                        "create table cg_bad_pk_sink ("
+                                                + "src_bucket bigint not null, src_offset bigint, c string,"
+                                                + " primary key (src_bucket) not enforced"
+                                                + ") with ('enrichment.target' = 'cg_l4_base',"
+                                                + " 'enrichment.group' = 'enriched')"))
+                .getRootCause()
+                .hasMessageContaining("must be log-only");
+
+        // INSERT-time rejections — set up a real base column-group table to validate against.
+        tEnv.executeSql(
+                "create table cg_l4_base ("
+                        + "  device_id int, payload string, "
+                        + "  geo_region string, risk_score double,"
+                        + "  _bucket bigint metadata from 'bucket' virtual,"
+                        + "  _offset bigint metadata from 'offset' virtual"
+                        + ") with ('column-groups.enriched' = 'geo_region, risk_score',"
+                        + " 'bucket.key' = 'device_id', 'bucket.num' = '1')");
+
+        // (d) enrichment.target points at a non-existent table.
+        tEnv.executeSql(
+                "create table cg_l4_bad_target ("
+                        + "  src_bucket bigint, src_offset bigint,"
+                        + "  geo_region string, risk_score double"
+                        + ") with ('enrichment.target' = 'no_such_table',"
+                        + " 'enrichment.group' = 'enriched')");
+        assertThatThrownBy(
+                        () ->
+                                tEnv.executeSql(
+                                        "insert into cg_l4_bad_target "
+                                                + "select cast(0 as bigint), cast(0 as bigint),"
+                                                + " cast(null as string), cast(null as double)"))
+                .getRootCause()
+                .hasMessageContaining("does not exist");
+
+        // (e) target exists but group doesn't.
+        tEnv.executeSql(
+                "create table cg_l4_bad_group ("
+                        + "  src_bucket bigint, src_offset bigint,"
+                        + "  geo_region string, risk_score double"
+                        + ") with ('enrichment.target' = 'cg_l4_base',"
+                        + " 'enrichment.group' = 'no_such_group')");
+        assertThatThrownBy(
+                        () ->
+                                tEnv.executeSql(
+                                        "insert into cg_l4_bad_group "
+                                                + "select cast(0 as bigint), cast(0 as bigint),"
+                                                + " cast(null as string), cast(null as double)"))
+                .hasMessageContaining("not declared on enrichment target");
+
+        // (f) schema mismatch — column count.
+        tEnv.executeSql(
+                "create table cg_l4_bad_count ("
+                        + "  src_bucket bigint, src_offset bigint,"
+                        + "  geo_region string"
+                        + ") with ('enrichment.target' = 'cg_l4_base',"
+                        + " 'enrichment.group' = 'enriched')");
+        assertThatThrownBy(
+                        () ->
+                                tEnv.executeSql(
+                                        "insert into cg_l4_bad_count "
+                                                + "select cast(0 as bigint), cast(0 as bigint),"
+                                                + " cast(null as string)"))
+                .hasMessageContaining("expects 4 columns");
+
+        // (g) schema mismatch — value column type.
+        tEnv.executeSql(
+                "create table cg_l4_bad_type ("
+                        + "  src_bucket bigint, src_offset bigint,"
+                        + "  geo_region int, risk_score double"
+                        + ") with ('enrichment.target' = 'cg_l4_base',"
+                        + " 'enrichment.group' = 'enriched')");
+        assertThatThrownBy(
+                        () ->
+                                tEnv.executeSql(
+                                        "insert into cg_l4_bad_type "
+                                                + "select cast(0 as bigint), cast(0 as bigint),"
+                                                + " cast(0 as int), cast(null as double)"))
+                .hasMessageContaining("does not match target group");
+
+        // (h) leading column not BIGINT.
+        tEnv.executeSql(
+                "create table cg_l4_bad_leading ("
+                        + "  src_bucket int, src_offset bigint,"
+                        + "  geo_region string, risk_score double"
+                        + ") with ('enrichment.target' = 'cg_l4_base',"
+                        + " 'enrichment.group' = 'enriched')");
+        assertThatThrownBy(
+                        () ->
+                                tEnv.executeSql(
+                                        "insert into cg_l4_bad_leading "
+                                                + "select cast(0 as int), cast(0 as bigint),"
+                                                + " cast(null as string), cast(null as double)"))
+                .hasMessageContaining("must be BIGINT");
+    }
+
+    @Test
     void testColumnGroupTableSqlRead() throws Exception {
         // Phase I.2: verify Flink SQL reads of a column-group table mirror direct Java-client
         // semantics — projection touching enrichment columns is gated at CEW; base-only
@@ -588,7 +838,7 @@ abstract class FlinkTableSourceITCase extends AbstractTestBase {
                 .contains(
                         "TableSourceScan(table=[[testcatalog, defaultdb, "
                                 + tableName
-                                + ", project=[b, d, c]]], fields=[b, d, c])");
+                                + ", project=[b, d, c], metadata=[]]], fields=[b, d, c])");
 
         List<String> expected =
                 Arrays.asList(
@@ -647,7 +897,7 @@ abstract class FlinkTableSourceITCase extends AbstractTestBase {
                 .contains(
                         "TableSourceScan(table=[[testcatalog, defaultdb, "
                                 + tableName
-                                + ", project=[b, a, c]]], fields=[b, a, c])");
+                                + ", project=[b, a, c], metadata=[]]], fields=[b, a, c])");
 
         List<String> expected =
                 Arrays.asList(
@@ -1658,7 +1908,7 @@ abstract class FlinkTableSourceITCase extends AbstractTestBase {
                 .contains(
                         "TableSourceScan(table=[[testcatalog, defaultdb, combined_filters_table, "
                                 + "filter=[=(c, _UTF-16LE'2025':VARCHAR(2147483647) CHARACTER SET \"UTF-16LE\")], "
-                                + "project=[a, c, d]]], fields=[a, c, d])");
+                                + "project=[a, c, d], metadata=[]]], fields=[a, c, d])");
 
         // test column filter, partition filter and flink runtime filter
         org.apache.flink.util.CloseableIterator<Row> rowIter =
@@ -1675,7 +1925,7 @@ abstract class FlinkTableSourceITCase extends AbstractTestBase {
                 .contains(
                         "TableSourceScan(table=[[testcatalog, defaultdb, combined_filters_table, "
                                 + "filter=[=(c, _UTF-16LE'2025':VARCHAR(2147483647) CHARACTER SET \"UTF-16LE\")], "
-                                + "project=[a, c, d]]], fields=[a, c, d])");
+                                + "project=[a, c, d], metadata=[]]], fields=[a, c, d])");
 
         // test column filter, partition filter and flink runtime filter
         rowIter =
@@ -1741,7 +1991,7 @@ abstract class FlinkTableSourceITCase extends AbstractTestBase {
                 .contains(
                         "TableSourceScan(table=[[testcatalog, defaultdb, combined_filters_table, "
                                 + "filter=[and(=(c, _UTF-16LE'2025':VARCHAR(2147483647) CHARACTER SET \"UTF-16LE\"), >(d, 200))], "
-                                + "project=[a, c, d]]], fields=[a, c, d])");
+                                + "project=[a, c, d], metadata=[]]], fields=[a, c, d])");
         // assert predicates are still retained in the Calc operator (FLINK-38635 safety net)
         assertThat(plan).contains("where=");
 
@@ -2132,7 +2382,7 @@ abstract class FlinkTableSourceITCase extends AbstractTestBase {
         String plan = tEnv.explainSql(query1);
         assertThat(plan)
                 .contains(
-                        "TableSourceScan(table=[[testcatalog, defaultdb, combined_filters_table_in, filter=[OR(=(c, _UTF-16LE'2025'), =(c, _UTF-16LE'2026'))], project=[a, c, d]]], fields=[a, c, d])");
+                        "TableSourceScan(table=[[testcatalog, defaultdb, combined_filters_table_in, filter=[OR(=(c, _UTF-16LE'2025'), =(c, _UTF-16LE'2026'))], project=[a, c, d], metadata=[]]], fields=[a, c, d])");
 
         // test column filter, partition filter and flink runtime filter
         org.apache.flink.util.CloseableIterator<Row> rowIter = tEnv.executeSql(query1).collect();

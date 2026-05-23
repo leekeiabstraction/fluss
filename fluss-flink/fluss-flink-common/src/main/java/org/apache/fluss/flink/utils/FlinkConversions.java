@@ -21,8 +21,10 @@ import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.config.ConfigOption;
 import org.apache.fluss.config.MemorySize;
 import org.apache.fluss.config.Password;
+import org.apache.fluss.flink.FlinkConnectorOptions;
 import org.apache.fluss.flink.adapter.CatalogTableAdapter;
 import org.apache.fluss.flink.catalog.FlinkCatalogFactory;
+import org.apache.fluss.flink.source.metadata.MetadataAppender;
 import org.apache.fluss.metadata.AggFunction;
 import org.apache.fluss.metadata.DatabaseDescriptor;
 import org.apache.fluss.metadata.MergeEngineType;
@@ -175,8 +177,9 @@ public class FlinkConversions {
                     schemaBuilder.withComment(column.getComment().get());
                 }
             } else {
-                // build non-physical column from options
-                CatalogPropertiesUtils.deserializeComputedColumn(newOptions, i, schemaBuilder);
+                // build non-physical column from options — dispatches to metadata or computed
+                // depending on what was serialized at this position.
+                CatalogPropertiesUtils.deserializeNonPhysicalColumn(newOptions, i, schemaBuilder);
             }
         }
 
@@ -230,6 +233,10 @@ public class FlinkConversions {
         // Check if aggregation merge engine is enabled to optimize parsing
         boolean isAggregationEngine = isAggregationMergeEngine(flinkTableConf);
 
+        // Phase L.3: catalog-time pairing + PK check for enrichment-target tables. Heavy
+        // (cross-table) schema validation is deferred to sink-build time (PHASE_L Option B §2.4).
+        validateEnrichmentPairing(flinkTableConf, resolvedSchema);
+
         // Phase K: parse `column-groups.<groupName>` DDL properties up-front so each column
         // can be tagged to its group as it's added below. Validation errors throw
         // ValidationException at create time (PHASE_K §4.4).
@@ -273,13 +280,19 @@ public class FlinkConversions {
                 extractCustomProperties(flinkTableConf, storageProperties);
         CatalogPropertiesUtils.serializeComputedColumns(
                 customProperties, resolvedSchema.getColumns());
+        CatalogPropertiesUtils.serializeMetadataColumns(
+                customProperties, resolvedSchema.getColumns());
         CatalogPropertiesUtils.serializeWatermarkSpecs(
                 customProperties, catalogBaseTable.getResolvedSchema().getWatermarkSpecs());
 
         Schema schema = schemBuilder.build();
 
+        // Reject unsupported metadata columns. Phase L.2 introduces two read-only METADATA
+        // keys: `bucket` and `offset`. VIRTUAL declarations on those keys are allowed —
+        // they're spliced in by the source emitter, not persisted in the Fluss schema.
         resolvedSchema.getColumns().stream()
                 .filter(col -> col instanceof Column.MetadataColumn)
+                .filter(col -> !isSupportedMetadataColumn((Column.MetadataColumn) col))
                 .findAny()
                 .ifPresent(
                         (col) -> {
@@ -841,4 +854,42 @@ public class FlinkConversions {
 
     /** Phase K: property-key prefix for declaring column groups in {@code CREATE TABLE WITH}. */
     private static final String COLUMN_GROUPS_PREFIX = "column-groups.";
+
+    /**
+     * Phase L.2: bucket/offset metadata columns are allowed on column-group / log tables so users
+     * can project addressing primitives into downstream enrichment writes. The metadata key falls
+     * back to the column name if not declared explicitly via {@code FROM 'key'}.
+     */
+    private static boolean isSupportedMetadataColumn(Column.MetadataColumn col) {
+        String key = col.getMetadataKey().orElse(col.getName());
+        return MetadataAppender.BUCKET_KEY.equals(key) || MetadataAppender.OFFSET_KEY.equals(key);
+    }
+
+    /**
+     * Phase L.3: catalog-time validation for enrichment-target tables. Catches malformed DDL at
+     * {@code CREATE TABLE} time, before any sink build is attempted. Schema validation against the
+     * target's column group runs later, at sink-build time, where the {@link
+     * org.apache.fluss.client.admin.Admin} is reachable.
+     */
+    private static void validateEnrichmentPairing(
+            Configuration flinkTableConf, ResolvedSchema resolvedSchema) {
+        boolean hasTarget = flinkTableConf.contains(FlinkConnectorOptions.ENRICHMENT_TARGET);
+        boolean hasGroup = flinkTableConf.contains(FlinkConnectorOptions.ENRICHMENT_GROUP);
+        if (!hasTarget && !hasGroup) {
+            return;
+        }
+        if (hasTarget && !hasGroup) {
+            throw new ValidationException(
+                    "'enrichment.target' requires 'enrichment.group' to also be set.");
+        }
+        if (hasGroup && !hasTarget) {
+            throw new ValidationException(
+                    "'enrichment.group' requires 'enrichment.target' to also be set.");
+        }
+        if (resolvedSchema.getPrimaryKey().isPresent()) {
+            throw new ValidationException(
+                    "Enrichment-target tables must be log-only; remove the PRIMARY KEY "
+                            + "declaration.");
+        }
+    }
 }

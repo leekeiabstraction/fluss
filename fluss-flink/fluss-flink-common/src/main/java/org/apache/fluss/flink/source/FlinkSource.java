@@ -23,6 +23,7 @@ import org.apache.fluss.flink.source.deserializer.DeserializerInitContextImpl;
 import org.apache.fluss.flink.source.deserializer.FlussDeserializationSchema;
 import org.apache.fluss.flink.source.emitter.FlinkRecordEmitter;
 import org.apache.fluss.flink.source.enumerator.FlinkSourceEnumerator;
+import org.apache.fluss.flink.source.metadata.MetadataAppender;
 import org.apache.fluss.flink.source.metrics.FlinkSourceReaderMetrics;
 import org.apache.fluss.flink.source.reader.FlinkSourceReader;
 import org.apache.fluss.flink.source.reader.LeaseContext;
@@ -75,6 +76,16 @@ public class FlinkSource<OUT>
 
     @Nullable private final Predicate logRecordBatchFilter;
 
+    /** When non-null, splices bucket/offset METADATA values into emitted rows. */
+    @Nullable private final MetadataAppender metadataAppender;
+
+    /**
+     * When non-null, returned from {@link #getProducedType()} in place of the deserializer's
+     * physical-only type. Needed because METADATA columns widen the produced row beyond the
+     * Fluss-side schema.
+     */
+    @Nullable private final TypeInformation<OUT> producedTypeInfoOverride;
+
     public FlinkSource(
             Configuration flussConf,
             TablePath tablePath,
@@ -121,6 +132,42 @@ public class FlinkSource<OUT>
             @Nullable Predicate partitionFilters,
             @Nullable LakeSource<LakeSplit> lakeSource,
             LeaseContext leaseContext) {
+        this(
+                flussConf,
+                tablePath,
+                hasPrimaryKey,
+                isPartitioned,
+                sourceOutputType,
+                projectedFields,
+                logRecordBatchFilter,
+                offsetsInitializer,
+                scanPartitionDiscoveryIntervalMs,
+                deserializationSchema,
+                streaming,
+                partitionFilters,
+                lakeSource,
+                leaseContext,
+                null,
+                null);
+    }
+
+    public FlinkSource(
+            Configuration flussConf,
+            TablePath tablePath,
+            boolean hasPrimaryKey,
+            boolean isPartitioned,
+            RowType sourceOutputType,
+            @Nullable int[] projectedFields,
+            @Nullable Predicate logRecordBatchFilter,
+            OffsetsInitializer offsetsInitializer,
+            long scanPartitionDiscoveryIntervalMs,
+            FlussDeserializationSchema<OUT> deserializationSchema,
+            boolean streaming,
+            @Nullable Predicate partitionFilters,
+            @Nullable LakeSource<LakeSplit> lakeSource,
+            LeaseContext leaseContext,
+            @Nullable MetadataAppender metadataAppender,
+            @Nullable TypeInformation<OUT> producedTypeInfoOverride) {
         this.flussConf = flussConf;
         this.tablePath = tablePath;
         this.hasPrimaryKey = hasPrimaryKey;
@@ -135,6 +182,8 @@ public class FlinkSource<OUT>
         this.partitionFilters = partitionFilters;
         this.lakeSource = lakeSource;
         this.leaseContext = leaseContext;
+        this.metadataAppender = metadataAppender;
+        this.producedTypeInfoOverride = producedTypeInfoOverride;
     }
 
     @Override
@@ -210,7 +259,8 @@ public class FlinkSource<OUT>
                         context.metricGroup().addGroup("deserializer"),
                         context.getUserCodeClassLoader(),
                         sourceOutputType));
-        FlinkRecordEmitter<OUT> recordEmitter = new FlinkRecordEmitter<>(deserializationSchema);
+        FlinkRecordEmitter<OUT> recordEmitter =
+                new FlinkRecordEmitter<>(deserializationSchema, metadataAppender);
 
         return new FlinkSourceReader<>(
                 elementsQueue,
@@ -227,6 +277,9 @@ public class FlinkSource<OUT>
 
     @Override
     public TypeInformation<OUT> getProducedType() {
+        if (producedTypeInfoOverride != null) {
+            return producedTypeInfoOverride;
+        }
         return deserializationSchema.getProducedType(sourceOutputType);
     }
 }

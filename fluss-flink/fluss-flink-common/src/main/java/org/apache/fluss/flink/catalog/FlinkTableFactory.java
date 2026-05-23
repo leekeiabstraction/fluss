@@ -23,6 +23,7 @@ import org.apache.fluss.config.TableConfig;
 import org.apache.fluss.flink.FlinkConnectorOptions;
 import org.apache.fluss.flink.lake.LakeFlinkCatalog;
 import org.apache.fluss.flink.lake.LakeTableFactory;
+import org.apache.fluss.flink.sink.EnrichmentTableSink;
 import org.apache.fluss.flink.sink.FlinkTableSink;
 import org.apache.fluss.flink.sink.shuffle.DistributionMode;
 import org.apache.fluss.flink.source.BinlogFlinkTableSource;
@@ -37,6 +38,7 @@ import org.apache.flink.api.common.RuntimeExecutionMode;
 import org.apache.flink.configuration.ConfigOption;
 import org.apache.flink.configuration.ExecutionOptions;
 import org.apache.flink.configuration.ReadableConfig;
+import org.apache.flink.table.api.ValidationException;
 import org.apache.flink.table.api.config.TableConfigOptions;
 import org.apache.flink.table.catalog.ObjectIdentifier;
 import org.apache.flink.table.catalog.ResolvedCatalogTable;
@@ -106,6 +108,8 @@ public class FlinkTableFactory implements DynamicTableSourceFactory, DynamicTabl
 
         FactoryUtil.TableFactoryHelper helper = FactoryUtil.createTableFactoryHelper(this, context);
         final ReadableConfig tableOptions = helper.getOptions();
+        // Phase L.3: enrichment-target tables are write-only — reject SELECT at plan time.
+        rejectIfEnrichmentTarget(tableOptions, context.getObjectIdentifier());
         validateSourceOptions(tableOptions);
 
         boolean isStreamingMode =
@@ -174,6 +178,12 @@ public class FlinkTableFactory implements DynamicTableSourceFactory, DynamicTabl
         FactoryUtil.TableFactoryHelper helper = FactoryUtil.createTableFactoryHelper(this, context);
         final ReadableConfig tableOptions = helper.getOptions();
 
+        // Phase L.3: write-only enrichment sink.
+        if (tableOptions.getOptional(FlinkConnectorOptions.ENRICHMENT_TARGET).isPresent()
+                || tableOptions.getOptional(FlinkConnectorOptions.ENRICHMENT_GROUP).isPresent()) {
+            return buildEnrichmentSink(context, tableOptions);
+        }
+
         boolean isStreamingMode =
                 context.getConfiguration().get(ExecutionOptions.RUNTIME_MODE)
                         == RuntimeExecutionMode.STREAMING;
@@ -213,6 +223,97 @@ public class FlinkTableFactory implements DynamicTableSourceFactory, DynamicTabl
                 tableOptions.getOptional(FlinkConnectorOptions.SINK_PRODUCER_ID).orElse(null));
     }
 
+    /**
+     * Phase L.3: build the write-only enrichment sink. Validates pairing of {@code
+     * enrichment.target}/{@code enrichment.group}; defers schema validation to {@link
+     * EnrichmentTableSink}'s plan-time resolution.
+     */
+    private DynamicTableSink buildEnrichmentSink(Context context, ReadableConfig tableOptions) {
+        String target =
+                tableOptions
+                        .getOptional(FlinkConnectorOptions.ENRICHMENT_TARGET)
+                        .orElseThrow(
+                                () ->
+                                        new ValidationException(
+                                                "'enrichment.group' requires 'enrichment.target' "
+                                                        + "to also be set."));
+        String group =
+                tableOptions
+                        .getOptional(FlinkConnectorOptions.ENRICHMENT_GROUP)
+                        .orElseThrow(
+                                () ->
+                                        new ValidationException(
+                                                "'enrichment.target' requires 'enrichment.group' "
+                                                        + "to also be set."));
+        if (group.isEmpty()) {
+            throw new ValidationException("'enrichment.group' must not be empty.");
+        }
+        if (context.getPrimaryKeyIndexes().length > 0) {
+            throw new ValidationException(
+                    "Enrichment-target tables must be log-only; remove the PRIMARY KEY "
+                            + "declaration on "
+                            + context.getObjectIdentifier()
+                            + ".");
+        }
+        TablePath sinkPath = toFlussTablePath(context.getObjectIdentifier());
+        TablePath targetPath =
+                parseEnrichmentTarget(
+                        target, context.getObjectIdentifier().getDatabaseName(), sinkPath);
+        RowType sinkRowType = (RowType) context.getPhysicalRowDataType().getLogicalType();
+        return new EnrichmentTableSink(
+                sinkPath,
+                targetPath,
+                toFlussClientConfig(
+                        context.getCatalogTable().getOptions(), context.getConfiguration()),
+                group,
+                sinkRowType);
+    }
+
+    private static TablePath parseEnrichmentTarget(
+            String target, String defaultDatabase, TablePath sinkPath) {
+        if (target.isEmpty()) {
+            throw new ValidationException("'enrichment.target' must not be empty.");
+        }
+        String[] parts = target.split("\\.", -1);
+        TablePath parsed;
+        if (parts.length == 1) {
+            parsed = TablePath.of(defaultDatabase, parts[0]);
+        } else if (parts.length == 2) {
+            parsed = TablePath.of(parts[0], parts[1]);
+        } else {
+            throw new ValidationException(
+                    "'enrichment.target' must be of the form `<db>.<table>` or `<table>`, "
+                            + "but got: "
+                            + target);
+        }
+        if (parsed.equals(sinkPath)) {
+            throw new ValidationException(
+                    "'enrichment.target' cannot point at the enrichment-target table itself ("
+                            + sinkPath
+                            + ").");
+        }
+        return parsed;
+    }
+
+    private static void rejectIfEnrichmentTarget(
+            ReadableConfig tableOptions, ObjectIdentifier identifier) {
+        if (tableOptions.getOptional(FlinkConnectorOptions.ENRICHMENT_TARGET).isPresent()) {
+            String target = tableOptions.get(FlinkConnectorOptions.ENRICHMENT_TARGET);
+            throw new ValidationException(
+                    "Table "
+                            + identifier
+                            + " is a write-only enrichment target for column group '"
+                            + tableOptions
+                                    .getOptional(FlinkConnectorOptions.ENRICHMENT_GROUP)
+                                    .orElse("?")
+                            + "' on "
+                            + target
+                            + ". To read enriched data, query "
+                            + target
+                            + " directly.");
+        }
+    }
+
     @Override
     public String factoryIdentifier() {
         return FlinkCatalogFactory.IDENTIFIER;
@@ -242,6 +343,8 @@ public class FlinkTableFactory implements DynamicTableSourceFactory, DynamicTabl
                                 FlinkConnectorOptions.SINK_BUCKET_SHUFFLE,
                                 FlinkConnectorOptions.SINK_DISTRIBUTION_MODE,
                                 FlinkConnectorOptions.SINK_PRODUCER_ID,
+                                FlinkConnectorOptions.ENRICHMENT_TARGET,
+                                FlinkConnectorOptions.ENRICHMENT_GROUP,
                                 LookupOptions.MAX_RETRIES,
                                 LookupOptions.CACHE_TYPE,
                                 LookupOptions.PARTIAL_CACHE_EXPIRE_AFTER_ACCESS,

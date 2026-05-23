@@ -57,6 +57,29 @@ public class FlinkConnectorOptions {
                     .noDefaultValue()
                     .withDescription("The number of buckets of a Fluss table.");
 
+    public static final ConfigOption<String> ENRICHMENT_TARGET =
+            ConfigOptions.key("enrichment.target")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "Phase L: when set, marks this table as a write-only enrichment "
+                                    + "target for a column group on another Fluss table. The "
+                                    + "value is a fully-qualified Fluss table name "
+                                    + "(e.g. `default.cg_table`). Must be paired with "
+                                    + "`enrichment.group`. INSERT INTO writes column-group "
+                                    + "enrichment rows to the target via "
+                                    + "AppendWriter.appendColumns; SELECT is rejected at plan "
+                                    + "time.");
+
+    public static final ConfigOption<String> ENRICHMENT_GROUP =
+            ConfigOptions.key("enrichment.group")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "Phase L: required when `enrichment.target` is set. Names the "
+                                    + "column group on the target table that this table writes "
+                                    + "to.");
+
     public static final ConfigOption<String> BUCKET_KEY =
             ConfigOptions.key("bucket.key")
                     .stringType()

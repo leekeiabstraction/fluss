@@ -17,6 +17,8 @@
 
 package org.apache.fluss.flink.source.split;
 
+import org.apache.fluss.metadata.TableBucket;
+
 /** State of the reader, essentially a mutable version of the {@link SourceSplitBase}. */
 public abstract class SourceSplitState {
 
@@ -24,6 +26,11 @@ public abstract class SourceSplitState {
 
     public SourceSplitState(SourceSplitBase split) {
         this.split = split;
+    }
+
+    /** Returns the table-bucket the underlying split is bound to. */
+    public final TableBucket getTableBucket() {
+        return split.getTableBucket();
     }
 
     /** Checks whether this split state is a hybrid snapshot log split state. */

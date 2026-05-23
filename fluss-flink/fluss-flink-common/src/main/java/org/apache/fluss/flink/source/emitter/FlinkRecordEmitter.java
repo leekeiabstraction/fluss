@@ -20,6 +20,7 @@ package org.apache.fluss.flink.source.emitter;
 import org.apache.fluss.client.table.scanner.ScanRecord;
 import org.apache.fluss.flink.lake.LakeRecordRecordEmitter;
 import org.apache.fluss.flink.source.deserializer.FlussDeserializationSchema;
+import org.apache.fluss.flink.source.metadata.MetadataAppender;
 import org.apache.fluss.flink.source.reader.FlinkSourceReader;
 import org.apache.fluss.flink.source.reader.RecordAndPos;
 import org.apache.fluss.flink.source.split.HybridSnapshotLogSplitState;
@@ -27,8 +28,11 @@ import org.apache.fluss.flink.source.split.SourceSplitState;
 
 import org.apache.flink.api.connector.source.SourceOutput;
 import org.apache.flink.connector.base.source.reader.RecordEmitter;
+import org.apache.flink.table.data.RowData;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import javax.annotation.Nullable;
 
 /**
  * The {@link RecordEmitter} implementation for {@link FlinkSourceReader}.
@@ -44,10 +48,24 @@ public class FlinkRecordEmitter<OUT> implements RecordEmitter<RecordAndPos, OUT,
     private static final Logger LOG = LoggerFactory.getLogger(FlinkRecordEmitter.class);
 
     private final FlussDeserializationSchema<OUT> deserializationSchema;
+    @Nullable private final MetadataAppender metadataAppender;
     private LakeRecordRecordEmitter<OUT> lakeRecordRecordEmitter;
 
+    /**
+     * Set at the start of each {@link #emitRecord} call so {@link #processAndEmitRecord} can pick
+     * up the bucket for metadata splicing. Flink calls emitter synchronously, so this is safe.
+     */
+    private SourceSplitState currentSplitState;
+
     public FlinkRecordEmitter(FlussDeserializationSchema<OUT> deserializationSchema) {
+        this(deserializationSchema, null);
+    }
+
+    public FlinkRecordEmitter(
+            FlussDeserializationSchema<OUT> deserializationSchema,
+            @Nullable MetadataAppender metadataAppender) {
         this.deserializationSchema = deserializationSchema;
+        this.metadataAppender = metadataAppender;
     }
 
     @Override
@@ -55,6 +73,7 @@ public class FlinkRecordEmitter<OUT> implements RecordEmitter<RecordAndPos, OUT,
             RecordAndPos recordAndPosition,
             SourceOutput<OUT> sourceOutput,
             SourceSplitState splitState) {
+        this.currentSplitState = splitState;
         if (splitState.isHybridSnapshotLogSplitState()) {
             // if it's hybrid split, we need to update the records number to skip(if in snapshot
             // phase) or log offset(in incremental phase)
@@ -114,6 +133,13 @@ public class FlinkRecordEmitter<OUT> implements RecordEmitter<RecordAndPos, OUT,
         }
 
         if (record != null) {
+            if (metadataAppender != null) {
+                int bucket = currentSplitState.getTableBucket().getBucket();
+                long offset = scanRecord.logOffset();
+                @SuppressWarnings("unchecked")
+                OUT spliced = (OUT) metadataAppender.splice((RowData) record, bucket, offset);
+                record = spliced;
+            }
             long timestamp = scanRecord.timestamp();
             if (timestamp > 0) {
                 sourceOutput.collect(record, timestamp);

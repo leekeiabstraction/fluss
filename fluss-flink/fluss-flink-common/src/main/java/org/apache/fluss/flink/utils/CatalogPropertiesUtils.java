@@ -25,6 +25,8 @@ import org.apache.flink.table.catalog.WatermarkSpec;
 import org.apache.flink.table.expressions.ResolvedExpression;
 import org.apache.flink.table.types.DataType;
 import org.apache.flink.table.types.logical.LogicalType;
+import org.apache.flink.table.types.logical.utils.LogicalTypeParser;
+import org.apache.flink.table.types.utils.TypeConversions;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -78,6 +80,8 @@ public class CatalogPropertiesUtils {
             compoundKey(WATERMARK_STRATEGY, DATA_TYPE);
 
     private static final String COMMENT = "comment";
+    private static final String METADATA_KEY = "metadata-key";
+    private static final String METADATA_VIRTUAL = "metadata-virtual";
     private static final Pattern SCHEMA_COLUMN_NAME_SUFFIX = Pattern.compile("\\d+\\.name");
 
     public static Map<String, String> deserializeOptions(Map<String, String> map) {
@@ -104,6 +108,63 @@ public class CatalogPropertiesUtils {
         final String expr = getValue(map, exprKey);
         final String name = getValue(map, nameKey);
         builder.columnByExpression(name, expr);
+    }
+
+    /**
+     * Dispatches to the right non-physical-column reader: computed column if {@code expr} is set,
+     * metadata column if {@code metadata-key} is set. Phase L.2: persists/restores {@code _bucket
+     * BIGINT METADATA FROM 'bucket' VIRTUAL}-style declarations.
+     */
+    public static void deserializeNonPhysicalColumn(
+            Map<String, String> map, int columnIndex, Schema.Builder builder) {
+        final String metadataKey = map.get(compoundKey(SCHEMA, columnIndex, METADATA_KEY));
+        if (metadataKey != null) {
+            final String name = getValue(map, columnKey(columnIndex));
+            final String dataType = getValue(map, compoundKey(SCHEMA, columnIndex, DATA_TYPE));
+            final boolean virtual =
+                    Boolean.parseBoolean(
+                            map.getOrDefault(
+                                    compoundKey(SCHEMA, columnIndex, METADATA_VIRTUAL), "false"));
+            builder.columnByMetadata(name, deserializeDataType(dataType), metadataKey, virtual);
+            return;
+        }
+        deserializeComputedColumn(map, columnIndex, builder);
+    }
+
+    public static void serializeMetadataColumns(Map<String, String> map, List<Column> columns) {
+        final List<Column> metadataCols = new ArrayList<>();
+        final List<Integer> idxList = new ArrayList<>();
+        for (int i = 0; i < columns.size(); i++) {
+            if (columns.get(i) instanceof Column.MetadataColumn) {
+                metadataCols.add(columns.get(i));
+                idxList.add(i);
+            }
+        }
+        if (metadataCols.isEmpty()) {
+            return;
+        }
+        final String[] names = serializeColumnNames(metadataCols);
+        final String[] dataTypes = serializeColumnDataTypes(metadataCols);
+        final String[] comments = serializeColumnComments(metadataCols);
+        final String[] metadataKeys = new String[metadataCols.size()];
+        final String[] virtualFlags = new String[metadataCols.size()];
+        for (int i = 0; i < metadataCols.size(); i++) {
+            Column.MetadataColumn col = (Column.MetadataColumn) metadataCols.get(i);
+            metadataKeys[i] = col.getMetadataKey().orElse(col.getName());
+            virtualFlags[i] = Boolean.toString(col.isVirtual());
+        }
+        final List<List<String>> values = new ArrayList<>();
+        for (int i = 0; i < metadataCols.size(); i++) {
+            values.add(
+                    Arrays.asList(
+                            names[i], dataTypes[i], comments[i], metadataKeys[i], virtualFlags[i]));
+        }
+        putIndexedProperties(
+                map,
+                SCHEMA,
+                Arrays.asList(NAME, DATA_TYPE, COMMENT, METADATA_KEY, METADATA_VIRTUAL),
+                values,
+                idxList);
     }
 
     public static void serializeComputedColumns(Map<String, String> map, List<Column> columns) {
@@ -302,6 +363,11 @@ public class CatalogPropertiesUtils {
                             resolvedExpression.asSummaryString()),
                     e);
         }
+    }
+
+    private static DataType deserializeDataType(String serialized) {
+        LogicalType logicalType = LogicalTypeParser.parse(serialized);
+        return TypeConversions.fromLogicalToDataType(logicalType);
     }
 
     private static String serializeDataType(DataType dataType) {
