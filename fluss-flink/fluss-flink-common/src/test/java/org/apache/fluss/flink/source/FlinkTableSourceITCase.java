@@ -34,6 +34,7 @@ import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.row.BinaryString;
 import org.apache.fluss.row.GenericRow;
 import org.apache.fluss.row.InternalRow;
+import org.apache.fluss.server.log.LogTablet;
 import org.apache.fluss.server.testutils.FlussClusterExtension;
 import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.utils.clock.ManualClock;
@@ -374,7 +375,9 @@ abstract class FlinkTableSourceITCase extends AbstractTestBase {
         // table with auto-partition enabled and two independent column groups. Verifies
         // the DDL parses, the schema captures both groups at the correct column indices,
         // the partition key stays in the default group, auto-partition pre-creates
-        // partitions, and SHOW CREATE TABLE preserves the relevant properties.
+        // partitions, and SHOW CREATE TABLE preserves the relevant properties. Then runs
+        // the FIP's base-row INSERT snippet and asserts HWM advances across buckets while
+        // both groups' CEWs remain at 0 (no enrichment writes have happened yet).
         tEnv.executeSql(
                 "create table device_logs ("
                         + "  dt string, device_id string, ip string, payload string,"
@@ -413,6 +416,46 @@ abstract class FlinkTableSourceITCase extends AbstractTestBase {
                     .contains("'column-groups.enriched_risk'")
                     .contains("'table.auto-partition.enabled'");
         }
+
+        // Run the FIP's base-row INSERT snippet — enrichment columns explicitly NULL.
+        // Use today's date so rows land in the auto-pre-created partition.
+        String today = LocalDate.now().format(DateTimeFormatter.BASIC_ISO_DATE);
+        tEnv.executeSql(
+                        "insert into device_logs values "
+                                + "('"
+                                + today
+                                + "', 'dev-001', '10.0.0.1', 'login', "
+                                + "    cast(null as string), cast(null as double), cast(null as string)),"
+                                + "('"
+                                + today
+                                + "', 'dev-002', '10.0.0.2', 'logout', "
+                                + "    cast(null as string), cast(null as double), cast(null as string)),"
+                                + "('"
+                                + today
+                                + "', 'dev-003', '10.0.0.3', 'login', "
+                                + "    cast(null as string), cast(null as double), cast(null as string))")
+                .await();
+
+        // HWM advances on base writes; summed across the partition's 16 buckets it
+        // equals the row count (rows scatter by `bucket.key = 'device_id'`). On every
+        // bucket, both groups' CEWs are still at the "no enrichment yet" baseline —
+        // the accessor returns -1 when the group's segment has never been opened, 0
+        // once initialized. Either way it must not be positive on any bucket.
+        long tableId = info.getTableId();
+        long partitionId = lookupPartitionId(tablePath, today);
+        long totalHwm = 0;
+        for (int b = 0; b < 16; b++) {
+            TableBucket bucket = new TableBucket(tableId, partitionId, b);
+            LogTablet log = FLUSS_CLUSTER_EXTENSION.waitAndGetLeaderReplica(bucket).getLogTablet();
+            totalHwm += log.getHighWatermark();
+            assertThat(log.getCommittedEnrichmentWatermark("enriched_geo"))
+                    .as("enriched_geo CEW not positive on bucket %d", b)
+                    .isNotPositive();
+            assertThat(log.getCommittedEnrichmentWatermark("enriched_risk"))
+                    .as("enriched_risk CEW not positive on bucket %d", b)
+                    .isNotPositive();
+        }
+        assertThat(totalHwm).as("HWM sums to row count across buckets").isEqualTo(3L);
     }
 
     @Test

@@ -141,6 +141,22 @@ The `column-groups.<g>` keys are internalized into the schema at create
 time, validated, and re-emitted by `SHOW CREATE TABLE` for round-trip
 fidelity.
 
+Base-row writes are ordinary `INSERT` statements that target every
+column; enrichment columns are explicitly `NULL` at this point and get
+filled later by Section 2's write-only sink:
+
+```sql
+INSERT INTO device_logs VALUES
+  ('20260525', 'dev-001', '10.0.0.1', 'login',  NULL, NULL, NULL),
+  ('20260525', 'dev-002', '10.0.0.2', 'logout', NULL, NULL, NULL),
+  ('20260525', 'dev-003', '10.0.0.3', 'login',  NULL, NULL, NULL);
+```
+
+The base log's `HWM` advances as usual. Each column group's `EWM` stays
+at 0 until its enrichment job begins writing; until then a query that
+projects an enrichment column returns no rows because reads are gated
+at `min(HWM, EWM_g for groups in projection)`.
+
 ### 2. SQL DDL — write-only enrichment-target table
 
 To write enrichment via Flink SQL, users define a *write-only* table whose
