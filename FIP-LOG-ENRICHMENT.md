@@ -519,6 +519,52 @@ The accumulator on the client packs N rows into one multi-row Arrow batch
 per RPC — see *§ Client-side batching*. The server-side append code works
 identically for single-row and multi-row wire payloads.
 
+### Write path
+
+Base append (`ProduceLog`) and enrichment append (`ProduceLogColumns`)
+share the same `Replica` but follow different durability rules: base
+writes wait for the ISR to catch up before the response (HWM is the
+client-visible ceiling, computed as `min(LEO)` across the ISR, where
+**Log End Offset (LEO)** is each replica's next-to-write offset);
+enrichment writes return as soon as the leader has the row durably on
+its `EnrichmentSegment` and surface the **leader's** EWM. Followers
+pull enrichment asynchronously and the leader recomputes the
+**Committed Enrichment Watermark (CEW)** when they report progress;
+CEW — not EWM — gates reads (see *§ Replication and durability*).
+
+```
+   Client             Leader Replica                  Follower(s)
+     │                      │                              │
+     │── ProduceLog ───────▶│                              │
+     │                      │ append to base log           │
+     │                      │ advance LEO                  │
+     │                      │── replicate ────────────────▶│
+     │                      │                              │ append base log
+     │                      │◀── ack (followerLogEndOffset) ┤
+     │                      │ HWM = min(LEO across ISR)    │
+     │◀── response (offset) │                              │
+     │                                                     │
+     │── ProduceLogColumns ▶│                              │
+     │                      │ source_offset == EWM_g + 1 ? │
+     │                      │ offset ∈ [localStart, HWM) ? │
+     │                      │ append to EnrichmentSegment  │
+     │                      │ advance leader EWM_g         │
+     │◀── response (EWM_g) ─│                              │
+     │                      │                              │
+     │            (asynchronous; concurrent with the above)
+     │                      │── records + leader EWM ─────▶│
+     │                      │                              │ append EnrichmentSegment
+     │                      │                              │ advance follower EWM_g
+     │                      │◀── follower EWM_g ───────────│
+     │                      │ CEW_g = min(EWM_g across ISR)│
+```
+
+The `EWM_g` returned to the caller is the leader's value, so a successful
+`ProduceLogColumns` response is *not* a durability guarantee; durability
+is gated by CEW which advances on the follower-fetch path. Reads — both
+direct fetches and lake tiering — observe CEW, not EWM, so a survivor of
+leader failover never reveals enrichment that wasn't durably replicated.
+
 ### Read path — merge-on-read
 
 `EnrichmentMerger` re-encodes a base Arrow batch with enrichment columns
