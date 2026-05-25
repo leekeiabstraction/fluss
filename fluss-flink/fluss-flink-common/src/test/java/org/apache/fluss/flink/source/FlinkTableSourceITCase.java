@@ -369,6 +369,53 @@ abstract class FlinkTableSourceITCase extends AbstractTestBase {
     }
 
     @Test
+    void testAutoPartitionedColumnGroupTable() throws Exception {
+        // Mirrors the FIP "SQL DDL — declare column groups" snippet: a partitioned base
+        // table with auto-partition enabled and two independent column groups. Verifies
+        // the DDL parses, the schema captures both groups at the correct column indices,
+        // the partition key stays in the default group, auto-partition pre-creates
+        // partitions, and SHOW CREATE TABLE preserves the relevant properties.
+        tEnv.executeSql(
+                "create table device_logs ("
+                        + "  dt string, device_id string, ip string, payload string,"
+                        + "  geo_region string, risk_score double, risk_classification string"
+                        + ") partitioned by (dt) with ("
+                        + "  'bucket.num' = '16',"
+                        + "  'bucket.key' = 'device_id',"
+                        + "  'table.auto-partition.enabled' = 'true',"
+                        + "  'table.auto-partition.time-unit' = 'DAY',"
+                        + "  'column-groups.enriched_geo' = 'geo_region',"
+                        + "  'column-groups.enriched_risk' = 'risk_score, risk_classification')");
+        TablePath tablePath = TablePath.of(DEFAULT_DB, "device_logs");
+        org.apache.fluss.metadata.TableInfo info = admin.getTableInfo(tablePath).get();
+
+        // dt is the partition key and stays in the default group (the invariant —
+        // partition keys must not appear in any named column group).
+        assertThat(info.getPartitionKeys()).containsExactly("dt");
+
+        // 0=dt, 1=device_id, 2=ip, 3=payload, 4=geo_region, 5=risk_score, 6=risk_classification.
+        Map<String, List<Integer>> groups = info.getSchema().getColumnGroups();
+        assertThat(groups).containsOnlyKeys("enriched_geo", "enriched_risk");
+        assertThat(groups.get("enriched_geo")).containsExactly(4);
+        assertThat(groups.get("enriched_risk")).containsExactly(5, 6);
+
+        // Auto-partition pre-creates partitions (default num-precreate = 2 → today + tomorrow).
+        FLUSS_CLUSTER_EXTENSION.waitUntilPartitionAllReady(tablePath);
+
+        // SHOW CREATE TABLE round-trip preserves both groups and the auto-partition setting.
+        try (CloseableIterator<Row> showIter =
+                tEnv.executeSql("show create table device_logs").collect()) {
+            assertThat(showIter.hasNext()).isTrue();
+            String ddl = (String) showIter.next().getField(0);
+            assertThat(ddl)
+                    .as("SHOW CREATE TABLE output: %s", ddl)
+                    .contains("'column-groups.enriched_geo'")
+                    .contains("'column-groups.enriched_risk'")
+                    .contains("'table.auto-partition.enabled'");
+        }
+    }
+
+    @Test
     void testEnrichmentSinkPartitionedTarget() throws Exception {
         // Phase M.5: end-to-end enrichment writes against a partitioned column-group target.
         // Sink row layout grows by one leading STRING column (partition name). The writer

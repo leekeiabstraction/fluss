@@ -116,36 +116,30 @@ CREATE TABLE device_logs (
   device_id   STRING,
   ip          STRING,
   payload     STRING,
-  ts          TIMESTAMP,
   -- Enrichment columns, written later via separate Flink jobs
-  geo_region  STRING,
-  risk_score  DOUBLE,
-  identity    STRING
+  geo_region           STRING,
+  risk_score           DOUBLE,
+  risk_classification  STRING
 ) PARTITIONED BY (dt) WITH (
-  'bucket.num'                  = '16',
-  'bucket.key'                  = 'device_id',
-  'column-groups.enriched_geo'  = 'geo_region',
-  'column-groups.enriched_risk' = 'risk_score, identity'
+  'bucket.num'                     = '16',
+  'bucket.key'                     = 'device_id',
+  'table.auto-partition.enabled'   = 'true',
+  'table.auto-partition.time-unit' = 'DAY',
+  'column-groups.enriched_geo'     = 'geo_region',
+  'column-groups.enriched_risk'    = 'risk_score, risk_classification'
 );
 ```
 
 Multiple groups can coexist on one table; each group advances independently.
-Partitioning is supported under one structural rule (Phase M *Invariant
-M.1*): **partition-key columns must remain in the default group** — they
-must be writable at base-row insertion, while enrichment columns are NULL
-until filled later. Including a partition-key column in any
+Partitioning is supported under one structural rule: **partition-key
+columns must remain in the default group** — they must be set at base-row
+insertion, while enrichment columns are populated later via separate
+`appendColumns` writes. Including a partition-key column in any
 `column-groups.<g>` value is rejected at create time.
 
 The `column-groups.<g>` keys are internalized into the schema at create
-time, validated (every referenced column exists, no column appears in two
-groups, no partition-key column is grouped), and re-emitted by
-`SHOW CREATE TABLE` for round-trip fidelity.
-
-This property-based form was chosen over a per-column inline DDL clause
-(e.g. `geo_region STRING COLUMN GROUP 'enriched_geo'`) to avoid forking
-Flink's SQL grammar — a per-column clause would require a Calcite parser
-extension, which is a meaningfully larger change. A per-column clause is
-possible future ergonomic work.
+time, validated, and re-emitted by `SHOW CREATE TABLE` for round-trip
+fidelity.
 
 ### 2. SQL DDL — write-only enrichment-target table
 
@@ -571,6 +565,13 @@ These were explored in the original design doc (see `README.md`,
   pool / dynamic estimator with base appends; tuning twice was pure
   surface area. A separate override can be added later if a real
   latency/throughput conflict surfaces.
+
+- **Per-column inline `COLUMN GROUP` DDL clause.** Considered as a more
+  ergonomic alternative to the table-level `column-groups.<g>` property
+  (e.g. `geo_region STRING COLUMN GROUP 'enriched_geo'`), but would
+  require extending Flink's Calcite parser — a meaningfully larger,
+  Fluss-external change. Possible future ergonomic work once the
+  property form is stable.
 
 ---
 
