@@ -540,6 +540,60 @@ public class ColumnGroupEWMITCase extends ClientToServerITCaseBase {
         }
     }
 
+    @Test
+    void testAppendColumnsTwoGroupsExample() throws Exception {
+        // Mirrors the FIP's Section 3 example: AppendWriter.appendColumns fills two
+        // independent column groups via the Java client. Each call advances only its
+        // own group's EWM.
+        TablePath tablePath = TablePath.of(DB_NAME, "device_logs_two_groups");
+        Schema schema =
+                Schema.newBuilder()
+                        .column("device_id", DataTypes.STRING())
+                        .column("ip", DataTypes.STRING())
+                        .column("payload", DataTypes.STRING())
+                        .column("geo_region", DataTypes.STRING())
+                        .columnGroup("enriched_geo")
+                        .column("risk_score", DataTypes.DOUBLE())
+                        .columnGroup("enriched_risk")
+                        .column("risk_classification", DataTypes.STRING())
+                        .columnGroup("enriched_risk")
+                        .build();
+        long tableId =
+                createTable(
+                        tablePath,
+                        TableDescriptor.builder().schema(schema).distributedBy(1).build(),
+                        false);
+        FLUSS_CLUSTER_EXTENSION.waitUntilTableReady(tableId);
+        TableBucket bucket = new TableBucket(tableId, 0);
+
+        try (Table table = conn.getTable(tablePath)) {
+            AppendWriter writer = table.newAppend().createWriter();
+            // Base row: enrichment columns NULL.
+            writer.append(row("dev-001", "10.0.0.1", "login", null, null, null)).get();
+
+            // enriched_geo: one column (geo_region STRING).
+            writer.appendColumns(
+                            "enriched_geo",
+                            bucket,
+                            0L,
+                            GenericRow.of(BinaryString.fromString("US-WEST-2")))
+                    .get();
+
+            // enriched_risk: two columns in schema order (risk_score DOUBLE,
+            // risk_classification STRING).
+            writer.appendColumns(
+                            "enriched_risk",
+                            bucket,
+                            0L,
+                            GenericRow.of(0.92, BinaryString.fromString("high")))
+                    .get();
+        }
+
+        LogTablet leader = getLeaderLogTablet(bucket);
+        assertThat(leader.getEnrichmentWatermark("enriched_geo")).isEqualTo(1L);
+        assertThat(leader.getEnrichmentWatermark("enriched_risk")).isEqualTo(1L);
+    }
+
     /** Find the leader LogTablet for a given table bucket across all tablet servers. */
     private LogTablet getLeaderLogTablet(TableBucket tableBucket) {
         for (TabletServer ts : FLUSS_CLUSTER_EXTENSION.getTabletServers()) {

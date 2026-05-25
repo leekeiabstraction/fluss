@@ -229,6 +229,35 @@ public interface AppendWriter extends TableWriter {
 }
 ```
 
+Example — enriching one source offset on the `device_logs` table declared
+in Section 1, filling both groups:
+
+```java
+TablePath tablePath = TablePath.of("mydb", "device_logs");
+TableBucket bucket  = new TableBucket(tableId, partitionId, /* bucketId */ 0);
+
+try (Table table = connection.getTable(tablePath)) {
+    AppendWriter writer = table.newAppend().createWriter();
+
+    // enriched_geo: one column (geo_region STRING).
+    writer.appendColumns(
+            "enriched_geo",
+            bucket,
+            /* sourceOffset */ 0L,
+            GenericRow.of(BinaryString.fromString("US-WEST-2")))
+            .get();
+
+    // enriched_risk: two columns in schema order (risk_score DOUBLE,
+    // risk_classification STRING).
+    writer.appendColumns(
+            "enriched_risk",
+            bucket,
+            0L,
+            GenericRow.of(0.92, BinaryString.fromString("high")))
+            .get();
+}
+```
+
 Client batching, leader resolution, retries, and back-pressure are
 transparent to the caller (see *Design § Client-side batching* below).
 
