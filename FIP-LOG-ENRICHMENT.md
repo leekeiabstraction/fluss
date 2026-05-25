@@ -567,6 +567,35 @@ leader failover never reveals enrichment that wasn't durably replicated.
 
 ### Read path — merge-on-read
 
+At read time the leader inspects the requested projection to identify
+which column groups it touches, clamps the fetch ceiling to CEW (not
+EWM — see *§ Replication and durability* for why), reads base records
+from the log, and invokes `EnrichmentMerger` to splice in enrichment
+column values from the per-group segments. Pure-base projections skip
+the merger entirely and read up to `HWM`.
+
+```
+   Client                  Leader (Replica)                 EnrichmentMerger
+     │                            │                                │
+     │── FetchLog ───────────────▶│                                │
+     │   projection P             │ G = groups touched by P        │
+     │                            │ stop = min(HWM,                │
+     │                            │            min(CEW_g for g∈G)) │
+     │                            │ read base log [start, stop)    │
+     │                            │                                │
+     │                            │ if G is empty:                 │
+     │                            │   skip merger                  │
+     │                            │ else:                          │
+     │                            │── merge(base, segments_G) ────▶│
+     │                            │                                │ per base batch:
+     │                            │                                │   per row, per col in G:
+     │                            │                                │     lookup EnrichmentSegment
+     │                            │                                │     decode at intraIndex
+     │                            │                                │   emit merged Arrow batch
+     │                            │◀── merged LogRecords ──────────│
+     │◀── FetchLogResp ───────────│                                │
+```
+
 `EnrichmentMerger` re-encodes a base Arrow batch with enrichment columns
 sourced from the per-group segments. Each requested column-group cell is
 extracted using `lookupBatch`'s `intraIndex`. From
