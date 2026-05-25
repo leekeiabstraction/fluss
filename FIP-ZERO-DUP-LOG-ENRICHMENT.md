@@ -261,6 +261,30 @@ try (Table table = connection.getTable(tablePath)) {
 Client batching, leader resolution, retries, and back-pressure are
 transparent to the caller (see *Design § Client-side batching* below).
 
+**Reading with `LogScanner`.** The standard `Table.newScan()` →
+`LogScanner` API works unchanged on column-grouped tables. The EWM gate
+is enforced server-side: scans whose projection touches a column group
+are clamped at `min(HWM, EWM_g)`; pure-base scans read up to `HWM`
+exactly as before.
+
+```java
+// Enriched scan: projecting geo_region (in enriched_geo) clamps reads
+// at min(HWM, EWM_geo). Merge-on-read substitutes enrichment values.
+int[] projection = new int[] {0, 4};  // device_id (idx 0), geo_region (idx 4)
+try (LogScanner scanner =
+        table.newScan().project(projection).createLogScanner()) {
+    scanner.subscribeFromBeginning(/* bucketId */ 0);
+    ScanRecords records = scanner.poll(Duration.ofSeconds(1));
+    for (ScanRecord r : records) {
+        // r.getRow() contains the merged base + enrichment values;
+        // geo_region is the value written via appendColumns, not NULL.
+    }
+}
+```
+
+No client-side coordination is needed — the merge happens on the server
+via `EnrichmentMerger` (see *Design § Read path*).
+
 ### 4. RPC — `ProduceLogColumns`
 
 A new RPC carries multi-bucket, multi-row enrichment writes. Defined in
