@@ -50,25 +50,6 @@ B. At scale this is real operational and infrastructure cost — 2× storage,
 additional architectural complexity of running and maintaining a separate
 enrichment pipeline.
 
-With this proposal, the enrichment job writes enrichment columns back to
-the **same** log table A via `appendColumns`; there is no log table B:
-
-```
-edge device ──▶ log table A ──▶ consumer
-                  ▲     │
-   appendColumns  │     │  scan base
-                  │     ▼
-                Flink job
-                (enrichment)
-```
-
-Base columns are stored once and enrichment columns are stored once.
-Consumers project whatever they need against the single table:
-projections that touch only base columns advance up to `HWM` as today;
-projections that touch enrichment column group `g` are clamped at
-`min(HWM, EWM_g)`, so partial rows are never observed and the system —
-not the consumer — owns the "is enrichment caught up?" decision.
-
 Workarounds outside Fluss either reintroduce duplication elsewhere or push
 correctness concerns onto consumers:
 
@@ -93,6 +74,25 @@ correctness concerns onto consumers:
 
 We want a first-class primitive that lets the **same row** gain columns over
 time, with the system enforcing "completeness" at the read boundary.
+
+With this proposal, the enrichment job writes enrichment columns back to
+the **same** log table A via `appendColumns`; there is no log table B:
+
+```
+edge device ──▶ log table A ──▶ consumer
+                  ▲     │
+   appendColumns  │     │  scan base
+                  │     ▼
+                Flink job
+                (enrichment)
+```
+
+Base columns are stored once and enrichment columns are stored once.
+Consumers project whatever they need against the single table:
+projections that touch only base columns advance up to `HWM` as today;
+projections that touch enrichment column group `g` are clamped at
+`min(HWM, EWM_g)`, so partial rows are never observed and the system —
+not the consumer — owns the "is enrichment caught up?" decision.
 
 ### Goals
 
