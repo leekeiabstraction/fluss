@@ -1,4 +1,4 @@
-# FIP: Zero-Duplication Log Enrichment via Append Columns
+# FIP: Log Enrichment via Append Columns
 
 | Field    | Value |
 |----------|-------|
