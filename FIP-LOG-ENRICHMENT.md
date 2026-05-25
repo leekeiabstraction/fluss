@@ -114,9 +114,8 @@ not the consumer — owns the "is enrichment caught up?" decision.
   alternatives*.
 - Cross-table joins or general projection materialisation; this is
   same-table column extension only.
-- Changing the integration with Flink's *Materialized Table*. The
-  workaround in *Motivation* covers the gap; revisiting that integration
-  can be a follow-up FIP once this feature reaches maturity.
+- Materialised table integration can be a follow-up FIP once this
+  feature reaches maturity.
 
 ---
 
