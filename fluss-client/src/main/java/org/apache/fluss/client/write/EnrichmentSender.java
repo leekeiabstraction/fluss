@@ -27,6 +27,7 @@ import org.apache.fluss.rpc.gateway.TabletServerGateway;
 import org.apache.fluss.rpc.messages.PbProduceLogColumnsReqForBucket;
 import org.apache.fluss.rpc.messages.PbProduceLogColumnsRespForBucket;
 import org.apache.fluss.rpc.messages.ProduceLogColumnsRequest;
+import org.apache.fluss.rpc.protocol.Errors;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -177,12 +178,13 @@ public final class EnrichmentSender implements Runnable {
                             }
                             PbProduceLogColumnsRespForBucket resp = response.getBucketsRespAt(0);
                             if (resp.hasErrorCode() && resp.getErrorCode() != 0) {
-                                sealed.completeAllExceptionally(
-                                        new IOException(
-                                                "Server rejected enrichment write for bucket "
-                                                        + bucket
-                                                        + ": "
-                                                        + resp.getErrorMessage()));
+                                Errors err = Errors.forCode((short) resp.getErrorCode());
+                                String msg =
+                                        "Server rejected enrichment write for bucket "
+                                                + bucket
+                                                + ": "
+                                                + resp.getErrorMessage();
+                                sealed.completeAllExceptionally(err.exception(msg));
                             } else {
                                 sealed.completeAll(resp.getEnrichmentWatermark());
                             }

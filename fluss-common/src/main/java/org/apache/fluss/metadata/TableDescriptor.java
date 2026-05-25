@@ -22,6 +22,7 @@ import org.apache.fluss.annotation.PublicStable;
 import org.apache.fluss.config.ConfigOption;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.ConfigurationUtils;
+import org.apache.fluss.exception.InvalidColumnGroupConfigException;
 import org.apache.fluss.utils.json.JsonSerdeUtils;
 import org.apache.fluss.utils.json.TableDescriptorJsonSerde;
 
@@ -130,13 +131,16 @@ public final class TableDescriptor implements Serializable {
                     partitionKeys.stream()
                             .filter(groupedColumnNames::contains)
                             .collect(Collectors.toList());
-            checkArgument(
-                    illegal.isEmpty(),
-                    "Partition keys must belong to the default column group "
-                            + "(enrichment-group columns are NULL at base-write time and "
-                            + "cannot determine the partition). Offending partition keys "
-                            + "declared in non-default groups: %s",
-                    illegal);
+            if (!illegal.isEmpty()) {
+                throw new InvalidColumnGroupConfigException(
+                        String.format(
+                                "Partition keys must belong to the default column group "
+                                        + "(enrichment-group columns are NULL at base-write "
+                                        + "time and cannot determine the partition). "
+                                        + "Offending partition keys declared in non-default "
+                                        + "groups: %s",
+                                illegal));
+            }
         }
 
         if (this.tableDistribution != null) {

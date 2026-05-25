@@ -19,6 +19,7 @@ package org.apache.fluss.metadata;
 
 import org.apache.fluss.config.ConfigBuilder;
 import org.apache.fluss.config.ConfigOption;
+import org.apache.fluss.exception.InvalidColumnGroupConfigException;
 import org.apache.fluss.types.DataTypes;
 
 import org.junit.jupiter.api.Test;
@@ -359,7 +360,7 @@ class TableDescriptorTest {
                                         .partitionedBy("geo_region")
                                         .distributedBy(1, "device_id")
                                         .build())
-                .isInstanceOf(IllegalArgumentException.class)
+                .isInstanceOf(InvalidColumnGroupConfigException.class)
                 .hasMessageContaining("Partition keys must belong to the default column group")
                 .hasMessageContaining("geo_region");
     }

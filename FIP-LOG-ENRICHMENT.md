@@ -388,6 +388,49 @@ existing `projected_fields` is enough for the server to decide the read
 gate. (We *do* surface per-group EWMs on the response for observability;
 the field is additive and optional.)
 
+### 5. Error codes
+
+Four new entries in `org.apache.fluss.rpc.protocol.Errors` cover the
+enrichment-path failures; each maps to a typed `ApiException` subclass
+in `fluss-common/.../exception/`. All four are **non-retriable** — they
+indicate either a stale client view or a permanent condition, never a
+transient RPC failure.
+
+| Code | Name | Exception | Thrown when |
+|------|------|-----------|-------------|
+| 66 | `INVALID_COLUMN_GROUP_OFFSET` | `InvalidColumnGroupOffsetException` | `appendColumns` `source_offset` doesn't equal `EWM + 1` for the bucket (gap or already-filled) |
+| 67 | `COLUMN_GROUP_SOURCE_OFFSET_TRUNCATED` | `ColumnGroupSourceOffsetTruncatedException` | `appendColumns` `source_offset` is below the bucket's local log start; the base record aged out under retention |
+| 68 | `UNKNOWN_COLUMN_GROUP` | `UnknownColumnGroupException` | `appendColumns` or fetch projection names a group not declared on the table |
+| 69 | `INVALID_COLUMN_GROUP_CONFIG` | `InvalidColumnGroupConfigException` | `CREATE TABLE` validation: partition-key column declared inside a `column-groups.<g>` property, group references an unknown column, duplicated group membership, group paired with primary key |
+
+**Client handling.** The three runtime-path codes have distinct
+recovery shapes:
+
+- **`INVALID_COLUMN_GROUP_OFFSET`** is the only one where the client
+  can auto-recover. The server populates
+  `PbProduceLogColumnsRespForBucket.enrichment_watermark` with the
+  actual EWM on this error path, so `EnrichmentAccumulator` refreshes
+  its local EWM cache for `(bucket, group)` and drops in-flight
+  batches whose first offset is now stale. It does **not** auto-retry
+  the same RPC — a permanent gap (base offset that was never written)
+  would otherwise loop.
+- **`COLUMN_GROUP_SOURCE_OFFSET_TRUNCATED`** is terminal for that row.
+  `EnrichmentAccumulator` fails the corresponding
+  `CompletableFuture<AppendColumnsResult>` and continues. The Flink
+  enrichment sink maps this to a `enrichment.skipped.truncated`
+  metric increment rather than a job failure, so a slow enrichment
+  job catching up after retention loss doesn't crash.
+- **`UNKNOWN_COLUMN_GROUP`** is detected client-side by `AppendWriterImpl`
+  (synchronous throw before the RPC) when the schema cache shows no
+  such group, and again server-side by `Replica.appendColumnsAsLeader`
+  if the client view is stale. The client refreshes `TableInfo` once;
+  if the group is still absent, the original message is surfaced to
+  the caller unchanged.
+
+`INVALID_COLUMN_GROUP_CONFIG` is a `CREATE TABLE` validation failure;
+the table is never created and the client surfaces the descriptive
+error message verbatim.
+
 ---
 
 ## Design

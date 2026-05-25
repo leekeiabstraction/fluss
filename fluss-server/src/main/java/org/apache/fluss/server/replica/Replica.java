@@ -21,7 +21,9 @@ import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.compression.ArrowCompressionInfo;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.TableConfig;
+import org.apache.fluss.exception.ColumnGroupSourceOffsetTruncatedException;
 import org.apache.fluss.exception.FencedLeaderEpochException;
+import org.apache.fluss.exception.InvalidColumnGroupOffsetException;
 import org.apache.fluss.exception.InvalidColumnProjectionException;
 import org.apache.fluss.exception.InvalidTableException;
 import org.apache.fluss.exception.InvalidTimestampException;
@@ -31,6 +33,7 @@ import org.apache.fluss.exception.LogStorageException;
 import org.apache.fluss.exception.NonPrimaryKeyTableException;
 import org.apache.fluss.exception.NotEnoughReplicasException;
 import org.apache.fluss.exception.NotLeaderOrFollowerException;
+import org.apache.fluss.exception.UnknownColumnGroupException;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.metadata.ChangelogImage;
 import org.apache.fluss.metadata.LogFormat;
@@ -1068,7 +1071,7 @@ public final class Replica {
                     Map<String, List<Integer>> groupIndices = schema.getColumnGroups();
                     List<Integer> indicesInGroup = groupIndices.get(columnGroup);
                     if (indicesInGroup == null) {
-                        throw new IllegalArgumentException(
+                        throw new UnknownColumnGroupException(
                                 "Unknown column group '"
                                         + columnGroup
                                         + "' on table "
@@ -1083,7 +1086,7 @@ public final class Replica {
                     for (int i = 0; i < sourceOffsets.length; i++) {
                         long actual = sourceOffsets[i];
                         if (actual != expected) {
-                            throw new IllegalArgumentException(
+                            throw new InvalidColumnGroupOffsetException(
                                     String.format(
                                             "Out-of-order column-group write for bucket %s group '%s': "
                                                     + "expected source_offset %d (next slot after EWM=%d) but got %d at index %d",
@@ -1095,14 +1098,14 @@ public final class Replica {
                                             i));
                         }
                         if (actual < localLogStart) {
-                            throw new IllegalArgumentException(
+                            throw new ColumnGroupSourceOffsetTruncatedException(
                                     String.format(
                                             "Cannot enrich offset %d below local log start %d "
                                                     + "(base segment may have been retention-deleted) for bucket %s",
                                             actual, localLogStart, tableBucket));
                         }
                         if (actual >= localLogEnd) {
-                            throw new IllegalArgumentException(
+                            throw new InvalidColumnGroupOffsetException(
                                     String.format(
                                             "Cannot enrich offset %d which is outside [0, %d) for bucket %s",
                                             actual, localLogEnd, tableBucket));

@@ -23,6 +23,8 @@ import org.apache.fluss.client.table.scanner.log.LogScanner;
 import org.apache.fluss.client.table.scanner.log.ScanRecords;
 import org.apache.fluss.client.table.writer.AppendColumnsResult;
 import org.apache.fluss.client.table.writer.AppendWriter;
+import org.apache.fluss.exception.InvalidColumnGroupOffsetException;
+import org.apache.fluss.exception.UnknownColumnGroupException;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableChange;
@@ -280,6 +282,7 @@ public class ColumnGroupEWMITCase extends ClientToServerITCaseBase {
             // EWM starts at -1; first valid offset is 0. Skipping to 1 must fail.
             GenericRow enrich = GenericRow.of(BinaryString.fromString("US-WEST-1"), 0.6);
             assertThatThrownBy(() -> writer.appendColumns("enriched", bucket, 1L, enrich).get())
+                    .hasCauseInstanceOf(InvalidColumnGroupOffsetException.class)
                     .hasMessageContaining("Out-of-order column-group write")
                     .hasMessageContaining("expected source_offset 0");
 
@@ -292,12 +295,36 @@ public class ColumnGroupEWMITCase extends ClientToServerITCaseBase {
                     .get();
             GenericRow skipOne = GenericRow.of(BinaryString.fromString("US-WEST-2"), 0.7);
             assertThatThrownBy(() -> writer.appendColumns("enriched", bucket, 2L, skipOne).get())
+                    .hasCauseInstanceOf(InvalidColumnGroupOffsetException.class)
                     .hasMessageContaining("Out-of-order column-group write")
                     .hasMessageContaining("expected source_offset 1");
 
             // EWM advanced exactly once (only offset 0 was successfully enriched).
             LogTablet leader = getLeaderLogTablet(bucket);
             assertThat(leader.getEnrichmentWatermark("enriched")).isEqualTo(1L);
+        }
+    }
+
+    @Test
+    void testAppendColumnsRejectsUnknownGroup() throws Exception {
+        TablePath tablePath = TablePath.of(DB_NAME, "device_logs_unknown_group");
+        long tableId = createTable(tablePath, TABLE_DESCRIPTOR, false);
+        FLUSS_CLUSTER_EXTENSION.waitUntilTableReady(tableId);
+        TableBucket bucket = new TableBucket(tableId, 0);
+
+        try (Table table = conn.getTable(tablePath)) {
+            AppendWriter writer = table.newAppend().createWriter();
+            writer.append(row("dev-0", "10.0.0.0", "login", 1000L, null, null)).get();
+
+            // "no_such_group" is not declared on the table. AppendWriterImpl validates
+            // group membership client-side before the RPC, so UnknownColumnGroupException
+            // is thrown synchronously rather than completing the future exceptionally.
+            GenericRow enrichmentRow = GenericRow.of(BinaryString.fromString("US-WEST-1"), 0.5);
+            assertThatThrownBy(
+                            () -> writer.appendColumns("no_such_group", bucket, 0L, enrichmentRow))
+                    .isInstanceOf(UnknownColumnGroupException.class)
+                    .hasMessageContaining("Unknown column group")
+                    .hasMessageContaining("no_such_group");
         }
     }
 

@@ -22,6 +22,7 @@ import org.apache.fluss.client.write.EnrichmentBatchKey;
 import org.apache.fluss.client.write.EnrichmentRouter;
 import org.apache.fluss.client.write.WriteRecord;
 import org.apache.fluss.client.write.WriterClient;
+import org.apache.fluss.exception.UnknownColumnGroupException;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.Schema;
@@ -145,7 +146,7 @@ class AppendWriterImpl extends AbstractTableWriter implements AppendWriter {
         Map<String, List<Integer>> groups = schema.getColumnGroups();
         List<Integer> indices = groups.get(columnGroup);
         if (indices == null) {
-            throw new IllegalArgumentException(
+            throw new UnknownColumnGroupException(
                     "Unknown column group '" + columnGroup + "' on table " + tablePath);
         }
         if (enrichmentRow.getFieldCount() != indices.size()) {

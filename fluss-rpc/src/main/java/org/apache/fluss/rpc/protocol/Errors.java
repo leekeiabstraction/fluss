@@ -20,6 +20,7 @@ package org.apache.fluss.rpc.protocol;
 import org.apache.fluss.exception.ApiException;
 import org.apache.fluss.exception.AuthenticationException;
 import org.apache.fluss.exception.AuthorizationException;
+import org.apache.fluss.exception.ColumnGroupSourceOffsetTruncatedException;
 import org.apache.fluss.exception.ConfigException;
 import org.apache.fluss.exception.CorruptMessageException;
 import org.apache.fluss.exception.CorruptRecordException;
@@ -32,6 +33,8 @@ import org.apache.fluss.exception.FencedLeaderEpochException;
 import org.apache.fluss.exception.FencedTieringEpochException;
 import org.apache.fluss.exception.IneligibleReplicaException;
 import org.apache.fluss.exception.InvalidAlterTableException;
+import org.apache.fluss.exception.InvalidColumnGroupConfigException;
+import org.apache.fluss.exception.InvalidColumnGroupOffsetException;
 import org.apache.fluss.exception.InvalidColumnProjectionException;
 import org.apache.fluss.exception.InvalidConfigException;
 import org.apache.fluss.exception.InvalidCoordinatorException;
@@ -80,6 +83,7 @@ import org.apache.fluss.exception.TableNotPartitionedException;
 import org.apache.fluss.exception.TimeoutException;
 import org.apache.fluss.exception.TooManyBucketsException;
 import org.apache.fluss.exception.TooManyPartitionsException;
+import org.apache.fluss.exception.UnknownColumnGroupException;
 import org.apache.fluss.exception.UnknownServerException;
 import org.apache.fluss.exception.UnknownTableOrBucketException;
 import org.apache.fluss.exception.UnknownWriterIdException;
@@ -252,7 +256,25 @@ public enum Errors {
     NOT_COORDINATOR_LEADER_EXCEPTION(
             65,
             "The coordinator is not a leader and cannot process request.",
-            NotCoordinatorLeaderException::new);
+            NotCoordinatorLeaderException::new),
+    INVALID_COLUMN_GROUP_OFFSET(
+            66,
+            "The appendColumns source offset does not match the bucket's expected next slot "
+                    + "(EWM + 1).",
+            InvalidColumnGroupOffsetException::new),
+    COLUMN_GROUP_SOURCE_OFFSET_TRUNCATED(
+            67,
+            "The appendColumns source offset is below the bucket's local log start; the base "
+                    + "record has aged out under retention.",
+            ColumnGroupSourceOffsetTruncatedException::new),
+    UNKNOWN_COLUMN_GROUP(
+            68,
+            "The referenced column group is not declared on the table.",
+            UnknownColumnGroupException::new),
+    INVALID_COLUMN_GROUP_CONFIG(
+            69,
+            "The column-group declaration is structurally invalid.",
+            InvalidColumnGroupConfigException::new);
 
     private static final Logger LOG = LoggerFactory.getLogger(Errors.class);
 
