@@ -508,54 +508,62 @@ public final class EnrichmentMerger implements AutoCloseable {
 The merger is invoked when the fetch's projection touches at least one
 enrichment column. Pure-base fetches skip it entirely.
 
-### EWM gate
+### Replication and durability
 
-`LogTablet` tracks per-group EWM. `Replica.appendColumnsAsLeader` enforces
-strict contiguous-from-EWM writes:
+Two existing server classes pick up the new column-group surface:
+
+- **`LogTablet`** gains per-group state — one `EnrichmentSegment` per
+  declared group plus per-group local-EWM and CEW maps — and the methods
+  that operate on it (leader/follower append, follower fetch, EWM/CEW
+  accessors).
+- **`Replica`** owns the enforcement layer: strict-from-EWM ordering on
+  writes, CEW advancement once writes are durable on the ISR, and the
+  read-side fetch gate (fetches whose projection touches column group
+  `g` are clamped at `min(HWM, CEW_g)` for each touched `g`).
 
 ```java
+public final class LogTablet {
+    // ... existing log / HWM state omitted
+
+    public void appendColumnsAsLeader(
+            String groupName, MemoryLogRecords records, long[] sourceOffsets)
+            throws IOException;
+
+    public void appendColumnsAsFollower(
+            String groupName, MemoryLogRecords records, long[] sourceOffsets)
+            throws IOException;
+
+    public EnrichmentReadResult readEnrichmentForFollower(
+            String groupName, long fromInclusive, long toExclusive, int maxBytes)
+            throws IOException;
+
+    public long getEnrichmentWatermark(String groupName);
+    public long getCommittedEnrichmentWatermark(String groupName);
+    public void updateCommittedEnrichmentWatermark(String groupName, long newCew);
+}
+
 public final class Replica {
-    // ... fields / ctor / other methods omitted
+    // ... existing replica state omitted
 
+    /** Validate strict-from-EWM ordering, then persist via LogTablet. */
     public long appendColumnsAsLeader(
-            String columnGroup, MemoryLogRecords records, long[] sourceOffsets) {
-        // ... acquire lock, look up enrichmentSegments[columnGroup] omitted
+            String columnGroup, MemoryLogRecords records, long[] sourceOffsets);
 
-        long currentEwm = logTablet.getEnrichmentWatermark(columnGroup);
-        long expected = Math.max(0L, currentEwm);
-        for (int i = 0; i < sourceOffsets.length; i++) {
-            long actual = sourceOffsets[i];
-            if (actual != expected) {
-                throw new IllegalArgumentException(
-                    "Out-of-order column-group write for bucket %s group '%s': "
-                  + "expected source_offset %d (next slot after EWM=%d) but got %d at index %d");
-            }
-            // (also: actual < localLogStart → reject; actual >= localLogEnd → reject)
-            expected++;
-        }
-        // ... persist, advance EWM, attempt CEW advance
-    }
+    /** CEW_g = min(EWM_g across ISR ∪ {leader}); called when a follower acks. */
+    private void maybeAdvanceCEW(String groupName);
 }
 ```
 
-Read-side: the server computes the *projected* EWM bound as
-`min(EWM_g for each g touched by the projection)` and clamps the fetch
-ceiling at `min(HWM, projected_EWM)`. The implementation lives in the same
-`Replica.fetchRecords` path that already enforces HWM.
-
-### Replication and durability
-
 Followers replicate enrichment via a parallel fetch stream:
-`EnrichmentSegment.range(fromInclusive, toExclusive, maxBytes)` returns
-zero-copy slices rounded to whole-batch boundaries. The leader tracks a
-follower's per-group "enrichment cursor" alongside the existing log fetch
-position.
+`LogTablet.readEnrichmentForFollower` returns zero-copy slices rounded to
+whole-batch boundaries. The leader tracks each follower's per-group
+"enrichment cursor" alongside the existing log fetch position.
 
 The *Committed Enrichment Watermark (CEW)* is the per-group analogue of the
 high watermark: `CEW_g = min(EWM_g across ISR ∪ {leader})`. Reads are gated
-at the **CEW**, not the local EWM, so a survivor surviving leader failover
-never reveals enrichment that wasn't durably replicated. From
-`fluss-server/.../replica/Replica.java#maybeAdvanceCEW`:
+at the **CEW**, not the local EWM, so a survivor of leader failover never
+reveals enrichment that wasn't durably replicated. From
+`Replica#maybeAdvanceCEW`:
 
 ```java
 private void maybeAdvanceCEW(String groupName) {
