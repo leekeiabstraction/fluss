@@ -324,26 +324,7 @@ existing `projected_fields` is enough for the server to decide the read
 gate. (We *do* surface per-group EWMs on the response for observability;
 the field is additive and optional.)
 
-### 5. On-disk layout
-
-Each `(bucket, column-group)` gets its own segment file alongside the base
-log:
-
-```
-{dataDir}/{tablePath}/{bucketId}/
-  00000000000000000000.log                       <-- base log
-  00000000000000000000.index
-  00000000000000000000.timeindex
-  00000000000000000000.col.enriched_geo.log      <-- column group 'enriched_geo'
-  00000000000000000000.col.enriched_geo.index
-  00000000000000000000.col.enriched_risk.log     <-- column group 'enriched_risk'
-  00000000000000000000.col.enriched_risk.index
-```
-
-The per-group `.col.<group>.log` is a `FileLogRecords` of Arrow batches; the
-matching `.index` is a standard sparse `OffsetIndex` (8-byte entries).
-
-### 6. Schema metadata API
+### 5. Schema metadata API
 
 `Schema.Column` gains an optional `columnGroup` field (existing API,
 nullable). Convenience accessors on `Schema`:
@@ -363,6 +344,23 @@ public final class Schema {
 ## Design
 
 ### Storage layer
+
+**On-disk layout.** Each `(bucket, column-group)` gets its own segment
+file alongside the base log:
+
+```
+{dataDir}/{tablePath}/{bucketId}/
+  00000000000000000000.log                       <-- base log
+  00000000000000000000.index
+  00000000000000000000.timeindex
+  00000000000000000000.col.enriched_geo.log      <-- column group 'enriched_geo'
+  00000000000000000000.col.enriched_geo.index
+  00000000000000000000.col.enriched_risk.log     <-- column group 'enriched_risk'
+  00000000000000000000.col.enriched_risk.index
+```
+
+The per-group `.col.<group>.log` is a `FileLogRecords` of Arrow batches;
+the matching `.index` is a standard sparse `OffsetIndex` (8-byte entries).
 
 `EnrichmentSegment` is the per-(bucket, group) storage primitive. Append
 walks the incoming Arrow batches and indexes each row's source offset at
