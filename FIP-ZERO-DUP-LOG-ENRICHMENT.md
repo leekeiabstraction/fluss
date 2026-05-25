@@ -591,13 +591,28 @@ tierEligible(segment) =
  && for all groups g declared on the table: CEW_g >= segment.lastOffset()
 ```
 
-A configurable escape valve (`log.tiering.enrichment-wait-timeout`, default
-30 min) ships a *base-only* upload after the timeout to prevent local disk
-filling forever; the manifest entry is marked `INCOMPLETE`, and a later
-backfill writes a companion enrichment file. Background compaction merges
-the companion back into a single file. Lake materialisation reuses the
-same gate; partition-level Iceberg/Paimon files appear once their
-contained offsets are CEW-covered.
+For a plain log table, `lakeLogEndOffset ≤ HWM`; for a column-group
+table, `lakeLogEndOffset ≤ CEW ≤ HWM`. A column-group table is
+structurally less timely in the lake than a plain log table by the
+CEW-to-HWM gap — the same staleness clients experience inside Fluss,
+just acknowledged on the tiering path.
+
+Key design choices:
+
+- **Server-side merge, not client-side.** The tiering job sets a full
+  projection at scanner-construction time and reads through the
+  existing fetch path, which routes through `EnrichmentMerger` on the
+  `Replica`. The tiering job stays ignorant of enrichment segment
+  layout and CEW gating — no separate logic to keep in sync.
+- **Tiering uses CEW, not local EWM.** Lake commits should survive a
+  clean Fluss leader failover; tiering at local EWM could leave the
+  lake disagreeing with the new leader's view (phantom rows in the
+  lake).
+- **No new RPC.** Fetch already supports projection; the tiering split
+  generator caps `stoppingOffset` at CEW for column-group tables.
+- **LakeWriter implementations unchanged.** Iceberg / Paimon / Lance
+  writers receive `LogRecord` instances and never inspect provenance —
+  merged rows look identical to plain log rows.
 
 ### Client-side batching (Phase N)
 
