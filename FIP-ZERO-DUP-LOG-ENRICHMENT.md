@@ -510,22 +510,32 @@ enrichment column. Pure-base fetches skip it entirely.
 
 ### EWM gate
 
-`LogTablet` tracks per-group EWM. `appendColumnsAsLeader` enforces strict
-contiguous-from-EWM writes:
+`LogTablet` tracks per-group EWM. `Replica.appendColumnsAsLeader` enforces
+strict contiguous-from-EWM writes:
 
 ```java
-long expected = Math.max(0L, currentEwm);
-for (int i = 0; i < sourceOffsets.length; i++) {
-    long actual = sourceOffsets[i];
-    if (actual != expected) {
-        throw new IllegalArgumentException(
-            "Out-of-order column-group write for bucket %s group '%s': "
-          + "expected source_offset %d (next slot after EWM=%d) but got %d at index %d");
+public final class Replica {
+    // ... fields / ctor / other methods omitted
+
+    public long appendColumnsAsLeader(
+            String columnGroup, MemoryLogRecords records, long[] sourceOffsets) {
+        // ... acquire lock, look up enrichmentSegments[columnGroup] omitted
+
+        long currentEwm = logTablet.getEnrichmentWatermark(columnGroup);
+        long expected = Math.max(0L, currentEwm);
+        for (int i = 0; i < sourceOffsets.length; i++) {
+            long actual = sourceOffsets[i];
+            if (actual != expected) {
+                throw new IllegalArgumentException(
+                    "Out-of-order column-group write for bucket %s group '%s': "
+                  + "expected source_offset %d (next slot after EWM=%d) but got %d at index %d");
+            }
+            // (also: actual < localLogStart → reject; actual >= localLogEnd → reject)
+            expected++;
+        }
+        // ... persist, advance EWM, attempt CEW advance
     }
-    // (also: actual < localLogStart → reject; actual >= localLogEnd → reject)
-    expected++;
 }
-// ... persist, advance EWM, attempt CEW advance
 ```
 
 Read-side: the server computes the *projected* EWM bound as
