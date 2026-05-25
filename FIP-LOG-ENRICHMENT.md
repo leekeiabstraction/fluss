@@ -399,7 +399,7 @@ transient RPC failure.
 | Code | Name | Exception | Thrown when |
 |------|------|-----------|-------------|
 | 66 | `INVALID_COLUMN_GROUP_OFFSET` | `InvalidColumnGroupOffsetException` | `appendColumns` `source_offset` doesn't equal `EWM + 1` for the bucket (gap or already-filled) |
-| 67 | `COLUMN_GROUP_SOURCE_OFFSET_TRUNCATED` | `ColumnGroupSourceOffsetTruncatedException` | `appendColumns` `source_offset` is below the bucket's local log start; the base record aged out under retention |
+| 67 | `COLUMN_GROUP_SOURCE_OFFSET_TRUNCATED` | `ColumnGroupSourceOffsetTruncatedException` | `appendColumns` `source_offset` is below the bucket's local log start; the base segment is no longer locally present (e.g. already tiered to remote, or chopped by a head-truncation). With the tier-eligibility gate active, this should not arise in normal operation — it's a defensive check |
 | 68 | `UNKNOWN_COLUMN_GROUP` | `UnknownColumnGroupException` | `appendColumns` or fetch projection names a group not declared on the table |
 | 69 | `INVALID_COLUMN_GROUP_CONFIG` | `InvalidColumnGroupConfigException` | `CREATE TABLE` validation: partition-key column declared inside a `column-groups.<g>` property, group references an unknown column, duplicated group membership, group paired with primary key |
 
@@ -418,8 +418,10 @@ recovery shapes:
   `EnrichmentAccumulator` fails the corresponding
   `CompletableFuture<AppendColumnsResult>` and continues. The Flink
   enrichment sink maps this to a `enrichment.skipped.truncated`
-  metric increment rather than a job failure, so a slow enrichment
-  job catching up after retention loss doesn't crash.
+  metric increment rather than a job failure, so an enrichment job
+  re-encountering an offset that's no longer locally available (e.g.
+  after a tier-eligibility-gate bypass or head truncation) doesn't
+  crash the job.
 - **`UNKNOWN_COLUMN_GROUP`** is detected client-side by `AppendWriterImpl`
   (synchronous throw before the RPC) when the schema cache shows no
   such group, and again server-side by `Replica.appendColumnsAsLeader`
