@@ -80,9 +80,9 @@ the **same** log table A via `appendColumns`; there is no log table B:
 
 ```
 edge device ──▶ log table A ──▶ consumer
-                  ▲     │
-   appendColumns  │     │  scan base
-                  │     ▼
+                  │     ▲
+       scan base  │     │  appendColumns
+                  ▼     │
                 Flink job
                 (enrichment)
 ```
