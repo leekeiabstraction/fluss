@@ -144,43 +144,16 @@ public final class Schema {
 }
 ```
 
-Java equivalent of the SQL DDL in Section 2 (same `device_logs` table:
-two column groups, partitioned + auto-partitioned by `dt`, bucketed by
-`device_id`). The block form scopes `enriched_risk`'s two members
-together; the single-column `enriched_geo` group could use either form:
+A table with column groups is created via `TableDescriptor.builder()` +
+`Admin.createTable` exactly as a plain table is — see the end-to-end
+example below.
 
-```java
-Schema schema = Schema.newBuilder()
-        .column("dt",        DataTypes.STRING())
-        .column("device_id", DataTypes.STRING())
-        .column("ip",        DataTypes.STRING())
-        .column("payload",   DataTypes.STRING())
-        .columnGroup("enriched_geo", g ->
-                g.column("geo_region", DataTypes.STRING()))
-        .columnGroup("enriched_risk", g ->
-                g.column("risk_score",          DataTypes.DOUBLE())
-                 .column("risk_classification", DataTypes.STRING()))
-        .build();
-
-TableDescriptor descriptor = TableDescriptor.builder()
-        .schema(schema)
-        .partitionedBy("dt")
-        .distributedBy(16, "device_id")
-        .property(ConfigOptions.TABLE_AUTO_PARTITION_ENABLED,   true)
-        .property(ConfigOptions.TABLE_AUTO_PARTITION_TIME_UNIT, AutoPartitionTimeUnit.DAY)
-        .build();
-
-try (Connection conn = ConnectionFactory.createConnection(flussConfig);
-     Admin admin     = conn.getAdmin()) {
-    admin.createTable(
-                    TablePath.of("mydb", "device_logs"),
-                    descriptor,
-                    /* ignoreIfExists */ false)
-            .get();
-}
-```
-
-**Writing enrichment via `appendColumns`.** From
+**Writing enrichment via `appendColumns`.** A single-row, leader-routed
+RPC that bypasses the regular append batching pipeline. After the put
+succeeds, the per-bucket EWM advances to the highest contiguous offset
+filled (starting from 0); client batching, leader resolution, retries
+and back-pressure are transparent to the caller (see *Design §
+Client-side batching* below). From
 `fluss-client/src/main/java/org/apache/fluss/client/table/writer/AppendWriter.java`:
 
 ```java
@@ -206,61 +179,91 @@ public interface AppendWriter extends TableWriter {
 }
 ```
 
-Example — enriching one source offset on the `device_logs` table from
-above, filling both groups:
-
-```java
-TablePath tablePath = TablePath.of("mydb", "device_logs");
-TableBucket bucket  = new TableBucket(tableId, partitionId, /* bucketId */ 0);
-
-try (Table table = connection.getTable(tablePath)) {
-    AppendWriter writer = table.newAppend().createWriter();
-
-    // enriched_geo: one column (geo_region STRING).
-    writer.appendColumns(
-            "enriched_geo",
-            bucket,
-            /* sourceOffset */ 0L,
-            GenericRow.of(BinaryString.fromString("US-WEST-2")))
-            .get();
-
-    // enriched_risk: two columns in schema order (risk_score DOUBLE,
-    // risk_classification STRING).
-    writer.appendColumns(
-            "enriched_risk",
-            bucket,
-            0L,
-            GenericRow.of(0.92, BinaryString.fromString("high")))
-            .get();
-}
-```
-
-Client batching, leader resolution, retries, and back-pressure are
-transparent to the caller (see *Design § Client-side batching* below).
-
 **Reading with `LogScanner`.** The standard `Table.newScan()` →
 `LogScanner` API works unchanged on column-grouped tables. The EWM gate
 is enforced server-side: scans whose projection touches a column group
 are clamped at `min(HWM, EWM_g)`; pure-base scans read up to `HWM`
-exactly as before.
+exactly as before. No client-side coordination is needed — the merge
+happens on the server via `EnrichmentMerger` (see *Design § Read path*).
+
+**End-to-end example.** The Java analogue of Section 3's SQL pattern
+`INSERT INTO sink SELECT _bucket, _offset, geo_lookup(ip) FROM device_logs`:
+declare the table, write base rows, then open a scanner, pull `ip` out
+of each base row, derive an enrichment value from it, and call
+`appendColumns` at the scanned offset. Reading back with a projection
+that touches `enriched_geo` returns the merged base + enrichment values
+via server-side `EnrichmentMerger`. Exercised end-to-end by
+`ColumnGroupEWMITCase#testEnrichFromScannedBaseColumn`; a multi-group
+variant is in `testAppendColumnsTwoGroupsExample` in the same file.
 
 ```java
-// Enriched scan: projecting geo_region (in enriched_geo) clamps reads
-// at min(HWM, EWM_geo). Merge-on-read substitutes enrichment values.
-int[] projection = new int[] {0, 4};  // device_id (idx 0), geo_region (idx 4)
-try (LogScanner scanner =
-        table.newScan().project(projection).createLogScanner()) {
-    scanner.subscribeFromBeginning(/* bucketId */ 0);
-    ScanRecords records = scanner.poll(Duration.ofSeconds(1));
-    for (ScanRecord r : records) {
-        // r.getRow() contains the merged base + enrichment values;
-        // geo_region is the value written via appendColumns, not NULL.
+// 1. Define the table.
+Schema schema = Schema.newBuilder()
+        .column("device_id", DataTypes.STRING())
+        .column("ip",        DataTypes.STRING())
+        .column("payload",   DataTypes.STRING())
+        .columnGroup("enriched_geo", g ->
+                g.column("geo_region", DataTypes.STRING()))
+        .build();
+
+TablePath tablePath = TablePath.of("mydb", "device_logs");
+
+try (Connection conn = ConnectionFactory.createConnection(flussConfig)) {
+    // 2. Create it.
+    try (Admin admin = conn.getAdmin()) {
+        admin.createTable(
+                        tablePath,
+                        TableDescriptor.builder().schema(schema).distributedBy(1).build(),
+                        /* ignoreIfExists */ false)
+                .get();
+    }
+
+    try (Table table = conn.getTable(tablePath)) {
+        AppendWriter writer = table.newAppend().createWriter();
+        TableBucket bucket  = new TableBucket(table.getTableInfo().getTableId(), 0);
+
+        // 3. Base writes — enrichment column NULL.
+        for (int i = 0; i < 4; i++) {
+            writer.append(GenericRow.of(
+                            BinaryString.fromString("dev-" + i),
+                            BinaryString.fromString("10.0.0." + i),
+                            BinaryString.fromString("login"),
+                            /* geo_region */ null))
+                    .get();
+        }
+
+        // 4. Scan base rows, derive enrichment from each row's ip, call
+        //    appendColumns at the scanned offset (SQL Section 3 in Java).
+        try (LogScanner scanner = table.newScan().createLogScanner()) {
+            scanner.subscribeFromBeginning(/* bucketId */ 0);
+            int delivered = 0;
+            while (delivered < 4) {
+                for (ScanRecord r : scanner.poll(Duration.ofSeconds(1))) {
+                    String ip = r.getRow().getString(1).toString();
+                    writer.appendColumns(
+                                    "enriched_geo",
+                                    bucket,
+                                    r.logOffset(),
+                                    GenericRow.of(BinaryString.fromString("GEO:" + ip)))
+                            .get();
+                    delivered++;
+                }
+            }
+        }
+
+        // 5. Read back. Projecting geo_region (idx 3) clamps reads at EWM_geo
+        //    and splices in the values written above via merge-on-read.
+        int[] projection = new int[] {0, 1, 3};   // device_id, ip, geo_region
+        try (LogScanner enriched =
+                table.newScan().project(projection).createLogScanner()) {
+            enriched.subscribeFromBeginning(/* bucketId */ 0);
+            for (ScanRecord r : enriched.poll(Duration.ofSeconds(1))) {
+                // r.getRow().getString(2).equals("GEO:" + r.getRow().getString(1));
+            }
+        }
     }
 }
 ```
-
-No client-side coordination is needed — the merge happens on the server
-via `EnrichmentMerger` (see *Design § Read path*).
 
 ### 2. SQL DDL — declare column groups
 

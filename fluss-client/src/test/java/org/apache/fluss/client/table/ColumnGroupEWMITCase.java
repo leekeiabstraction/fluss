@@ -596,6 +596,90 @@ public class ColumnGroupEWMITCase extends ClientToServerITCaseBase {
         assertThat(leader.getEnrichmentWatermark("enriched_risk")).isEqualTo(1L);
     }
 
+    @Test
+    void testEnrichFromScannedBaseColumn() throws Exception {
+        // Java equivalent of the FIP's Section 3 SQL pattern:
+        //   INSERT INTO sink SELECT _bucket, _offset, geo_lookup(ip) FROM device_logs;
+        // Open a LogScanner over the base table, pull `ip` out of each scanned row, derive a
+        // synthetic enrichment value from it, then call appendColumns at that row's offset.
+        TablePath tablePath = TablePath.of(DB_NAME, "device_logs_enrich_from_scan");
+        Schema schema =
+                Schema.newBuilder()
+                        .column("device_id", DataTypes.STRING())
+                        .column("ip", DataTypes.STRING())
+                        .column("payload", DataTypes.STRING())
+                        .columnGroup(
+                                "enriched_geo", g -> g.column("geo_region", DataTypes.STRING()))
+                        .build();
+        long tableId =
+                createTable(
+                        tablePath,
+                        TableDescriptor.builder().schema(schema).distributedBy(1).build(),
+                        false);
+        FLUSS_CLUSTER_EXTENSION.waitUntilTableReady(tableId);
+        TableBucket bucket = new TableBucket(tableId, 0);
+
+        int recordCount = 4;
+        try (Table table = conn.getTable(tablePath)) {
+            // Phase 1: write distinct base rows. `ip` is the column we'll feed into the
+            // synthetic enrichment function below.
+            AppendWriter writer = table.newAppend().createWriter();
+            for (int i = 0; i < recordCount; i++) {
+                writer.append(row("dev-" + i, "10.0.0." + i, "login", null)).get();
+            }
+
+            // Phase 2: scan base rows, derive enrichment from ip, call appendColumns at the
+            // scanned offset. Mirrors what the Flink enrichment sink does per row.
+            try (LogScanner scanner = createLogScanner(table)) {
+                subscribeFromBeginning(scanner, table);
+                int delivered = 0;
+                while (delivered < recordCount) {
+                    ScanRecords records = scanner.poll(Duration.ofSeconds(1));
+                    for (ScanRecord r : records) {
+                        String ip = r.getRow().getString(1).toString();
+                        // Synthetic geo_lookup(ip): "GEO:<ip>".
+                        InternalRow enrichmentRow =
+                                GenericRow.of(BinaryString.fromString("GEO:" + ip));
+                        AppendColumnsResult result =
+                                writer.appendColumns(
+                                                "enriched_geo",
+                                                bucket,
+                                                r.logOffset(),
+                                                enrichmentRow)
+                                        .get();
+                        assertThat(result.getEnrichmentWatermark()).isEqualTo(r.logOffset() + 1);
+                        delivered++;
+                    }
+                }
+            }
+
+            // Phase 3: read back through the enrichment-touching projection. The merged
+            // geo_region must be the function-of-ip value we wrote, not NULL.
+            int[] projection = new int[] {0, 1, 3}; // device_id, ip, geo_region
+            try (LogScanner enrichedScanner = createLogScanner(table, projection)) {
+                subscribeFromBeginning(enrichedScanner, table);
+                List<ScanRecord> seen = new ArrayList<>();
+                long deadline = System.currentTimeMillis() + 5_000L;
+                while (seen.size() < recordCount && System.currentTimeMillis() < deadline) {
+                    ScanRecords records = enrichedScanner.poll(Duration.ofSeconds(1));
+                    for (ScanRecord r : records) {
+                        seen.add(r);
+                    }
+                }
+                assertThat(seen).hasSize(recordCount);
+                for (int i = 0; i < recordCount; i++) {
+                    InternalRow projected = seen.get(i).getRow();
+                    String ip = projected.getString(1).toString();
+                    // geo_region (projection index 2) must equal the function of ip we computed.
+                    assertThat(projected.getString(2).toString()).isEqualTo("GEO:" + ip);
+                }
+            }
+        }
+
+        LogTablet leader = getLeaderLogTablet(bucket);
+        assertThat(leader.getEnrichmentWatermark("enriched_geo")).isEqualTo((long) recordCount);
+    }
+
     /** Find the leader LogTablet for a given table bucket across all tablet servers. */
     private LogTablet getLeaderLogTablet(TableBucket tableBucket) {
         for (TabletServer ts : FLUSS_CLUSTER_EXTENSION.getTabletServers()) {
