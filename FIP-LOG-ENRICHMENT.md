@@ -121,20 +121,14 @@ not the consumer — owns the "is enrichment caught up?" decision.
 
 ### 1. Java client API
 
-The Java client API has three surfaces: `Schema.Builder` declares the
-table shape with named column groups, `AppendWriter.appendColumns` writes
-enrichment values at existing source offsets, and `LogScanner` reads
-merged rows under the server-side EWM gate.
+Three surfaces: `Schema.Builder` declares the table shape with named
+column groups, `AppendWriter.appendColumns` writes enrichment at
+existing source offsets, and `LogScanner` reads merged rows under the
+server-side EWM gate.
 
-**Defining a table with column groups.** `Schema.Column` gains an
-optional `columnGroup` field. `Schema.Builder` exposes a block API —
-`columnGroup(String, Consumer<Builder>)` — that scopes the columns
-declared inside the lambda to a named group, so a group's members live
-visually together in the source. An inline overload — `column(String,
-DataType, String)` — is available for one-off enrichment columns, and
-the retroactive `columnGroup(String)` (no lambda) form is kept for
-parity with existing call sites. Convenience accessors expose the group
-layout to readers (e.g. the server's `EnrichmentMerger`). From
+**Defining a table.** `Schema.Column` gains an optional `columnGroup`
+field; `Schema.Builder.columnGroup(name, block)` scopes the columns
+added inside the lambda to a named group. From
 `fluss-common/src/main/java/org/apache/fluss/metadata/Schema.java`:
 
 ```java
@@ -149,71 +143,42 @@ public final class Schema {
     public static final class Builder {
         public Builder column(String name, DataType dataType);
 
-        /** Inline form: append a column and assign it to {@code columnGroup}. */
-        public Builder column(String name, DataType dataType, String columnGroup);
-
-        /** Block form: every column added inside {@code block} joins {@code groupName}. */
+        /** Every column added inside {@code block} joins {@code groupName}. */
         public Builder columnGroup(String groupName, Consumer<Builder> block);
-
-        /** Retroactive form: assign the most-recently-added column to {@code groupName}. */
-        public Builder columnGroup(String groupName);
 
         // ... primaryKey(), withComment(), build() ...
     }
 }
 ```
 
-A table with column groups is created via `TableDescriptor.builder()` +
-`Admin.createTable` exactly as a plain table is — see the end-to-end
-example below.
-
-**Writing enrichment via `appendColumns`.** A single-row, leader-routed
-RPC that bypasses the regular append batching pipeline. After the put
+**Writing enrichment.** A single-row, leader-routed RPC. After the put
 succeeds, the per-bucket EWM advances to the highest contiguous offset
-filled (starting from 0); client batching, leader resolution, retries
-and back-pressure are transparent to the caller (see *Design §
-Client-side batching* below). From
-`fluss-client/src/main/java/org/apache/fluss/client/table/writer/AppendWriter.java`:
+filled (starting from 0). From
+`fluss-client/.../client/table/writer/AppendWriter.java`:
 
 ```java
 @PublicEvolving
 public interface AppendWriter extends TableWriter {
 
-    /** Append a record into a Log Table. */
     CompletableFuture<AppendResult> append(InternalRow record);
 
-    /**
-     * Write enrichment columns for the given column group at an existing source offset on a
-     * specific bucket. The enrichment row must contain only the columns of the named column
-     * group, in the order they appear in the table schema.
-     *
-     * <p>After the put succeeds, the per-bucket enrichment watermark advances to the highest
-     * contiguous offset that has been filled (starting from 0).
-     */
+    /** Write enrichment columns for the given group at an existing source offset. */
     CompletableFuture<AppendColumnsResult> appendColumns(
-            String columnGroup,
-            TableBucket  bucket,
-            long         sourceOffset,
-            InternalRow  enrichmentRow);
+            String columnGroup, TableBucket bucket, long sourceOffset, InternalRow enrichmentRow);
 }
 ```
 
-**Reading with `LogScanner`.** The standard `Table.newScan()` →
-`LogScanner` API works unchanged on column-grouped tables. The EWM gate
-is enforced server-side: scans whose projection touches a column group
-are clamped at `min(HWM, EWM_g)`; pure-base scans read up to `HWM`
-exactly as before. No client-side coordination is needed — the merge
-happens on the server via `EnrichmentMerger` (see *Design § Read path*).
+**Reading.** The standard `Table.newScan()` → `LogScanner` works
+unchanged; scans whose projection touches column group `g` are clamped
+server-side at `min(HWM, EWM_g)` and the merge happens inside
+`EnrichmentMerger` (see *Design § Read path*).
 
-**End-to-end example.** The Java analogue of Section 3's SQL pattern
+**End-to-end example.** Java analogue of Section 3's SQL pattern
 `INSERT INTO sink SELECT _bucket, _offset, geo_lookup(ip) FROM device_logs`:
-declare the table, write base rows, then open a scanner, pull `ip` out
-of each base row, derive an enrichment value from it, and call
-`appendColumns` at the scanned offset. Reading back with a projection
-that touches `enriched_geo` returns the merged base + enrichment values
-via server-side `EnrichmentMerger`. Exercised end-to-end by
-`ColumnGroupEWMITCase#testEnrichFromScannedBaseColumn`; a multi-group
-variant is in `testAppendColumnsTwoGroupsExample` in the same file.
+declare the table, write base rows, scan, derive an enrichment from
+each row's `ip`, and call `appendColumns` at the scanned offset.
+Exercised by `ColumnGroupEWMITCase#testEnrichFromScannedBaseColumn`; a
+multi-group variant lives in `testAppendColumnsTwoGroupsExample`.
 
 ```java
 // 1. Define the table.
