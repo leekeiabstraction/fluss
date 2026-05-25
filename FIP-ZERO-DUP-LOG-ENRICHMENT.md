@@ -614,7 +614,7 @@ Key design choices:
   writers receive `LogRecord` instances and never inspect provenance —
   merged rows look identical to plain log rows.
 
-### Client-side batching (Phase N)
+### Client-side batching
 
 `appendColumns` calls do not directly issue RPCs. They feed a per-(table,
 group, bucket) `EnrichmentAccumulator`, modelled on Fluss's existing
@@ -623,20 +623,27 @@ batches and dispatches `ProduceLogColumns` RPCs. The accumulator shares
 the writer's `MemorySegmentPool`, `ArrowWriterPool`, and dynamic
 batch-size estimator with base appends, and inherits the writer's
 `client.writer.batch-size` / `client.writer.batch-timeout` /
-`client.writer.buffer-page-size` settings. From
-`fluss-client/src/main/java/org/apache/fluss/client/write/EnrichmentRouter.java`:
+`client.writer.buffer-page-size` settings.
 
 ```java
-public synchronized EnrichmentAccumulator getOrCreateAccumulator(
-        String columnGroup, EnrichmentAccumulator.BatchEncoderInfo encoderInfo) {
-    if (closed) throw new IllegalStateException(...);
-    EnrichmentAccumulator existing = accumulatorsByGroup.get(columnGroup);
-    if (existing != null) return existing;
-    EnrichmentAccumulator fresh =
-            writerClient.newEnrichmentAccumulator(tablePath, encoderInfo);
-    accumulatorsByGroup.put(columnGroup, fresh);
-    ensureSenderStarted();   // start the daemon sender on first use
-    return fresh;
+public final class EnrichmentAccumulator {
+    // ... fields / ctor / pool + estimator deps omitted
+
+    /** Enqueue a row for {@code key}; future completes when the server acks the batch. */
+    public CompletableFuture<AppendColumnsResult> append(
+            EnrichmentBatchKey key, long sourceOffset, InternalRow row, long nowMs);
+
+    /** True if some batch is full, has lingered past timeout, or flushAll() was called. */
+    public boolean hasReady(long nowMs);
+
+    /** Seal and return all ready batches, grouped per (table, group, bucket) key. */
+    public Map<EnrichmentBatchKey, List<EnrichmentWriteBatch.SealedBatch>> drainReady(long nowMs)
+            throws Exception;
+
+    /** Mark all in-flight batches as ready on the next drain. */
+    public void flushAll();
+
+    public void close();
 }
 ```
 
