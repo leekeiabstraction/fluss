@@ -681,15 +681,17 @@ Three new classes and three modifications cover the Flink-SQL surface:
   `bucket`, `offset`, `partition`; the per-row appender is the new
   `MetadataAppender`.
 
-The plan-time pivot inside `EnrichmentTableSink`:
+Key signatures, by class:
 
 ```java
+// EnrichmentTableSink: plan-time validation + runtime sink wiring.
 public class EnrichmentTableSink implements DynamicTableSink {
-    // ... fields / configure / changelog mode omitted
+    public EnrichmentTableSink(
+            TablePath targetTablePath, String groupName, Configuration flussConfig, /* ... */);
 
     @Override
     public SinkRuntimeProvider getSinkRuntimeProvider(Context context) {
-        ResolvedTarget resolved = resolveTarget();    // plan-time schema check
+        ResolvedTarget resolved = resolveTarget();   // plan-time schema check
         EnrichmentSink sink = new EnrichmentSink(
                 targetTablePath, flussConfig, resolved.tableId, groupName,
                 resolved.enrichmentValueRowType, resolved.partitioned);
@@ -697,6 +699,72 @@ public class EnrichmentTableSink implements DynamicTableSink {
                 dataStream.sinkTo(sink)
                           .name("EnrichmentSink(" + targetTablePath + "/" + groupName + ")");
     }
+
+    @Override
+    public ChangelogMode getChangelogMode(ChangelogMode requestedMode);  // insert-only
+}
+
+// EnrichmentSink: thin Sink<RowData> shell that creates the per-task writer.
+public class EnrichmentSink extends SinkAdapter<RowData> {
+    public EnrichmentSink(
+            TablePath tablePath, Configuration flussConfig, long tableId,
+            String groupName, RowType enrichmentValueRowType, boolean partitioned);
+}
+
+// EnrichmentSinkWriter: per-task runtime that drives appendColumns.
+public class EnrichmentSinkWriter implements SinkWriter<RowData> {
+    /** Unpack (src_partition, src_bucket, src_offset, vals); call AppendWriter.appendColumns. */
+    @Override
+    public void write(RowData row, Context context) throws IOException;
+
+    @Override
+    public void flush(boolean endOfInput) throws IOException;
+
+    @Override
+    public void close() throws Exception;
+}
+
+// MetadataAppender: source-side splicer for bucket / offset / partition METADATA columns.
+public class MetadataAppender implements Serializable {
+    public static final String BUCKET_KEY    = "bucket";
+    public static final String OFFSET_KEY    = "offset";
+    public static final String PARTITION_KEY = "partition";
+
+    /** Build an appender plan from the user's METADATA-column declarations. */
+    public static Result plan(/* ... */);
+
+    /** Per-row splice into the appender's metadata slots. */
+    public RowData splice(
+            RowData physicalRow, int bucket, long offset, @Nullable String partitionName);
+}
+
+// FlinkTableFactory: dispatch on `enrichment.target`.
+public class FlinkTableFactory implements DynamicTableSourceFactory, DynamicTableSinkFactory {
+    /** Returns an EnrichmentTableSink when `enrichment.target` is set; otherwise the
+     *  standard FlinkTableSink. SELECT on an enrichment-target table is rejected. */
+    @Override
+    public DynamicTableSink createDynamicTableSink(Context context);
+}
+
+// FlinkConversions: DDL <-> schema column-group translation.
+public final class FlinkConversions {
+    /** Parse `column-groups.<g> = col1, col2, ...` DDL options into a column → group map. */
+    private static Map<String, String> parseColumnGroups(
+            Configuration flinkTableConf,
+            Set<String> physicalColumnNames,
+            boolean hasPrimaryKey,
+            List<String> partitionKeys);
+    // Read path (toFlinkTable) re-synthesizes the same options from the Schema's
+    // column-group metadata so SHOW CREATE TABLE round-trips losslessly.
+}
+
+// FlinkTableSource: advertise bucket / offset / partition as METADATA-readable columns.
+public class FlinkTableSource implements ScanTableSource, SupportsReadingMetadata /* ... */ {
+    @Override
+    public Map<String, DataType> listReadableMetadata();   // bucket, offset, partition
+
+    @Override
+    public void applyReadableMetadata(List<String> metadataKeys, DataType producedDataType);
 }
 ```
 
