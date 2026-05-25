@@ -542,21 +542,23 @@ public class ColumnGroupEWMITCase extends ClientToServerITCaseBase {
 
     @Test
     void testAppendColumnsTwoGroupsExample() throws Exception {
-        // Mirrors the FIP's Section 3 example: AppendWriter.appendColumns fills two
-        // independent column groups via the Java client. Each call advances only its
-        // own group's EWM.
+        // Mirrors the FIP's Section 1 example: AppendWriter.appendColumns fills two
+        // independent column groups via the Java client. The schema is declared with
+        // the .columnGroup(name, block) lambda form so each group's members live together
+        // in the source.
         TablePath tablePath = TablePath.of(DB_NAME, "device_logs_two_groups");
         Schema schema =
                 Schema.newBuilder()
                         .column("device_id", DataTypes.STRING())
                         .column("ip", DataTypes.STRING())
                         .column("payload", DataTypes.STRING())
-                        .column("geo_region", DataTypes.STRING())
-                        .columnGroup("enriched_geo")
-                        .column("risk_score", DataTypes.DOUBLE())
-                        .columnGroup("enriched_risk")
-                        .column("risk_classification", DataTypes.STRING())
-                        .columnGroup("enriched_risk")
+                        .columnGroup(
+                                "enriched_geo", g -> g.column("geo_region", DataTypes.STRING()))
+                        .columnGroup(
+                                "enriched_risk",
+                                g ->
+                                        g.column("risk_score", DataTypes.DOUBLE())
+                                                .column("risk_classification", DataTypes.STRING()))
                         .build();
         long tableId =
                 createTable(

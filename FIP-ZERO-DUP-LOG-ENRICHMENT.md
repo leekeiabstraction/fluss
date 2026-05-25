@@ -100,9 +100,88 @@ time, with the system enforcing "completeness" at the read boundary.
 
 ## Public interfaces
 
-### 1. Java client API — `AppendWriter.appendColumns`
+### 1. Java client API
 
-From `fluss-client/src/main/java/org/apache/fluss/client/table/writer/AppendWriter.java`:
+The Java client API has three surfaces: `Schema.Builder` declares the
+table shape with named column groups, `AppendWriter.appendColumns` writes
+enrichment values at existing source offsets, and `LogScanner` reads
+merged rows under the server-side EWM gate.
+
+**Defining a table with column groups.** `Schema.Column` gains an
+optional `columnGroup` field. `Schema.Builder` exposes a block API —
+`columnGroup(String, Consumer<Builder>)` — that scopes the columns
+declared inside the lambda to a named group, so a group's members live
+visually together in the source. An inline overload — `column(String,
+DataType, String)` — is available for one-off enrichment columns, and
+the retroactive `columnGroup(String)` (no lambda) form is kept for
+parity with existing call sites. Convenience accessors expose the group
+layout to readers (e.g. the server's `EnrichmentMerger`). From
+`fluss-common/src/main/java/org/apache/fluss/metadata/Schema.java`:
+
+```java
+public final class Schema {
+    public static Builder newBuilder();
+
+    /** Returns groupName -> ordered list of column indices in that group. */
+    public Map<String, List<Integer>> getColumnGroups();
+    public Set<String> getColumnGroupNames();
+    public int[]       getDefaultGroupColumnIndices();
+
+    public static final class Builder {
+        public Builder column(String name, DataType dataType);
+
+        /** Inline form: append a column and assign it to {@code columnGroup}. */
+        public Builder column(String name, DataType dataType, String columnGroup);
+
+        /** Block form: every column added inside {@code block} joins {@code groupName}. */
+        public Builder columnGroup(String groupName, Consumer<Builder> block);
+
+        /** Retroactive form: assign the most-recently-added column to {@code groupName}. */
+        public Builder columnGroup(String groupName);
+
+        // ... primaryKey(), withComment(), build() ...
+    }
+}
+```
+
+Java equivalent of the SQL DDL in Section 2 (same `device_logs` table:
+two column groups, partitioned + auto-partitioned by `dt`, bucketed by
+`device_id`). The block form scopes `enriched_risk`'s two members
+together; the single-column `enriched_geo` group could use either form:
+
+```java
+Schema schema = Schema.newBuilder()
+        .column("dt",        DataTypes.STRING())
+        .column("device_id", DataTypes.STRING())
+        .column("ip",        DataTypes.STRING())
+        .column("payload",   DataTypes.STRING())
+        .columnGroup("enriched_geo", g ->
+                g.column("geo_region", DataTypes.STRING()))
+        .columnGroup("enriched_risk", g ->
+                g.column("risk_score",          DataTypes.DOUBLE())
+                 .column("risk_classification", DataTypes.STRING()))
+        .build();
+
+TableDescriptor descriptor = TableDescriptor.builder()
+        .schema(schema)
+        .partitionedBy("dt")
+        .distributedBy(16, "device_id")
+        .property(ConfigOptions.TABLE_AUTO_PARTITION_ENABLED,   true)
+        .property(ConfigOptions.TABLE_AUTO_PARTITION_TIME_UNIT, AutoPartitionTimeUnit.DAY)
+        .build();
+
+try (Connection conn = ConnectionFactory.createConnection(flussConfig);
+     Admin admin     = conn.getAdmin()) {
+    admin.createTable(
+                    TablePath.of("mydb", "device_logs"),
+                    descriptor,
+                    /* ignoreIfExists */ false)
+            .get();
+}
+```
+
+**Writing enrichment via `appendColumns`.** From
+`fluss-client/src/main/java/org/apache/fluss/client/table/writer/AppendWriter.java`:
 
 ```java
 @PublicEvolving
@@ -127,8 +206,8 @@ public interface AppendWriter extends TableWriter {
 }
 ```
 
-Example — enriching one source offset on the `device_logs` table declared
-in Section 2 below, filling both groups:
+Example — enriching one source offset on the `device_logs` table from
+above, filling both groups:
 
 ```java
 TablePath tablePath = TablePath.of("mydb", "device_logs");
@@ -321,21 +400,6 @@ message PbProduceLogColumnsRespForBucket {
 existing `projected_fields` is enough for the server to decide the read
 gate. (We *do* surface per-group EWMs on the response for observability;
 the field is additive and optional.)
-
-### 5. Schema metadata API
-
-`Schema.Column` gains an optional `columnGroup` field (existing API,
-nullable). Convenience accessors on `Schema`:
-
-```java
-public final class Schema {
-    /** Returns groupName -> ordered list of column indices in that group. */
-    public Map<String, List<Integer>> getColumnGroups();
-
-    public Set<String>            getColumnGroupNames();
-    public List<Integer>          getDefaultGroupColumnIndices();
-}
-```
 
 ---
 

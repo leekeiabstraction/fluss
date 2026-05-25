@@ -45,6 +45,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
@@ -505,6 +506,23 @@ public final class Schema implements Serializable {
             return this;
         }
 
+        /**
+         * Declares a column that is appended to this schema and assigned to a named column group.
+         *
+         * <p>Equivalent to {@link #column(String, DataType)} immediately followed by {@link
+         * #columnGroup(String)}.
+         *
+         * @param columnName column name
+         * @param dataType column data type
+         * @param columnGroup the column group this column belongs to
+         * @return this builder for fluent API
+         */
+        public Builder column(String columnName, DataType dataType, String columnGroup) {
+            checkNotNull(columnGroup, "Column group name must not be null.");
+            column(columnName, dataType);
+            return columnGroup(columnGroup);
+        }
+
         /** Apply comment to the previous column. */
         public Builder withComment(@Nullable String comment) {
             if (!columns.isEmpty()) {
@@ -529,6 +547,38 @@ public final class Schema implements Serializable {
                 throw new IllegalArgumentException(
                         "Method 'columnGroup(...)' must be called after a column definition, "
                                 + "but there is no preceding column defined.");
+            }
+            return this;
+        }
+
+        /**
+         * Scopes a block of column declarations so each column added inside the block is assigned
+         * to the given column group. Columns added inside the block that explicitly specify a
+         * different group (e.g. via {@link #column(String, DataType, String)}) keep their explicit
+         * group; columns added before the block are not affected.
+         *
+         * <p>Example:
+         *
+         * <pre>{@code
+         * .columnGroup("enriched_risk", g -> g
+         *         .column("risk_score",          DataTypes.DOUBLE())
+         *         .column("risk_classification", DataTypes.STRING()))
+         * }</pre>
+         *
+         * @param groupName the column group name
+         * @param block a consumer that adds the group's columns to this builder
+         * @return this builder for fluent API
+         */
+        public Builder columnGroup(String groupName, Consumer<Builder> block) {
+            checkNotNull(groupName, "Column group name must not be null.");
+            checkNotNull(block, "Column group block must not be null.");
+            int startIndex = columns.size();
+            block.accept(this);
+            for (int i = startIndex; i < columns.size(); i++) {
+                Column current = columns.get(i);
+                if (!current.getColumnGroup().isPresent()) {
+                    columns.set(i, current.withColumnGroup(groupName));
+                }
             }
             return this;
         }
