@@ -370,46 +370,52 @@ time. From
 `fluss-server/src/main/java/org/apache/fluss/server/log/EnrichmentSegment.java`:
 
 ```java
-int append(MemoryLogRecords records, long[] sourceOffsets) throws IOException {
-    int basePosition = fileLogRecords.sizeInBytes();
-    int written      = fileLogRecords.append(records);
-    if (written == 0 && records.sizeInBytes() > 0) {
-        throw new IOException("FileLogRecords.append wrote 0 bytes ...");
-    }
-    int rowIdx        = 0;
-    int relativeOffset = 0;
-    for (LogRecordBatch batch : records.batches()) {
-        int batchPosition = basePosition + relativeOffset;
-        int recordCount   = batch.getRecordCount();
-        for (int i = 0; i < recordCount; i++) {
-            offsetIndex.append(sourceOffsets[rowIdx], batchPosition);
-            rowIdx++;
-        }
-        relativeOffset += batch.sizeInBytes();
-    }
-    // ... validate counts, return basePosition
-}
+final class EnrichmentSegment implements Closeable {
+    private final FileLogRecords fileLogRecords;
+    private final OffsetIndex offsetIndex;
+    // ... ctor / open / close omitted
 
-/**
- * Look up the file position AND intra-batch row index of the given source offset.
- * The intra-batch index is recovered by walking backward in OffsetIndex while
- * `position` stays equal — rows in the same Arrow batch all share the batch's
- * file position.
- */
-BatchSlot lookupBatch(long sourceOffset) {
-    if (offsetIndex.entries() == 0) return null;
-    OffsetPosition pos = offsetIndex.lookup(sourceOffset);
-    if (pos.getOffset() != sourceOffset) return null;
-    int slot       = Math.toIntExact(sourceOffset);
-    int position   = pos.getPosition();
-    int intraIndex = 0;
-    while (slot > 0) {
-        OffsetPosition prev = offsetIndex.entry(slot - 1);
-        if (prev.getPosition() != position) break;
-        intraIndex++;
-        slot--;
+    int append(MemoryLogRecords records, long[] sourceOffsets) throws IOException {
+        int basePosition = fileLogRecords.sizeInBytes();
+        int written      = fileLogRecords.append(records);
+        if (written == 0 && records.sizeInBytes() > 0) {
+            throw new IOException("FileLogRecords.append wrote 0 bytes ...");
+        }
+        int rowIdx        = 0;
+        int relativeOffset = 0;
+        for (LogRecordBatch batch : records.batches()) {
+            int batchPosition = basePosition + relativeOffset;
+            int recordCount   = batch.getRecordCount();
+            for (int i = 0; i < recordCount; i++) {
+                offsetIndex.append(sourceOffsets[rowIdx], batchPosition);
+                rowIdx++;
+            }
+            relativeOffset += batch.sizeInBytes();
+        }
+        // ... validate counts, return basePosition
     }
-    return new BatchSlot(position, intraIndex);
+
+    /**
+     * Look up the file position AND intra-batch row index of the given source offset.
+     * The intra-batch index is recovered by walking backward in OffsetIndex while
+     * `position` stays equal — rows in the same Arrow batch all share the batch's
+     * file position.
+     */
+    BatchSlot lookupBatch(long sourceOffset) {
+        if (offsetIndex.entries() == 0) return null;
+        OffsetPosition pos = offsetIndex.lookup(sourceOffset);
+        if (pos.getOffset() != sourceOffset) return null;
+        int slot       = Math.toIntExact(sourceOffset);
+        int position   = pos.getPosition();
+        int intraIndex = 0;
+        while (slot > 0) {
+            OffsetPosition prev = offsetIndex.entry(slot - 1);
+            if (prev.getPosition() != position) break;
+            intraIndex++;
+            slot--;
+        }
+        return new BatchSlot(position, intraIndex);
+    }
 }
 ```
 
