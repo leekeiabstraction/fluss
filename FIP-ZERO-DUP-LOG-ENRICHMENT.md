@@ -100,107 +100,7 @@ time, with the system enforcing "completeness" at the read boundary.
 
 ## Public interfaces
 
-### 1. SQL DDL — declare column groups
-
-Column groups are declared via table-level `column-groups.<groupName>`
-properties in the `WITH` clause; each property's value is a comma-separated
-list of columns that belong to that group. Enrichment columns are typically
-trailing nullable columns; the base writer leaves them NULL until the
-enrichment job fills them.
-
-```sql
-CREATE TABLE device_logs (
-  dt          STRING,
-  device_id   STRING,
-  ip          STRING,
-  payload     STRING,
-  -- Enrichment columns, written later via separate Flink jobs
-  geo_region           STRING,
-  risk_score           DOUBLE,
-  risk_classification  STRING,
-  -- Virtual metadata columns, surfaced by Fluss for use in enrichment SELECTs.
-  _partition  STRING METADATA FROM 'partition' VIRTUAL,
-  _bucket     BIGINT METADATA FROM 'bucket'    VIRTUAL,
-  _offset     BIGINT METADATA FROM 'offset'    VIRTUAL
-) PARTITIONED BY (dt) WITH (
-  'bucket.num'                     = '16',
-  'bucket.key'                     = 'device_id',
-  'table.auto-partition.enabled'   = 'true',
-  'table.auto-partition.time-unit' = 'DAY',
-  'column-groups.enriched_geo'     = 'geo_region',
-  'column-groups.enriched_risk'    = 'risk_score, risk_classification'
-);
-```
-
-Multiple groups can coexist on one table; each group advances independently.
-Partitioning is supported under one structural rule: **partition-key
-columns must remain in the default group** — they must be set at base-row
-insertion, while enrichment columns are populated later via separate
-`appendColumns` writes. Including a partition-key column in any
-`column-groups.<g>` value is rejected at create time.
-
-The `column-groups.<g>` keys are internalized into the schema at create
-time, validated, and re-emitted by `SHOW CREATE TABLE` for round-trip
-fidelity.
-
-Base-row writes are ordinary `INSERT` statements that target every
-column; enrichment columns are explicitly `NULL` at this point and get
-filled later by Section 2's write-only sink:
-
-```sql
-INSERT INTO device_logs VALUES
-  ('20260525', 'dev-001', '10.0.0.1', 'login',  NULL, NULL, NULL),
-  ('20260525', 'dev-002', '10.0.0.2', 'logout', NULL, NULL, NULL),
-  ('20260525', 'dev-003', '10.0.0.3', 'login',  NULL, NULL, NULL);
-```
-
-The base log's `HWM` advances as usual. Each column group's `EWM` stays
-at 0 until its enrichment job begins writing; until then a query that
-projects an enrichment column returns no rows because reads are gated
-at `min(HWM, EWM_g for groups in projection)`.
-
-### 2. SQL DDL — write-only enrichment-target table
-
-To write enrichment via Flink SQL, users define a *write-only* table whose
-row shape mirrors the base table's addressing — `(BIGINT src_bucket,
-BIGINT src_offset, <group columns...>)` for unpartitioned bases, or
-`(STRING src_partition, BIGINT src_bucket, BIGINT src_offset, ...)` for
-partitioned bases (as below) — and points at the base table. The source
-SELECT reads the base row's `_partition` / `_bucket` / `_offset` from the
-virtual METADATA columns declared on the base table in Section 1:
-
-```sql
-CREATE TABLE device_logs_geo_sink (
-  src_partition  STRING,
-  src_bucket     BIGINT,
-  src_offset     BIGINT,
-  geo_region     STRING
-) WITH (
-  'connector'         = 'fluss',
-  'enrichment.target' = 'mydb.device_logs',
-  'enrichment.group'  = 'enriched_geo'
-);
-
-INSERT INTO device_logs_geo_sink
-SELECT _partition, _bucket, _offset, geo_lookup(ip)
-FROM device_logs;
-```
-
-**Caveat — the SELECT must reference a base column.** A literal-only
-enrichment expression (e.g. replacing `geo_lookup(ip)` with the constant
-`'London'`) silently emits zero rows: with no base column in the
-projection, the connector falls back to a full-column fetch, and the
-server clamps that at `min(HWM, EWM_g) = 0` via the EWM gate. Any
-base-column reference in the expression — `ip` inside `geo_lookup(ip)`
-above — is enough to push down a narrow projection that bypasses the
-gate.
-
-Selecting from `device_logs_geo_sink` is rejected at plan time — the table
-is a sink only. Schema and field types are validated against the base
-table's column-group definition when the job starts; mismatch fails fast
-with a `ValidationException`.
-
-### 3. Java client API — `AppendWriter.appendColumns`
+### 1. Java client API — `AppendWriter.appendColumns`
 
 From `fluss-client/src/main/java/org/apache/fluss/client/table/writer/AppendWriter.java`:
 
@@ -228,7 +128,7 @@ public interface AppendWriter extends TableWriter {
 ```
 
 Example — enriching one source offset on the `device_logs` table declared
-in Section 1, filling both groups:
+in Section 2 below, filling both groups:
 
 ```java
 TablePath tablePath = TablePath.of("mydb", "device_logs");
@@ -282,6 +182,106 @@ try (LogScanner scanner =
 
 No client-side coordination is needed — the merge happens on the server
 via `EnrichmentMerger` (see *Design § Read path*).
+
+### 2. SQL DDL — declare column groups
+
+Column groups are declared via table-level `column-groups.<groupName>`
+properties in the `WITH` clause; each property's value is a comma-separated
+list of columns that belong to that group. Enrichment columns are typically
+trailing nullable columns; the base writer leaves them NULL until the
+enrichment job fills them.
+
+```sql
+CREATE TABLE device_logs (
+  dt          STRING,
+  device_id   STRING,
+  ip          STRING,
+  payload     STRING,
+  -- Enrichment columns, written later via separate Flink jobs
+  geo_region           STRING,
+  risk_score           DOUBLE,
+  risk_classification  STRING,
+  -- Virtual metadata columns, surfaced by Fluss for use in enrichment SELECTs.
+  _partition  STRING METADATA FROM 'partition' VIRTUAL,
+  _bucket     BIGINT METADATA FROM 'bucket'    VIRTUAL,
+  _offset     BIGINT METADATA FROM 'offset'    VIRTUAL
+) PARTITIONED BY (dt) WITH (
+  'bucket.num'                     = '16',
+  'bucket.key'                     = 'device_id',
+  'table.auto-partition.enabled'   = 'true',
+  'table.auto-partition.time-unit' = 'DAY',
+  'column-groups.enriched_geo'     = 'geo_region',
+  'column-groups.enriched_risk'    = 'risk_score, risk_classification'
+);
+```
+
+Multiple groups can coexist on one table; each group advances independently.
+Partitioning is supported under one structural rule: **partition-key
+columns must remain in the default group** — they must be set at base-row
+insertion, while enrichment columns are populated later via separate
+`appendColumns` writes. Including a partition-key column in any
+`column-groups.<g>` value is rejected at create time.
+
+The `column-groups.<g>` keys are internalized into the schema at create
+time, validated, and re-emitted by `SHOW CREATE TABLE` for round-trip
+fidelity.
+
+Base-row writes are ordinary `INSERT` statements that target every
+column; enrichment columns are explicitly `NULL` at this point and get
+filled later by Section 3's write-only sink:
+
+```sql
+INSERT INTO device_logs VALUES
+  ('20260525', 'dev-001', '10.0.0.1', 'login',  NULL, NULL, NULL),
+  ('20260525', 'dev-002', '10.0.0.2', 'logout', NULL, NULL, NULL),
+  ('20260525', 'dev-003', '10.0.0.3', 'login',  NULL, NULL, NULL);
+```
+
+The base log's `HWM` advances as usual. Each column group's `EWM` stays
+at 0 until its enrichment job begins writing; until then a query that
+projects an enrichment column returns no rows because reads are gated
+at `min(HWM, EWM_g for groups in projection)`.
+
+### 3. SQL DDL — write-only enrichment-target table
+
+To write enrichment via Flink SQL, users define a *write-only* table whose
+row shape mirrors the base table's addressing — `(BIGINT src_bucket,
+BIGINT src_offset, <group columns...>)` for unpartitioned bases, or
+`(STRING src_partition, BIGINT src_bucket, BIGINT src_offset, ...)` for
+partitioned bases (as below) — and points at the base table. The source
+SELECT reads the base row's `_partition` / `_bucket` / `_offset` from the
+virtual METADATA columns declared on the base table in Section 2:
+
+```sql
+CREATE TABLE device_logs_geo_sink (
+  src_partition  STRING,
+  src_bucket     BIGINT,
+  src_offset     BIGINT,
+  geo_region     STRING
+) WITH (
+  'connector'         = 'fluss',
+  'enrichment.target' = 'mydb.device_logs',
+  'enrichment.group'  = 'enriched_geo'
+);
+
+INSERT INTO device_logs_geo_sink
+SELECT _partition, _bucket, _offset, geo_lookup(ip)
+FROM device_logs;
+```
+
+**Caveat — the SELECT must reference a base column.** A literal-only
+enrichment expression (e.g. replacing `geo_lookup(ip)` with the constant
+`'London'`) silently emits zero rows: with no base column in the
+projection, the connector falls back to a full-column fetch, and the
+server clamps that at `min(HWM, EWM_g) = 0` via the EWM gate. Any
+base-column reference in the expression — `ip` inside `geo_lookup(ip)`
+above — is enough to push down a narrow projection that bypasses the
+gate.
+
+Selecting from `device_logs_geo_sink` is rejected at plan time — the table
+is a sink only. Schema and field types are validated against the base
+table's column-group definition when the job starts; mismatch fails fast
+with a `ValidationException`.
 
 ### 4. RPC — `ProduceLogColumns`
 
@@ -665,7 +665,7 @@ Three new classes and three modifications cover the Flink-SQL surface:
 - **`MetadataAppender`** — splices per-row `bucket` / `offset` /
   `partition` values into the produced `RowData` when those METADATA
   columns are declared on the base table. Load-bearing for the
-  Section 2 pattern of `SELECT _partition, _bucket, _offset, ...
+  Section 3 pattern of `SELECT _partition, _bucket, _offset, ...
   FROM base`.
 
 **Modified:**
