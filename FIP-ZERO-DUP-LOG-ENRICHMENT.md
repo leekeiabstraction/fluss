@@ -104,24 +104,48 @@ time, with the system enforcing "completeness" at the read boundary.
 
 ### 1. SQL DDL — declare column groups
 
-A column group is declared with the `COLUMN GROUP` clause on individual
-columns. Trailing nullable columns are typical; the base writer leaves them
-NULL until the enrichment job fills them.
+Column groups are declared via table-level `column-groups.<groupName>`
+properties in the `WITH` clause; each property's value is a comma-separated
+list of columns that belong to that group. Enrichment columns are typically
+trailing nullable columns; the base writer leaves them NULL until the
+enrichment job fills them.
 
 ```sql
 CREATE TABLE device_logs (
+  dt          STRING,
   device_id   STRING,
   ip          STRING,
   payload     STRING,
   ts          TIMESTAMP,
-  -- Enrichment columns, written later via a separate Flink job
-  geo_region  STRING  COLUMN GROUP 'enriched_geo',
-  risk_score  DOUBLE  COLUMN GROUP 'enriched_risk',
-  identity    STRING  COLUMN GROUP 'enriched_risk'
-) WITH ('bucket.num' = '16');
+  -- Enrichment columns, written later via separate Flink jobs
+  geo_region  STRING,
+  risk_score  DOUBLE,
+  identity    STRING
+) PARTITIONED BY (dt) WITH (
+  'bucket.num'                  = '16',
+  'bucket.key'                  = 'device_id',
+  'column-groups.enriched_geo'  = 'geo_region',
+  'column-groups.enriched_risk' = 'risk_score, identity'
+);
 ```
 
-Multiple groups can coexist on one table. Each group advances independently.
+Multiple groups can coexist on one table; each group advances independently.
+Partitioning is supported under one structural rule (Phase M *Invariant
+M.1*): **partition-key columns must remain in the default group** — they
+must be writable at base-row insertion, while enrichment columns are NULL
+until filled later. Including a partition-key column in any
+`column-groups.<g>` value is rejected at create time.
+
+The `column-groups.<g>` keys are internalized into the schema at create
+time, validated (every referenced column exists, no column appears in two
+groups, no partition-key column is grouped), and re-emitted by
+`SHOW CREATE TABLE` for round-trip fidelity.
+
+This property-based form was chosen over a per-column inline DDL clause
+(e.g. `geo_region STRING COLUMN GROUP 'enriched_geo'`) to avoid forking
+Flink's SQL grammar — a per-column clause would require a Calcite parser
+extension, which is a meaningfully larger change. A per-column clause is
+possible future ergonomic work.
 
 ### 2. SQL DDL — write-only enrichment-target table
 
