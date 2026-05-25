@@ -21,7 +21,7 @@ segment file alongside the base log and maintains a per-bucket per-group
 **Enrichment Watermark (EWM)** that tracks progress. Reads that project
 enrichment columns are server-side-gated at `min(HWM, EWM_g for all groups
 in projection)`, so consumers never see partial rows; pure-base reads keep
-today's `HWM` ceiling unchanged. Replication, tiering, and lake
+today's **High Watermark (HWM)** ceiling unchanged. Replication, tiering, and lake
 materialisation share the same gate, with a time-bounded escape valve to
 prevent local disk overflow if enrichment falls behind. A client-side
 accumulator batches enrichment writes so the wire cost is amortised across
@@ -114,6 +114,9 @@ not the consumer — owns the "is enrichment caught up?" decision.
   alternatives*.
 - Cross-table joins or general projection materialisation; this is
   same-table column extension only.
+- Changing the integration with Flink's *Materialized Table*. The
+  workaround in *Motivation* covers the gap; revisiting that integration
+  can be a follow-up FIP once this feature reaches maturity.
 
 ---
 
