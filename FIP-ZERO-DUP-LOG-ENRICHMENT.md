@@ -86,8 +86,6 @@ time, with the system enforcing "completeness" at the read boundary.
    column groups on the same base table; each advances its own EWM.
 4. **Tiering & lake parity.** Remote segments and lake tables contain the
    enriched data once enrichment catches up.
-5. **Operational safety.** Stalled enrichment must not silently corrupt
-   downstream views or fill local disk forever.
 
 ### Non-goals
 
@@ -649,23 +647,56 @@ public final class EnrichmentAccumulator {
 
 ### Flink SQL integration
 
-`EnrichmentTableSink` is a write-only `DynamicTableSink` activated by the
-`enrichment.target` / `enrichment.group` table properties. At plan time it
-resolves the target schema, validates that the sink row matches
-`(src_bucket BIGINT, src_offset BIGINT, <group cols>)` (or with a leading
-`src_partition STRING` for partitioned tables), and at runtime the sink
-calls `appendWriter.appendColumns(...)` per input row — which feeds the
-accumulator above.
+Three new classes and three modifications cover the Flink-SQL surface:
+
+**New:**
+
+- **`EnrichmentTableSink`** — the write-only `DynamicTableSink`
+  activated by `enrichment.target` / `enrichment.group`. Plan-time
+  validation of the sink row shape against the base table's
+  column-group definition; SELECT against the table is rejected.
+- **`EnrichmentSinkWriter`** (with **`EnrichmentSink`** as the thin
+  `Sink<RowData>` shell) — the Sink V2 runtime that unpacks
+  `(src_partition, src_bucket, src_offset, <group cols>)` from each
+  incoming `RowData`, resolves partition name → partition ID via a
+  cached `Admin.listPartitionInfos` lookup, and calls
+  `appendWriter.appendColumns(...)` per row — which feeds the
+  `EnrichmentAccumulator` above.
+- **`MetadataAppender`** — splices per-row `bucket` / `offset` /
+  `partition` values into the produced `RowData` when those METADATA
+  columns are declared on the base table. Load-bearing for the
+  Section 2 pattern of `SELECT _partition, _bucket, _offset, ...
+  FROM base`.
+
+**Modified:**
+
+- **`FlinkTableFactory`** — recognizes `enrichment.target` and
+  dispatches to `EnrichmentTableSink`; rejects SELECT on
+  enrichment-target tables at plan time.
+- **`FlinkConversions`** — `parseColumnGroups` translates
+  `column-groups.<g>` DDL options into `Schema.Builder.columnGroup`
+  calls; the read path re-synthesizes them so `SHOW CREATE TABLE`
+  round-trips losslessly.
+- **`FlinkTableSource`** — `listReadableMetadata()` advertises
+  `bucket`, `offset`, `partition`; the per-row appender is the new
+  `MetadataAppender`.
+
+The plan-time pivot inside `EnrichmentTableSink`:
 
 ```java
-public SinkRuntimeProvider getSinkRuntimeProvider(Context context) {
-    ResolvedTarget resolved = resolveTarget();      // plan-time schema check
-    EnrichmentSink sink = new EnrichmentSink(
-            targetTablePath, flussConfig, resolved.tableId, groupName,
-            resolved.enrichmentValueRowType, resolved.partitioned);
-    return (providerContext, dataStream) ->
-            dataStream.sinkTo(sink)
-                      .name("EnrichmentSink(" + targetTablePath + "/" + groupName + ")");
+public class EnrichmentTableSink implements DynamicTableSink {
+    // ... fields / configure / changelog mode omitted
+
+    @Override
+    public SinkRuntimeProvider getSinkRuntimeProvider(Context context) {
+        ResolvedTarget resolved = resolveTarget();    // plan-time schema check
+        EnrichmentSink sink = new EnrichmentSink(
+                targetTablePath, flussConfig, resolved.tableId, groupName,
+                resolved.enrichmentValueRowType, resolved.partitioned);
+        return (providerContext, dataStream) ->
+                dataStream.sinkTo(sink)
+                          .name("EnrichmentSink(" + targetTablePath + "/" + groupName + ")");
+    }
 }
 ```
 
