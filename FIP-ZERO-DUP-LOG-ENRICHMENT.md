@@ -185,9 +185,17 @@ CREATE TABLE device_logs_geo_sink (
 
 INSERT INTO device_logs_geo_sink
 SELECT _partition, _bucket, _offset, geo_lookup(ip)
-FROM device_logs
-WHERE geo_region IS NULL;
+FROM device_logs;
 ```
+
+**Caveat — the SELECT must reference a base column.** A literal-only
+enrichment expression (e.g. replacing `geo_lookup(ip)` with the constant
+`'London'`) silently emits zero rows: with no base column in the
+projection, the connector falls back to a full-column fetch, and the
+server clamps that at `min(HWM, EWM_g) = 0` via the EWM gate. Any
+base-column reference in the expression — `ip` inside `geo_lookup(ip)`
+above — is enough to push down a narrow projection that bypasses the
+gate.
 
 Selecting from `device_logs_geo_sink` is rejected at plan time — the table
 is a sink only. Schema and field types are validated against the base

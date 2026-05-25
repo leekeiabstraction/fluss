@@ -371,13 +371,8 @@ abstract class FlinkTableSourceITCase extends AbstractTestBase {
 
     @Test
     void testAutoPartitionedColumnGroupTable() throws Exception {
-        // Mirrors the FIP "SQL DDL — declare column groups" snippet: a partitioned base
-        // table with auto-partition enabled and two independent column groups. Verifies
-        // the DDL parses, the schema captures both groups at the correct column indices,
-        // the partition key stays in the default group, auto-partition pre-creates
-        // partitions, and SHOW CREATE TABLE preserves the relevant properties. Then runs
-        // the FIP's base-row INSERT snippet and asserts HWM advances across buckets while
-        // both groups' CEWs remain at 0 (no enrichment writes have happened yet).
+        // End-to-end mirror of the FIP's Section 1 + 2 DDL. The Section 2 SELECT must
+        // include a real base column so the source narrows projection past the EWM gate.
         tEnv.executeSql(
                 "create table device_logs ("
                         + "  dt string, device_id string, ip string, payload string,"
@@ -395,55 +390,40 @@ abstract class FlinkTableSourceITCase extends AbstractTestBase {
         TablePath tablePath = TablePath.of(DEFAULT_DB, "device_logs");
         org.apache.fluss.metadata.TableInfo info = admin.getTableInfo(tablePath).get();
 
-        // dt is the partition key and stays in the default group (the invariant —
-        // partition keys must not appear in any named column group).
-        assertThat(info.getPartitionKeys()).containsExactly("dt");
-
+        // Partition key stays in the default group; both named groups are at the right indices.
         // 0=dt, 1=device_id, 2=ip, 3=payload, 4=geo_region, 5=risk_score, 6=risk_classification.
+        assertThat(info.getPartitionKeys()).containsExactly("dt");
         Map<String, List<Integer>> groups = info.getSchema().getColumnGroups();
         assertThat(groups).containsOnlyKeys("enriched_geo", "enriched_risk");
         assertThat(groups.get("enriched_geo")).containsExactly(4);
         assertThat(groups.get("enriched_risk")).containsExactly(5, 6);
 
-        // Auto-partition pre-creates partitions (default num-precreate = 2 → today + tomorrow).
+        // Auto-partition pre-creates today + tomorrow's partitions (num-precreate=2).
         FLUSS_CLUSTER_EXTENSION.waitUntilPartitionAllReady(tablePath);
 
-        // SHOW CREATE TABLE round-trip preserves both groups and the auto-partition setting.
+        // SHOW CREATE TABLE round-trips both groups and the auto-partition setting.
         try (CloseableIterator<Row> showIter =
                 tEnv.executeSql("show create table device_logs").collect()) {
             assertThat(showIter.hasNext()).isTrue();
-            String ddl = (String) showIter.next().getField(0);
-            assertThat(ddl)
-                    .as("SHOW CREATE TABLE output: %s", ddl)
+            assertThat((String) showIter.next().getField(0))
                     .contains("'column-groups.enriched_geo'")
                     .contains("'column-groups.enriched_risk'")
                     .contains("'table.auto-partition.enabled'");
         }
 
         // Run the FIP's base-row INSERT snippet — enrichment columns explicitly NULL.
-        // Use today's date so rows land in the auto-pre-created partition.
         String today = LocalDate.now().format(DateTimeFormatter.BASIC_ISO_DATE);
+        String nulls = "cast(null as string), cast(null as double), cast(null as string)";
         tEnv.executeSql(
-                        "insert into device_logs values "
-                                + "('"
-                                + today
-                                + "', 'dev-001', '10.0.0.1', 'login', "
-                                + "    cast(null as string), cast(null as double), cast(null as string)),"
-                                + "('"
-                                + today
-                                + "', 'dev-002', '10.0.0.2', 'logout', "
-                                + "    cast(null as string), cast(null as double), cast(null as string)),"
-                                + "('"
-                                + today
-                                + "', 'dev-003', '10.0.0.3', 'login', "
-                                + "    cast(null as string), cast(null as double), cast(null as string))")
+                        String.format(
+                                "insert into device_logs values "
+                                        + "('%1$s', 'dev-001', '10.0.0.1', 'login', %2$s),"
+                                        + "('%1$s', 'dev-002', '10.0.0.2', 'logout', %2$s),"
+                                        + "('%1$s', 'dev-003', '10.0.0.3', 'login', %2$s)",
+                                today, nulls))
                 .await();
 
-        // HWM advances on base writes; summed across the partition's 16 buckets it
-        // equals the row count (rows scatter by `bucket.key = 'device_id'`). On every
-        // bucket, both groups' CEWs are still at the "no enrichment yet" baseline —
-        // the accessor returns -1 when the group's segment has never been opened, 0
-        // once initialized. Either way it must not be positive on any bucket.
+        // HWMs sum to row count; both CEWs ≤ 0 (no-enrichment baseline) on every bucket.
         long tableId = info.getTableId();
         long partitionId = lookupPartitionId(tablePath, today);
         long totalHwm = 0;
@@ -451,14 +431,63 @@ abstract class FlinkTableSourceITCase extends AbstractTestBase {
             TableBucket bucket = new TableBucket(tableId, partitionId, b);
             LogTablet log = FLUSS_CLUSTER_EXTENSION.waitAndGetLeaderReplica(bucket).getLogTablet();
             totalHwm += log.getHighWatermark();
-            assertThat(log.getCommittedEnrichmentWatermark("enriched_geo"))
-                    .as("enriched_geo CEW not positive on bucket %d", b)
-                    .isNotPositive();
-            assertThat(log.getCommittedEnrichmentWatermark("enriched_risk"))
-                    .as("enriched_risk CEW not positive on bucket %d", b)
-                    .isNotPositive();
+            assertThat(log.getCommittedEnrichmentWatermark("enriched_geo")).isNotPositive();
+            assertThat(log.getCommittedEnrichmentWatermark("enriched_risk")).isNotPositive();
         }
-        assertThat(totalHwm).as("HWM sums to row count across buckets").isEqualTo(3L);
+        assertThat(totalHwm).isEqualTo(3L);
+
+        // Section 2: enrichment via the write-only sink. `'London:' || ip` replaces the
+        // FIP's illustrative `geo_lookup(ip)`; `ip` keeps a base column in the projection.
+        tEnv.executeSql(
+                "create table device_logs_geo_sink ("
+                        + "  src_partition string, src_bucket bigint, src_offset bigint,"
+                        + "  geo_region string"
+                        + ") with ('enrichment.target' = 'device_logs',"
+                        + " 'enrichment.group' = 'enriched_geo')");
+        org.apache.flink.table.api.TableResult sinkInsert =
+                tEnv.executeSql(
+                        "insert into device_logs_geo_sink "
+                                + "select _partition, _bucket, _offset, 'London:' || ip"
+                                + " from device_logs");
+        try {
+            retry(
+                    java.time.Duration.ofMinutes(1),
+                    () -> {
+                        long total = 0;
+                        for (int b = 0; b < 16; b++) {
+                            long cew =
+                                    FLUSS_CLUSTER_EXTENSION
+                                            .waitAndGetLeaderReplica(
+                                                    new TableBucket(tableId, partitionId, b))
+                                            .getLogTablet()
+                                            .getCommittedEnrichmentWatermark("enriched_geo");
+                            total += Math.max(0, cew);
+                        }
+                        assertThat(total).isEqualTo(3L);
+                    });
+        } finally {
+            sinkInsert.getJobClient().ifPresent(jc -> jc.cancel());
+        }
+
+        // enriched_risk wasn't targeted; bucket 0 sample suffices.
+        assertThat(
+                        FLUSS_CLUSTER_EXTENSION
+                                .waitAndGetLeaderReplica(new TableBucket(tableId, partitionId, 0))
+                                .getLogTablet()
+                                .getCommittedEnrichmentWatermark("enriched_risk"))
+                .isNotPositive();
+
+        // Merged read: projecting geo_region returns the 3 enriched rows.
+        try (CloseableIterator<Row> iter =
+                tEnv.executeSql("select dt, device_id, geo_region from device_logs").collect()) {
+            assertResultsIgnoreOrder(
+                    iter,
+                    Arrays.asList(
+                            "+I[" + today + ", dev-001, London:10.0.0.1]",
+                            "+I[" + today + ", dev-002, London:10.0.0.2]",
+                            "+I[" + today + ", dev-003, London:10.0.0.3]"),
+                    true);
+        }
     }
 
     @Test
