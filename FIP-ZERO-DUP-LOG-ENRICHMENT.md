@@ -431,23 +431,77 @@ extracted using `lookupBatch`'s `intraIndex`. From
 `fluss-server/src/main/java/org/apache/fluss/server/log/EnrichmentMerger.java`:
 
 ```java
-private Object lookupEnrichment(
-        EnrichmentSegment seg, EnrichmentColumnRef ref, long sourceOffset)
-        throws IOException {
-    EnrichmentSegment.BatchSlot slot = seg.lookupBatch(sourceOffset);
-    if (slot == null) {
-        // The EWM gate ensures we never reach here for offsets the merger asked for.
-        return null;
+public final class EnrichmentMerger implements AutoCloseable {
+    // ... fields / ctor / close omitted
+
+    /** Re-encode baseRecords with enrichment columns sourced from per-group segments. */
+    public LogRecords merge(
+            LogRecords baseRecords, Map<String, EnrichmentSegment> enrichmentSegments)
+            throws Exception {
+        if (baseRecords == null || baseRecords.sizeInBytes() == 0) {
+            return MemoryLogRecords.EMPTY;
+        }
+        MultiBytesView.Builder outputBuilder = MultiBytesView.builder();
+        boolean wrote = false;
+        for (LogRecordBatch batch : baseRecords.batches()) {
+            BytesView batchBytes = mergeBatch(batch, enrichmentSegments);
+            if (batchBytes != null && batchBytes.getBytesLength() > 0) {
+                outputBuilder.addBytes(batchBytes);
+                wrote = true;
+            }
+        }
+        return wrote ? new BytesViewLogRecords(outputBuilder.build()) : MemoryLogRecords.EMPTY;
     }
-    AbstractIterator<FileLogInputStream.FileChannelLogRecordBatch> iter =
-            seg.records().batchIterator(slot.position, seg.records().sizeInBytes());
-    if (!iter.hasNext()) return null;
-    FileLogInputStream.FileChannelLogRecordBatch batch = iter.next();
-    if (slot.intraIndex >= batch.getRecordCount()) {
-        throw new IllegalStateException("Intra-batch index " + slot.intraIndex + " ...");
+
+    private BytesView mergeBatch(
+            LogRecordBatch batch, Map<String, EnrichmentSegment> enrichmentSegments)
+            throws Exception {
+        // ... allocate Arrow writer + paged output sized for this batch
+        try (MemoryLogRecordsArrowBuilder builder = /* ... */ null) {
+            int rowCount = 0;
+            try (CloseableIterator<LogRecord> rowIter = batch.records(baseReadContext)) {
+                while (rowIter.hasNext()) {
+                    LogRecord baseRecord = rowIter.next();
+                    long sourceOffset    = baseRecord.logOffset();
+                    InternalRow baseRow  = baseRecord.getRow();
+                    GenericRow projected = new GenericRow(projectedFields.length);
+                    for (int p = 0; p < projectedFields.length; p++) {
+                        EnrichmentColumnRef ref = enrichmentRefs[p];
+                        if (ref != null) {
+                            EnrichmentSegment seg = enrichmentSegments.get(ref.groupName);
+                            projected.setField(p, lookupEnrichment(seg, ref, sourceOffset));
+                        } else {
+                            int colIdx = projectedFields[p];
+                            projected.setField(
+                                    p, tableFieldGetters[colIdx].getFieldOrNull(baseRow));
+                        }
+                    }
+                    builder.append(baseRecord.getChangeType(), projected);
+                    rowCount++;
+                }
+            }
+            return rowCount == 0 ? null : builder.build();
+        }
     }
-    GroupDecoder decoder = getOrBuildDecoder(ref.groupName, batch.schemaId());
-    return decoder.readColumnByName(batch, ref.columnName, slot.intraIndex);
+
+    private Object lookupEnrichment(
+            EnrichmentSegment seg, EnrichmentColumnRef ref, long sourceOffset)
+            throws IOException {
+        EnrichmentSegment.BatchSlot slot = seg.lookupBatch(sourceOffset);
+        if (slot == null) {
+            // The EWM gate ensures we never reach here for offsets the merger asked for.
+            return null;
+        }
+        AbstractIterator<FileLogInputStream.FileChannelLogRecordBatch> iter =
+                seg.records().batchIterator(slot.position, seg.records().sizeInBytes());
+        if (!iter.hasNext()) return null;
+        FileLogInputStream.FileChannelLogRecordBatch batch = iter.next();
+        if (slot.intraIndex >= batch.getRecordCount()) {
+            throw new IllegalStateException("Intra-batch index " + slot.intraIndex + " ...");
+        }
+        GroupDecoder decoder = getOrBuildDecoder(ref.groupName, batch.schemaId());
+        return decoder.readColumnByName(batch, ref.columnName, slot.intraIndex);
+    }
 }
 ```
 
