@@ -1,4 +1,4 @@
-# FIP: Column-Group Enrichment for Log Tables
+# FIP: Zero-Duplication Log Enrichment via Append Columns
 
 | Field    | Value |
 |----------|-------|
@@ -14,19 +14,23 @@
 ## Abstract
 
 This FIP proposes **column groups** for Apache Fluss log tables: a subset of a
-table's columns can be declared "enrichment-only" and written *later*, at
-existing source offsets. A per-bucket per-group **Enrichment Watermark (EWM)*
-tracks progress and gates reads, replication, tiering, and lake materialisation
-so that consumers never see partial rows for the columns they project.
+table's columns can be declared "enrichment-only" and written *later* by
+appending columns at existing source offsets. A new RPC, `ProduceLogColumns`,
+carries the enrichment writes; the server stores each group in its own
+segment file alongside the base log and maintains a per-bucket per-group
+**Enrichment Watermark (EWM)** that tracks progress. Reads that project
+enrichment columns are server-side-gated at `min(HWM, EWM_g for all groups
+in projection)`, so consumers never see partial rows; pure-base reads keep
+today's `HWM` ceiling unchanged. Replication, tiering, and lake
+materialisation share the same gate, with a time-bounded escape valve to
+prevent local disk overflow if enrichment falls behind. A client-side
+accumulator batches enrichment writes so the wire cost is amortised across
+many rows.
 
 The mechanism eliminates the storage and I/O duplication that today's "raw
 table → enrichment job → enriched table" pattern incurs, while preserving
 Fluss's existing log-table guarantees (offset monotonicity, replication,
 tiering, exactly-once writes) for the enrichment path.
-
-The proposal is the result of a working POC on the
-`option02-lateMaterialized` branch; all snippets in this document are taken
-verbatim from that branch.
 
 ---
 
@@ -41,14 +45,35 @@ edge device ──▶ log table A ──▶ Flink job ──▶ log table B ─�
 
 Log table B's row is `A.* ⊕ enrichment_columns`. If A has 50 columns and the
 enrichment adds 3, the 50 base columns are stored twice — once in A, once in
-B. At scale this is real money: 2× storage, 2× write I/O, 2× fetch I/O for
-any downstream that consumes B.
+B. At scale this is real operational and infrastructure cost — 2× storage,
+2× write I/O, 2× fetch I/O for any downstream that consumes B — plus the
+additional architectural complexity of running and maintaining a separate
+enrichment pipeline.
 
-Workarounds outside Fluss (overlay tables, application-side joins, materialised
-views) either reintroduce duplication elsewhere or push correctness concerns
-onto consumers. We want a first-class primitive that lets the **same row**
-gain columns over time, with the system enforcing "completeness" at the read
-boundary.
+Workarounds outside Fluss either reintroduce duplication elsewhere or push
+correctness concerns onto consumers:
+
+- **[Overlay tables](https://hudi.apache.org/docs/table_types/)** — a side
+  table keyed by the base offset, holding only the enrichment columns;
+  readers merge the two at query time (the pattern Apache Hudi formalises
+  as Merge-on-Read). No base-column duplication, but the system has no
+  notion of "is the overlay caught up?" — the consumer must handle
+  missing or stale rows.
+- **[Application-side joins](https://nightlies.apache.org/flink/flink-docs-stable/docs/dev/table/sql/queries/joins/#lookup-join)**
+  — enrichment lives in a separate system (KV store, lookup table) and
+  every consumer fetches per row; Flink's *lookup join* is the canonical
+  form. Moves the storage cost out of the log but pushes the "is
+  enrichment current?" question onto every consumer.
+- **[Materialised views](https://nightlies.apache.org/flink/flink-docs-stable/docs/dev/table/materialized-table/overview/)**
+  — express the join in SQL; the engine recomputes and stores the result
+  as a new table (Flink's *Materialized Table* is the streaming-era
+  instance, with declarative freshness). Mechanically this is still
+  "log table B" wrapped in a SQL definition — base columns are
+  physically duplicated, and the view lags real-time writes by the
+  configured freshness.
+
+We want a first-class primitive that lets the **same row** gain columns over
+time, with the system enforcing "completeness" at the read boundary.
 
 ### Goals
 
@@ -72,22 +97,6 @@ boundary.
   alternatives*.
 - Cross-table joins or general projection materialisation; this is
   same-table column extension only.
-
----
-
-## Proposal summary (one paragraph)
-
-Tables declare some columns as belonging to a named *column group*. The
-default group's writes are unchanged. A new RPC, `ProduceLogColumns`, lets a
-client write enrichment columns at existing source offsets. The server
-stores each group in its own segment file alongside the base log, and
-maintains a per-(bucket, group) *Enrichment Watermark (EWM)*. Reads that
-project enrichment columns are server-side-gated at `min(HWM, EWM_g for all
-groups in projection)`. Pure-base reads keep today's `HWM` ceiling. Tiering
-and lake materialisation use the same EWM gate, with a time-bounded escape
-valve to prevent disk overflow if enrichment falls behind. A client-side
-accumulator + sender batches enrichment writes so the wire cost is amortised
-across many rows.
 
 ---
 
