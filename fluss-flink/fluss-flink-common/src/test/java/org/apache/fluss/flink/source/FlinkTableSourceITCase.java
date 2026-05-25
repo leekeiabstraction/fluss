@@ -381,7 +381,10 @@ abstract class FlinkTableSourceITCase extends AbstractTestBase {
         tEnv.executeSql(
                 "create table device_logs ("
                         + "  dt string, device_id string, ip string, payload string,"
-                        + "  geo_region string, risk_score double, risk_classification string"
+                        + "  geo_region string, risk_score double, risk_classification string,"
+                        + "  _partition string metadata from 'partition' virtual,"
+                        + "  _bucket    bigint metadata from 'bucket'    virtual,"
+                        + "  _offset    bigint metadata from 'offset'    virtual"
                         + ") partitioned by (dt) with ("
                         + "  'bucket.num' = '16',"
                         + "  'bucket.key' = 'device_id',"

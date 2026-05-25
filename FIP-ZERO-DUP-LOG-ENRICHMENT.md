@@ -119,7 +119,11 @@ CREATE TABLE device_logs (
   -- Enrichment columns, written later via separate Flink jobs
   geo_region           STRING,
   risk_score           DOUBLE,
-  risk_classification  STRING
+  risk_classification  STRING,
+  -- Virtual metadata columns, surfaced by Fluss for use in enrichment SELECTs.
+  _partition  STRING METADATA FROM 'partition' VIRTUAL,
+  _bucket     BIGINT METADATA FROM 'bucket'    VIRTUAL,
+  _offset     BIGINT METADATA FROM 'offset'    VIRTUAL
 ) PARTITIONED BY (dt) WITH (
   'bucket.num'                     = '16',
   'bucket.key'                     = 'device_id',
@@ -160,15 +164,19 @@ at `min(HWM, EWM_g for groups in projection)`.
 ### 2. SQL DDL — write-only enrichment-target table
 
 To write enrichment via Flink SQL, users define a *write-only* table whose
-row shape is `(BIGINT src_bucket, BIGINT src_offset, <group columns...>)` (or
+row shape mirrors the base table's addressing — `(BIGINT src_bucket,
+BIGINT src_offset, <group columns...>)` for unpartitioned bases, or
 `(STRING src_partition, BIGINT src_bucket, BIGINT src_offset, ...)` for
-partitioned base tables) and points at the base table:
+partitioned bases (as below) — and points at the base table. The source
+SELECT reads the base row's `_partition` / `_bucket` / `_offset` from the
+virtual METADATA columns declared on the base table in Section 1:
 
 ```sql
 CREATE TABLE device_logs_geo_sink (
-  src_bucket  BIGINT,
-  src_offset  BIGINT,
-  geo_region  STRING
+  src_partition  STRING,
+  src_bucket     BIGINT,
+  src_offset     BIGINT,
+  geo_region     STRING
 ) WITH (
   'connector'         = 'fluss',
   'enrichment.target' = 'mydb.device_logs',
@@ -176,8 +184,8 @@ CREATE TABLE device_logs_geo_sink (
 );
 
 INSERT INTO device_logs_geo_sink
-SELECT bucket, offset_, geo_lookup(ip)
-FROM device_logs_with_meta
+SELECT _partition, _bucket, _offset, geo_lookup(ip)
+FROM device_logs
 WHERE geo_region IS NULL;
 ```
 
