@@ -624,6 +624,52 @@ public class ColumnGroupEWMITCase extends ClientToServerITCaseBase {
     }
 
     @Test
+    void testAppendColumnsAcksAllResponseImpliesCewAdvanced() throws Exception {
+        // Under the default client.writer.acks=all, the appendColumns response is gated by
+        // CEW (the per-(bucket, group) Committed Enrichment Watermark), not by the leader's
+        // local EWM. By the time the CompletableFuture completes, CEW must already cover the
+        // source offset we just wrote — symmetric to how a base append() under acks=all only
+        // returns once HWM covers the write.
+        TablePath tablePath = TablePath.of(DB_NAME, "device_logs_acks_all");
+        Schema schema =
+                Schema.newBuilder()
+                        .column("device_id", DataTypes.STRING())
+                        .column("payload", DataTypes.STRING())
+                        .columnGroup(
+                                "enriched_geo", g -> g.column("geo_region", DataTypes.STRING()))
+                        .build();
+        long tableId =
+                createTable(
+                        tablePath,
+                        TableDescriptor.builder().schema(schema).distributedBy(1).build(),
+                        false);
+        FLUSS_CLUSTER_EXTENSION.waitUntilTableReady(tableId);
+        TableBucket bucket = new TableBucket(tableId, 0);
+
+        try (Table table = conn.getTable(tablePath)) {
+            AppendWriter writer = table.newAppend().createWriter();
+            writer.append(row("dev-0", "login", null)).get();
+            AppendColumnsResult res =
+                    writer.appendColumns(
+                                    "enriched_geo",
+                                    bucket,
+                                    0L,
+                                    GenericRow.of(BinaryString.fromString("US-WEST-0")))
+                            .get();
+
+            // Response carries the leader EWM after the local write (= source_offset + 1).
+            assertThat(res.getEnrichmentWatermark()).isEqualTo(1L);
+
+            // Acks=all contract: CEW must already be at or past 1 by the time the future
+            // completes — that's the point of the wait. (Under acks=1 we'd race the
+            // follower-fetch path and could see CEW = -1 here.)
+            LogTablet leader = getLeaderLogTablet(bucket);
+            assertThat(leader.getCommittedEnrichmentWatermark("enriched_geo"))
+                    .isGreaterThanOrEqualTo(1L);
+        }
+    }
+
+    @Test
     void testEnrichFromScannedBaseColumn() throws Exception {
         // Java equivalent of the FIP's Section 3 SQL pattern:
         //   INSERT INTO sink SELECT _bucket, _offset, geo_lookup(ip) FROM device_logs;

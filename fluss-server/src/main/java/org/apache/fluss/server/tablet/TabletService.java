@@ -69,7 +69,6 @@ import org.apache.fluss.rpc.messages.UpdateMetadataResponse;
 import org.apache.fluss.rpc.protocol.ApiError;
 import org.apache.fluss.rpc.protocol.Errors;
 import org.apache.fluss.rpc.protocol.MergeMode;
-import org.apache.fluss.rpc.util.CommonRpcMessageUtils;
 import org.apache.fluss.security.acl.OperationType;
 import org.apache.fluss.security.acl.Resource;
 import org.apache.fluss.server.DynamicConfigManager;
@@ -86,6 +85,7 @@ import org.apache.fluss.server.log.ListOffsetsParam;
 import org.apache.fluss.server.metadata.TabletServerMetadataCache;
 import org.apache.fluss.server.metadata.TabletServerMetadataProvider;
 import org.apache.fluss.server.replica.ReplicaManager;
+import org.apache.fluss.server.replica.delay.DelayedEnrichmentWrite;
 import org.apache.fluss.server.utils.ServerRpcMessageUtils;
 import org.apache.fluss.server.zk.ZooKeeperClient;
 
@@ -194,45 +194,48 @@ public final class TabletService extends RpcServiceBase implements TabletServerG
         authorizeTable(WRITE, request.getTableId());
         long tableId = request.getTableId();
         String columnGroup = request.getColumnGroup();
-        ProduceLogColumnsResponse response = new ProduceLogColumnsResponse();
+        int acks = request.hasAcks() ? request.getAcks() : -1;
+        int timeoutMs = request.hasTimeoutMs() ? request.getTimeoutMs() : 30000;
 
-        for (PbProduceLogColumnsReqForBucket bucketReq : request.getBucketsReqsList()) {
-            PbProduceLogColumnsRespForBucket bucketResp = response.addBucketsResp();
-            bucketResp.setBucketId(bucketReq.getBucketId());
-            if (bucketReq.hasPartitionId()) {
-                bucketResp.setPartitionId(bucketReq.getPartitionId());
-            }
-
-            TableBucket tb =
-                    bucketReq.hasPartitionId()
-                            ? new TableBucket(
-                                    tableId, bucketReq.getPartitionId(), bucketReq.getBucketId())
-                            : new TableBucket(tableId, bucketReq.getBucketId());
-
-            try {
-                ReplicaManager.HostedReplica hosted = replicaManager.getReplica(tb);
-                if (!(hosted instanceof ReplicaManager.OnlineReplica)) {
-                    throw new UnknownTableOrBucketException(
-                            "Replica for bucket " + tb + " is not online on this server");
-                }
-                java.nio.ByteBuffer recordsBuf =
-                        CommonRpcMessageUtils.toByteBuffer(bucketReq.getRecordsSlice());
-                MemoryLogRecords records = MemoryLogRecords.pointToByteBuffer(recordsBuf);
-                long ewm =
-                        ((ReplicaManager.OnlineReplica) hosted)
-                                .getReplica()
-                                .appendColumnsAsLeader(
-                                        columnGroup, records, bucketReq.getSourceOffsets());
-                bucketResp.setEnrichmentWatermark(ewm);
-            } catch (Exception e) {
-                ApiError apiError = ApiError.fromThrowable(e);
-                bucketResp.setErrorCode(apiError.error().code());
-                if (apiError.message() != null) {
-                    bucketResp.setErrorMessage(apiError.message());
-                }
-            }
-        }
-        return CompletableFuture.completedFuture(response);
+        CompletableFuture<ProduceLogColumnsResponse> responseFuture = new CompletableFuture<>();
+        replicaManager.appendEnrichmentToLog(
+                timeoutMs,
+                acks,
+                tableId,
+                columnGroup,
+                request.getBucketsReqsList(),
+                bucketResults -> {
+                    ProduceLogColumnsResponse response = new ProduceLogColumnsResponse();
+                    for (PbProduceLogColumnsReqForBucket bucketReq : request.getBucketsReqsList()) {
+                        TableBucket tb =
+                                bucketReq.hasPartitionId()
+                                        ? new TableBucket(
+                                                tableId,
+                                                bucketReq.getPartitionId(),
+                                                bucketReq.getBucketId())
+                                        : new TableBucket(tableId, bucketReq.getBucketId());
+                        PbProduceLogColumnsRespForBucket bucketResp = response.addBucketsResp();
+                        bucketResp.setBucketId(bucketReq.getBucketId());
+                        if (bucketReq.hasPartitionId()) {
+                            bucketResp.setPartitionId(bucketReq.getPartitionId());
+                        }
+                        DelayedEnrichmentWrite.BucketResult result = bucketResults.get(tb);
+                        if (result == null) {
+                            bucketResp.setErrorCode(Errors.UNKNOWN_SERVER_ERROR.code());
+                            bucketResp.setErrorMessage(
+                                    "Missing enrichment result for bucket " + tb);
+                        } else if (result.getError() != null) {
+                            bucketResp.setErrorCode(result.getError().code());
+                            if (result.getMessage() != null) {
+                                bucketResp.setErrorMessage(result.getMessage());
+                            }
+                        } else {
+                            bucketResp.setEnrichmentWatermark(result.getEwm());
+                        }
+                    }
+                    responseFuture.complete(response);
+                });
+        return responseFuture;
     }
 
     @Override

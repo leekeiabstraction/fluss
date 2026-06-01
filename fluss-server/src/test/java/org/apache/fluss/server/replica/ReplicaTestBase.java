@@ -493,6 +493,7 @@ public class ReplicaTestBase {
                                         HIGH_WATERMARK_CHECKPOINT_FILE_NAME))),
                 replicaManager.getDelayedWriteManager(),
                 replicaManager.getDelayedFetchLogManager(),
+                replicaManager.getDelayedEnrichmentWriteManager(),
                 replicaManager.getAdjustIsrManager(),
                 snapshotContext,
                 serverMetadataCache,

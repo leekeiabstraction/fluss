@@ -62,10 +62,12 @@ import org.apache.fluss.rpc.gateway.CoordinatorGateway;
 import org.apache.fluss.rpc.messages.NotifyKvSnapshotOffsetResponse;
 import org.apache.fluss.rpc.messages.NotifyLakeTableOffsetResponse;
 import org.apache.fluss.rpc.messages.NotifyRemoteLogOffsetsResponse;
+import org.apache.fluss.rpc.messages.PbProduceLogColumnsReqForBucket;
 import org.apache.fluss.rpc.protocol.ApiError;
 import org.apache.fluss.rpc.protocol.ApiKeys;
 import org.apache.fluss.rpc.protocol.Errors;
 import org.apache.fluss.rpc.protocol.MergeMode;
+import org.apache.fluss.rpc.util.CommonRpcMessageUtils;
 import org.apache.fluss.server.coordinator.CoordinatorContext;
 import org.apache.fluss.server.entity.FetchReqInfo;
 import org.apache.fluss.server.entity.LakeBucketOffset;
@@ -99,6 +101,7 @@ import org.apache.fluss.server.metrics.UserMetrics;
 import org.apache.fluss.server.metrics.group.BucketMetricGroup;
 import org.apache.fluss.server.metrics.group.TableMetricGroup;
 import org.apache.fluss.server.metrics.group.TabletServerMetricGroup;
+import org.apache.fluss.server.replica.delay.DelayedEnrichmentWrite;
 import org.apache.fluss.server.replica.delay.DelayedFetchLog;
 import org.apache.fluss.server.replica.delay.DelayedFetchLog.FetchBucketStatus;
 import org.apache.fluss.server.replica.delay.DelayedOperationManager;
@@ -183,6 +186,12 @@ public class ReplicaManager implements ServerReconfigurable {
      * is up.
      */
     private final DelayedOperationManager<DelayedFetchLog> delayedFetchLogManager;
+
+    /**
+     * Delayed enrichment write operation manager — watches acks=all {@link
+     * org.apache.fluss.rpc.messages.ProduceLogColumnsRequest} requests until CEW catches up.
+     */
+    private final DelayedOperationManager<DelayedEnrichmentWrite> delayedEnrichmentWriteManager;
 
     private final ReplicaFetcherManager replicaFetcherManager;
     // The manager used to manager the replica alter, especially the isr expand and shrink.
@@ -288,6 +297,11 @@ public class ReplicaManager implements ServerReconfigurable {
                         "delay fetch log",
                         serverId,
                         conf.getInt(ConfigOptions.LOG_REPLICA_FETCH_OPERATION_PURGE_NUMBER));
+        this.delayedEnrichmentWriteManager =
+                new DelayedOperationManager<>(
+                        "delay enrichment write",
+                        serverId,
+                        conf.getInt(ConfigOptions.LOG_REPLICA_WRITE_OPERATION_PURGE_NUMBER));
         this.internalListenerName = conf.get(ConfigOptions.INTERNAL_LISTENER_NAME);
 
         this.replicaFetcherManager =
@@ -1643,6 +1657,95 @@ public class ReplicaManager implements ServerReconfigurable {
                 .collect(Collectors.toList());
     }
 
+    /**
+     * Write enrichment records to the leader's per-(bucket, group) {@code EnrichmentSegment} and,
+     * under {@code acks=-1}, wait until the per-group CEW catches up across the ISR before invoking
+     * {@code responseCallback}. Mirrors {@link #appendRecordsToLog} for the enrichment path. With
+     * {@code acks=0/1} or when every bucket fails locally, the callback fires synchronously.
+     */
+    public void appendEnrichmentToLog(
+            int timeoutMs,
+            int requiredAcks,
+            long tableId,
+            String columnGroup,
+            List<PbProduceLogColumnsReqForBucket> bucketReqs,
+            Consumer<Map<TableBucket, DelayedEnrichmentWrite.BucketResult>> responseCallback) {
+        if (isRequiredAcksInvalid(requiredAcks)) {
+            throw new InvalidRequiredAcksException("Invalid required acks: " + requiredAcks);
+        }
+
+        Map<TableBucket, DelayedEnrichmentWrite.BucketState> bucketStateMap = new HashMap<>();
+        for (PbProduceLogColumnsReqForBucket bucketReq : bucketReqs) {
+            TableBucket tb =
+                    bucketReq.hasPartitionId()
+                            ? new TableBucket(
+                                    tableId, bucketReq.getPartitionId(), bucketReq.getBucketId())
+                            : new TableBucket(tableId, bucketReq.getBucketId());
+            try {
+                HostedReplica hosted = getReplica(tb);
+                if (!(hosted instanceof OnlineReplica)) {
+                    throw new UnknownTableOrBucketException(
+                            "Replica for bucket " + tb + " is not online on this server");
+                }
+                java.nio.ByteBuffer recordsBuf =
+                        CommonRpcMessageUtils.toByteBuffer(bucketReq.getRecordsSlice());
+                MemoryLogRecords records = MemoryLogRecords.pointToByteBuffer(recordsBuf);
+                long ewm =
+                        ((OnlineReplica) hosted)
+                                .getReplica()
+                                .appendColumnsAsLeader(
+                                        columnGroup, records, bucketReq.getSourceOffsets());
+                bucketStateMap.put(tb, DelayedEnrichmentWrite.BucketState.localSuccess(ewm));
+            } catch (Exception e) {
+                ApiError apiError = ApiError.fromThrowable(e);
+                bucketStateMap.put(
+                        tb,
+                        DelayedEnrichmentWrite.BucketState.localFailure(
+                                apiError.error(), apiError.message()));
+            }
+        }
+
+        maybeAddDelayedEnrichmentWrite(
+                timeoutMs, requiredAcks, columnGroup, bucketStateMap, responseCallback);
+    }
+
+    private void maybeAddDelayedEnrichmentWrite(
+            int timeoutMs,
+            int requiredAcks,
+            String columnGroup,
+            Map<TableBucket, DelayedEnrichmentWrite.BucketState> bucketStateMap,
+            Consumer<Map<TableBucket, DelayedEnrichmentWrite.BucketResult>> responseCallback) {
+        boolean anyLocalSuccess =
+                bucketStateMap.values().stream().anyMatch(s -> s.getLocalError() == null);
+        if (requiredAcks == -1 && anyLocalSuccess) {
+            DelayedEnrichmentWrite delayedWrite =
+                    new DelayedEnrichmentWrite(
+                            timeoutMs, columnGroup, bucketStateMap, this, responseCallback);
+            delayedEnrichmentWriteManager.tryCompleteElseWatch(
+                    delayedWrite,
+                    bucketStateMap.keySet().stream()
+                            .map(DelayedTableBucketKey::new)
+                            .collect(Collectors.toList()));
+        } else {
+            Map<TableBucket, DelayedEnrichmentWrite.BucketResult> results = new HashMap<>();
+            bucketStateMap.forEach(
+                    (tb, state) -> {
+                        if (state.getLocalError() != null) {
+                            results.put(
+                                    tb,
+                                    DelayedEnrichmentWrite.BucketResult.failure(
+                                            state.getLocalError(), state.getLocalErrorMsg()));
+                        } else {
+                            results.put(
+                                    tb,
+                                    DelayedEnrichmentWrite.BucketResult.success(
+                                            state.getRequiredEwm()));
+                        }
+                    });
+            responseCallback.accept(results);
+        }
+    }
+
     private <T extends WriteResultForBucket> void maybeAddDelayedWrite(
             int timeoutMs,
             int requiredAcks,
@@ -1987,6 +2090,7 @@ public class ReplicaManager implements ServerReconfigurable {
                                         highWatermarkCheckpoint),
                                 delayedWriteManager,
                                 delayedFetchLogManager,
+                                delayedEnrichmentWriteManager,
                                 adjustIsrManager,
                                 kvSnapshotContext,
                                 metadataCache,
@@ -2038,6 +2142,11 @@ public class ReplicaManager implements ServerReconfigurable {
     @VisibleForTesting
     public DelayedOperationManager<DelayedFetchLog> getDelayedFetchLogManager() {
         return delayedFetchLogManager;
+    }
+
+    @VisibleForTesting
+    public DelayedOperationManager<DelayedEnrichmentWrite> getDelayedEnrichmentWriteManager() {
+        return delayedEnrichmentWriteManager;
     }
 
     @VisibleForTesting

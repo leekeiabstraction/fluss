@@ -80,6 +80,8 @@ public class WriterClient {
 
     private final Configuration conf;
     private final int maxRequestSize;
+    private final short configuredAcks;
+    private final int configuredRequestTimeoutMs;
     private final RecordAccumulator accumulator;
     private final Sender sender;
     private final ExecutorService ioThreadPool;
@@ -110,6 +112,9 @@ public class WriterClient {
 
             short acks = configureAcks(idempotenceManager.idempotenceEnabled());
             int retries = configureRetries(idempotenceManager.idempotenceEnabled());
+            this.configuredAcks = acks;
+            this.configuredRequestTimeoutMs =
+                    (int) conf.get(ConfigOptions.CLIENT_REQUEST_TIMEOUT).toMillis();
             this.accumulator =
                     new RecordAccumulator(
                             conf, idempotenceManager, writerMetricGroup, SystemClock.getInstance());
@@ -194,6 +199,19 @@ public class WriterClient {
     public EnrichmentRouter getOrCreateEnrichmentRouter(TablePath tablePath) {
         return enrichmentRouters.computeIfAbsent(
                 tablePath, tp -> new EnrichmentRouter(tp, this, metadataUpdater));
+    }
+
+    /**
+     * Returns the configured {@code client.writer.acks} setting threaded through to enrichment
+     * writes so they honour the same durability semantics as base appends.
+     */
+    public short getConfiguredAcks() {
+        return configuredAcks;
+    }
+
+    /** Returns the configured request timeout in milliseconds for enrichment write RPCs. */
+    public int getConfiguredRequestTimeoutMs() {
+        return configuredRequestTimeoutMs;
     }
 
     /**

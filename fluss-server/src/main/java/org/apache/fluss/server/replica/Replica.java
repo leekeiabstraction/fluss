@@ -95,6 +95,7 @@ import org.apache.fluss.server.metadata.TabletServerMetadataCache;
 import org.apache.fluss.server.metrics.group.BucketMetricGroup;
 import org.apache.fluss.server.metrics.group.TableMetricGroup;
 import org.apache.fluss.server.metrics.group.TabletServerMetricGroup;
+import org.apache.fluss.server.replica.delay.DelayedEnrichmentWrite;
 import org.apache.fluss.server.replica.delay.DelayedFetchLog;
 import org.apache.fluss.server.replica.delay.DelayedOperationManager;
 import org.apache.fluss.server.replica.delay.DelayedTableBucketKey;
@@ -182,6 +183,7 @@ public final class Replica {
     private final int localTabletServerId;
     private final DelayedOperationManager<DelayedWrite<?>> delayedWriteManager;
     private final DelayedOperationManager<DelayedFetchLog> delayedFetchLogManager;
+    private final DelayedOperationManager<DelayedEnrichmentWrite> delayedEnrichmentWriteManager;
     /** The manger to manger the isr expand and shrink. */
     private final AdjustIsrManager adjustIsrManager;
 
@@ -244,6 +246,7 @@ public final class Replica {
             OffsetCheckpointFile.LazyOffsetCheckpoints lazyHighWatermarkCheckpoint,
             DelayedOperationManager<DelayedWrite<?>> delayedWriteManager,
             DelayedOperationManager<DelayedFetchLog> delayedFetchLogManager,
+            DelayedOperationManager<DelayedEnrichmentWrite> delayedEnrichmentWriteManager,
             AdjustIsrManager adjustIsrManager,
             SnapshotContext snapshotContext,
             TabletServerMetadataCache metadataCache,
@@ -262,6 +265,7 @@ public final class Replica {
         this.localTabletServerId = localTabletServerId;
         this.delayedWriteManager = delayedWriteManager;
         this.delayedFetchLogManager = delayedFetchLogManager;
+        this.delayedEnrichmentWriteManager = delayedEnrichmentWriteManager;
         this.adjustIsrManager = adjustIsrManager;
         this.fatalErrorHandler = fatalErrorHandler;
         this.bucketMetricGroup = bucketMetricGroup;
@@ -1330,6 +1334,7 @@ public final class Replica {
             }
         }
         logTablet.updateCommittedEnrichmentWatermark(groupName, newCew);
+        tryCompleteDelayedEnrichmentWrites();
     }
 
     private boolean shouldWaitForReplicaToJoinIsr(
@@ -1583,6 +1588,30 @@ public final class Replica {
             }
 
             if (logTablet.getHighWatermark() >= requiredOffset) {
+                if (minInSyncReplicasSupplier.getAsInt() <= curMaximalIsr.size()) {
+                    return Tuple2.of(true, Errors.NONE);
+                } else {
+                    return Tuple2.of(true, Errors.NOT_ENOUGH_REPLICAS_AFTER_APPEND_EXCEPTION);
+                }
+            } else {
+                return Tuple2.of(false, Errors.NONE);
+            }
+        } else {
+            return Tuple2.of(false, Errors.NOT_LEADER_OR_FOLLOWER);
+        }
+    }
+
+    /**
+     * Returns whether the CEW for {@code groupName} has reached {@code requiredOffset}, mirroring
+     * {@link #checkEnoughReplicasReachOffset} but for the per-(bucket, group) Committed Enrichment
+     * Watermark. Used by {@code DelayedEnrichmentWrite} to know when an acks=all enrichment append
+     * is durable across the ISR.
+     */
+    public Tuple2<Boolean, Errors> checkEnoughReplicasReachEwm(
+            String groupName, long requiredOffset) {
+        if (isLeader()) {
+            List<Integer> curMaximalIsr = isrState.maximalIsr();
+            if (logTablet.getCommittedEnrichmentWatermark(groupName) >= requiredOffset) {
                 if (minInSyncReplicasSupplier.getAsInt() <= curMaximalIsr.size()) {
                     return Tuple2.of(true, Errors.NONE);
                 } else {
@@ -1927,6 +1956,14 @@ public final class Replica {
         DelayedTableBucketKey delayedTableBucketKey = new DelayedTableBucketKey(tableBucket);
         delayedWriteManager.checkAndComplete(delayedTableBucketKey);
         delayedFetchLogManager.checkAndComplete(delayedTableBucketKey);
+    }
+
+    /**
+     * Trigger completion of any pending acks=all enrichment writes for this bucket. Called from
+     * {@link #maybeAdvanceCEW} after CEW advances; mirrors {@link #tryCompleteDelayedOperations}.
+     */
+    private void tryCompleteDelayedEnrichmentWrites() {
+        delayedEnrichmentWriteManager.checkAndComplete(new DelayedTableBucketKey(tableBucket));
     }
 
     private void validateBucketEpoch(int requestBucketEpoch) {

@@ -233,6 +233,10 @@ message ProduceLogColumnsRequest {
   required int64 table_id = 1;
   required string column_group = 2;
   repeated PbProduceLogColumnsReqForBucket buckets_req = 3;
+  // acks mirrors ProduceLogRequest: 0 = no ack, 1 = leader-local durability,
+  // -1 (all) = wait for CEW to cover source_offsets across the ISR.
+  optional int32 acks = 4 [default = -1];
+  optional int32 timeout_ms = 5 [default = 30000];
 }
 
 message ProduceLogColumnsResponse {

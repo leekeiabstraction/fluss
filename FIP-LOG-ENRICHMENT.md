@@ -361,6 +361,11 @@ message ProduceLogColumnsRequest {
   required int64  table_id     = 1;
   required string column_group = 2;
   repeated PbProduceLogColumnsReqForBucket buckets_req = 3;
+  // Mirrors ProduceLogRequest.acks: 0 = no ack, 1 = leader-local
+  // durability, -1 (all) = wait for CEW to cover source_offsets across
+  // the ISR. Default -1.
+  optional int32 acks          = 4 [default = -1];
+  optional int32 timeout_ms    = 5 [default = 30000];
 }
 
 message PbProduceLogColumnsReqForBucket {
@@ -380,7 +385,8 @@ message PbProduceLogColumnsRespForBucket {
   required int32 bucket_id             = 2;
   optional int32 error_code            = 3;
   optional string error_message        = 4;
-  // Enrichment watermark for the column group on this bucket after the put.
+  // Watermark for the column group on this bucket after the put: CEW_g under
+  // acks=all, leader-local EWM_g under acks=1.
   optional int64 enrichment_watermark  = 5;
 }
 ```
@@ -522,15 +528,19 @@ identically for single-row and multi-row wire payloads.
 ### Write path
 
 Base append (`ProduceLog`) and enrichment append (`ProduceLogColumns`)
-share the same `Replica` but follow different durability rules: base
-writes wait for the ISR to catch up before the response (HWM is the
-client-visible ceiling, computed as `min(LEO)` across the ISR, where
-**Log End Offset (LEO)** is each replica's next-to-write offset);
-enrichment writes return as soon as the leader has the row durably on
-its `EnrichmentSegment` and surface the **leader's** EWM. Followers
-pull enrichment asynchronously and the leader recomputes the
-**Committed Enrichment Watermark (CEW)** when they report progress;
-CEW — not EWM — gates reads (see *§ Replication and durability*).
+share the same `Replica` and honour the same `client.writer.acks`
+setting. Under the default `acks=all`, the response waits for the
+in-sync replicas to catch up before completing: base writes wait for
+the **High Watermark (HWM)** — `min(LEO)` across the ISR, where **Log
+End Offset (LEO)** is each replica's next-to-write offset — to cover
+the appended record, and enrichment writes wait for the per-group
+**Committed Enrichment Watermark (CEW)** — `min(EWM_g)` across the
+ISR — to cover the filled `source_offset`. Under `acks=1` the leader
+returns immediately after its local write (HWM/CEW are advanced
+asynchronously on follower-fetch); under `acks=0` the leader does
+not respond at all.
+
+The diagram below shows the `acks=all` flow.
 
 ```
    Client             Leader Replica                  Follower(s)
@@ -549,21 +559,17 @@ CEW — not EWM — gates reads (see *§ Replication and durability*).
      │                      │ offset ∈ [localStart, HWM) ? │
      │                      │ append to EnrichmentSegment  │
      │                      │ advance leader EWM_g         │
-     │◀── response (EWM_g) ─│                              │
-     │                      │                              │
-     │            (asynchronous; concurrent with the above)
      │                      │── records + leader EWM ─────▶│
      │                      │                              │ append EnrichmentSegment
      │                      │                              │ advance follower EWM_g
      │                      │◀── follower EWM_g ───────────│
      │                      │ CEW_g = min(EWM_g across ISR)│
+     │◀── response (CEW_g) ─│                              │
 ```
 
-The `EWM_g` returned to the caller is the leader's value, so a successful
-`ProduceLogColumns` response is *not* a durability guarantee; durability
-is gated by CEW which advances on the follower-fetch path. Reads — both
-direct fetches and lake tiering — observe CEW, not EWM, so a survivor of
-leader failover never reveals enrichment that wasn't durably replicated.
+Reads — both direct fetches and lake tiering — observe CEW, not the
+leader-local EWM, so a survivor of leader failover never reveals
+enrichment that wasn't durably replicated.
 
 ### Read path — merge-on-read
 

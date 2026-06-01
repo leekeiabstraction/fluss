@@ -99,7 +99,12 @@ public final class EnrichmentRouter {
         if (sender == null) {
             sender =
                     new EnrichmentSender(
-                            tablePath, metadataUpdater, accumulators, DEFAULT_POLL_INTERVAL_MS);
+                            tablePath,
+                            metadataUpdater,
+                            accumulators,
+                            DEFAULT_POLL_INTERVAL_MS,
+                            writerClient.getConfiguredAcks(),
+                            writerClient.getConfiguredRequestTimeoutMs());
             senderThread = new Thread(sender, "fluss-enrichment-sender-" + tablePath);
             senderThread.setDaemon(true);
             senderThread.start();

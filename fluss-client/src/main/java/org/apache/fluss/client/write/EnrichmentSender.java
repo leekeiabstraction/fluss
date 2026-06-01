@@ -54,6 +54,8 @@ public final class EnrichmentSender implements Runnable {
     private final MetadataUpdater metadataUpdater;
     private volatile List<EnrichmentAccumulator> accumulators;
     private final long pollIntervalMs;
+    private final short acks;
+    private final int requestTimeoutMs;
 
     private volatile boolean running = true;
 
@@ -70,11 +72,15 @@ public final class EnrichmentSender implements Runnable {
             TablePath tablePath,
             MetadataUpdater metadataUpdater,
             List<EnrichmentAccumulator> accumulators,
-            long pollIntervalMs) {
+            long pollIntervalMs,
+            short acks,
+            int requestTimeoutMs) {
         this.tablePath = tablePath;
         this.metadataUpdater = metadataUpdater;
         this.accumulators = accumulators;
         this.pollIntervalMs = pollIntervalMs;
+        this.acks = acks;
+        this.requestTimeoutMs = requestTimeoutMs;
     }
 
     @Override
@@ -151,7 +157,9 @@ public final class EnrichmentSender implements Runnable {
         ProduceLogColumnsRequest request =
                 new ProduceLogColumnsRequest()
                         .setTableId(key.getTableId())
-                        .setColumnGroup(key.getColumnGroup());
+                        .setColumnGroup(key.getColumnGroup())
+                        .setAcks(acks)
+                        .setTimeoutMs(requestTimeoutMs);
         PbProduceLogColumnsReqForBucket bucketReq = request.addBucketsReq();
         bucketReq.setBucketId(bucket.getBucket());
         if (bucket.getPartitionId() != null) {
